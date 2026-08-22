@@ -14,6 +14,13 @@
 
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_drmcommon.h>
+
+#ifndef DRM_FORMAT_NV12
+#define DRM_FORMAT_NV12	0x3231564e	/* NV12 fourcc */
+#endif
+
+#include "decode.h" 
 
 #define IRIS_VAAPI_VERSION	"0.0.1"
 #define IRIS_VAAPI_VENDOR	"iris-vaapi P0: Qualcomm Iris SM8150 (V4L2) "
@@ -24,6 +31,14 @@ struct iris_drv_data {
 	unsigned int context_id;
 	unsigned int surface_id;
 	unsigned int buffer_id;
+	unsigned int width, height;
+	VAProfile profile;
+	struct iris_decode_ctx *dec;
+	int n_bufs;
+	unsigned int buf_ids[256];
+	VABufferType buf_types[256];
+	unsigned int buf_sizes[256];
+	void *buf_data[256];
 };
 
 static const VAProfile iris_profiles[] = {
@@ -53,11 +68,28 @@ iris_drv_data(VADriverContextP ctx)
 	return ctx->pDriverData;
 }
 
+static void
+iris_free_buffers(struct iris_drv_data *dd)
+{
+	int i;
+
+	for (i = 0; i < dd->n_bufs; i++)
+		free(dd->buf_data[i]);
+	dd->n_bufs = 0;
+}
+
 static VAStatus
 iris_vaTerminate(VADriverContextP ctx)
 {
-	free(ctx->pDriverData);
-	ctx->pDriverData = NULL;
+	struct iris_drv_data *dd = ctx->pDriverData;
+
+	if (dd) {
+		iris_free_buffers(dd);
+		if (dd->dec)
+			iris_decode_destroy(dd->dec);
+		free(dd);
+		ctx->pDriverData = NULL;
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -144,6 +176,7 @@ iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 	dd = iris_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	dd->profile = profile;
 
 	*config_id = ++dd->config_id;
 	return VA_STATUS_SUCCESS;
@@ -183,6 +216,15 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
+	dd->width = picture_width;
+	dd->height = picture_height;
+	if (!dd->dec) {
+		dd->dec = iris_decode_create();
+		if (!dd->dec)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		iris_decode_setup(dd->dec, picture_width, picture_height,
+				  dd->profile);
+	}
 	*context_id = ++dd->context_id;
 	return VA_STATUS_SUCCESS;
 }
@@ -204,8 +246,13 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	for (i = 0; i < num_surfaces; i++)
-		surfaces[i] = ++dd->surface_id;
+	for (i = 0; i < num_surfaces; i++) {
+		VASurfaceID id = ++dd->surface_id;
+
+		if (dd->dec && iris_decode_create_surface(dd->dec, id))
+			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+		surfaces[i] = id;
+	}
 
 	return VA_STATUS_SUCCESS;
 }
@@ -214,6 +261,13 @@ static VAStatus
 iris_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 		       int num_surfaces)
 {
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_SUCCESS;
+	for (i = 0; i < num_surfaces; i++)
+		iris_decode_destroy_surface(dd->dec, surface_list[i]);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -237,8 +291,19 @@ iris_vaCreateBuffer(VADriverContextP ctx, VAContextID context_id,
 	dd = iris_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (dd->n_bufs >= 256)
+		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 
-	*buf_id = ++dd->buffer_id;
+	dd->buf_types[dd->n_bufs] = type;
+	dd->buf_sizes[dd->n_bufs] = size;
+	dd->buf_data[dd->n_bufs] = calloc(1, size ? size : 1);
+	if (!dd->buf_data[dd->n_bufs])
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (data && size)
+		memcpy(dd->buf_data[dd->n_bufs], data, size);
+	dd->buf_ids[dd->n_bufs] = ++dd->buffer_id;
+	*buf_id = dd->buf_ids[dd->n_bufs];
+	dd->n_bufs++;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -249,11 +314,31 @@ iris_vaBufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
 	return VA_STATUS_SUCCESS;
 }
 
+static int
+iris_find_buffer(struct iris_drv_data *dd, VABufferID buf_id)
+{
+	int i;
+
+	for (i = 0; i < dd->n_bufs; i++)
+		if (dd->buf_ids[i] == buf_id)
+			return i;
+	return -1;
+}
+
 static VAStatus
 iris_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 {
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
 	*pbuf = NULL;
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	if (!dd)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	i = iris_find_buffer(dd, buf_id);
+	if (i < 0)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	*pbuf = dd->buf_data[i];
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
@@ -265,6 +350,20 @@ iris_vaUnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
 static VAStatus
 iris_vaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
 {
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
+	if (!dd)
+		return VA_STATUS_SUCCESS;
+	i = iris_find_buffer(dd, buf_id);
+	if (i < 0)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	free(dd->buf_data[i]);
+	dd->buf_ids[i] = dd->buf_ids[dd->n_bufs - 1];
+	dd->buf_types[i] = dd->buf_types[dd->n_bufs - 1];
+	dd->buf_sizes[i] = dd->buf_sizes[dd->n_bufs - 1];
+	dd->buf_data[i] = dd->buf_data[dd->n_bufs - 1];
+	dd->n_bufs--;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -272,33 +371,87 @@ static VAStatus
 iris_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
 		    VASurfaceID render_target)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	iris_decode_begin(dd->dec, render_target);
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 		     VABufferID *buffers, int num_buffers)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	for (i = 0; i < num_buffers; i++) {
+		int idx = iris_find_buffer(dd, buffers[i]);
+		void *data;
+		VABufferType type;
+
+		if (idx < 0)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+		data = dd->buf_data[idx];
+		type = dd->buf_types[idx];
+
+		switch (type) {
+		case VAPictureParameterBufferType:
+			if (dd->buf_sizes[idx] <
+			    sizeof(VAPictureParameterBufferH264))
+				return VA_STATUS_ERROR_INVALID_BUFFER;
+			iris_decode_picture(dd->dec, data);
+			break;
+		case VASliceParameterBufferType:
+			/* Slice headers are inside the data buffers. */
+			break;
+		case VASliceDataBufferType:
+			iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]);
+			break;
+		default:
+			/* IQ matrix and friends are not needed. */
+			break;
+		}
+	}
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaEndPicture(VADriverContextP ctx, VAContextID context_id)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	return iris_decode_end(dd->dec) ?
+		VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_target)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	return iris_decode_sync(dd->dec, render_target) ?
+		VA_STATUS_ERROR_TIMEDOUT : VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target,
 			  VASurfaceStatus *status)
 {
-	*status = VASurfaceReady;
+	struct iris_drv_data *dd = ctx->pDriverData;
+
+	if (!dd || !dd->dec || !status)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	*status = iris_decode_surface_ready(dd->dec, render_target) ?
+		VASurfaceReady : VASurfaceRendering;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -306,7 +459,21 @@ static VAStatus
 iris_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
 			 int *num_formats)
 {
-	*num_formats = 0;
+	static const VAImageFormat nv12 = {
+		.fourcc = VA_FOURCC_NV12,
+		.byte_order = VA_LSB_FIRST,
+		.bits_per_pixel = 12,
+	};
+
+	if (!num_formats)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (format_list && *num_formats >= 1)
+		format_list[0] = nv12;
+	else if (!format_list)
+		*num_formats = 1;
+	else if (*num_formats < 1)
+		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+	*num_formats = 1;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -467,7 +634,39 @@ static VAStatus
 iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 			   uint32_t mem_type, uint32_t flags, void *descriptor)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+	VADRMPRIMESurfaceDescriptor *d = descriptor;
+	unsigned int w, h, pitch, size;
+	int fd;
+
+	if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
+		return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (iris_decode_export(dd->dec, surface_id, &fd, &pitch, &size,
+			       &w, &h))
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	memset(d, 0, sizeof(*d));
+	d->fourcc = VA_FOURCC_NV12;
+	d->width = w;
+	d->height = h;
+	d->num_objects = 1;
+	d->objects[0].fd = fd;
+	d->objects[0].size = size;
+	d->num_layers = 1;
+	d->layers[0].drm_format = DRM_FORMAT_NV12;
+	d->layers[0].num_planes = 2;
+	d->layers[0].object_index[0] = 0;
+	d->layers[0].object_index[1] = 0;
+	d->layers[0].offset[0] = 0;
+	d->layers[0].offset[1] = pitch * h;
+	d->layers[0].pitch[0] = pitch;
+	d->layers[0].pitch[1] = pitch;
+
+	(void)flags;
+	return VA_STATUS_SUCCESS;
 }
 
 static const struct VADriverVTable iris_vtable_template = {

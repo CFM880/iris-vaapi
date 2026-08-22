@@ -12,6 +12,7 @@
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <stddef.h>
+#include <stdint.h>
 
 struct v4l2_dec_frame {
 	unsigned int index;		/* CAPTURE buffer index */
@@ -53,14 +54,24 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 int v4l2_dec_start(struct v4l2_dec *d);
 /* poll the device fd. Returns poll() result. */
 int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms);
-/* Queue one full access unit on the OUTPUT queue. */
-int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len);
+/* Queue one full access unit on the OUTPUT queue.  The decoder propagates
+ * @timestamp to the produced CAPTURE frame, which the driver uses to match
+ * decoded frames back to VA surfaces. */
+int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len,
+		  uint64_t timestamp);
 /* Handle pending events; builds/rebuilds CAPTURE after a resolution change. */
 int v4l2_dec_handle_events(struct v4l2_dec *d, int *changed);
 /* Dequeue a decoded NV12 frame. Returns 0, 1 at EOS, -EAGAIN if none ready. */
 int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame);
 /* Requeue a consumed CAPTURE buffer. */
 int v4l2_dec_qcap(struct v4l2_dec *d, const struct v4l2_dec_frame *frame);
+/* Requeue a CAPTURE buffer by index. */
+int v4l2_dec_qcap_idx(struct v4l2_dec *d, unsigned int index);
+/* Export a CAPTURE buffer as a DRM PRIME fd and return its luma pitch. */
+int v4l2_dec_export(struct v4l2_dec *d, unsigned int cap_index, int *fd,
+		    unsigned int *pitch, unsigned int *size);
+/* Current coded size of the CAPTURE queue. */
+void v4l2_dec_size(struct v4l2_dec *d, unsigned int *w, unsigned int *h);
 /* Dequeue + requeue a finished OUTPUT buffer. -EAGAIN if none ready. */
 int v4l2_dec_dqout(struct v4l2_dec *d);
 /* Signal EOS (queue an empty LAST buffer). */

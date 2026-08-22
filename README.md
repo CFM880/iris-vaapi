@@ -88,31 +88,44 @@ mplane 常见坑：
 **注意**：中断会话（进程被杀/中途错误）会让固件卡死，`SESSION_INIT` 超时（-110），
 需 `sudo rmmod qcom_iris && sudo modprobe qcom_iris` 恢复。
 
-## 进行中
+## P1 — 接入 VA-API 驱动（✅ 完成）
 
-### P1 剩余 — 接入 VA-API 驱动
+把引擎接进驱动，真实解码路径全部打通：
 
-把引擎接进驱动，实现真实解码路径：
+| 组件 | 状态 |
+|---|---|
+| `src/h264_params.c` — SPS/PPS 重序列化 | ✅ 已验证（重建 NAL 解码像素级一致）|
+| `src/decode.c` — surface 管理 + slice 累积 + 异步解码 | ✅ |
+| `src/iris_vaapi.c` — vtable 解码路径 | ✅ |
+| 端到端 `test/test_va_decode.c` | ✅ `DECODE OK` |
 
-1. **SPS/PPS 重序列化**（`src/h264_params.c`，开发中）
-   - 从 `VAPictureParameterBufferH264` 的解析字段经 Exp-Golomb 重建 SPS/PPS NAL
-   - profile_idc 从 `VAProfile` 推导（High=100/Main=77/CB=66），level 按高度推算
-   - `VAPictureParameterBufferH264` 不携带 profile/level/offset_for_ref_frame 等字段，
-     序列化时用 config profile + 合理默认
-   - 当前状态：序列化器已写，测试解析真实 SPS/PPS 时有 buffer overflow（待修）
+关键实现要点：
 
-2. **slice 重组**：Chrome 逐 slice 给数据，需把一帧的所有 `VASliceDataBufferType`
-   拼接（保留 start code 与防竞争字节）+ 前置重建的 SPS/PPS → 完整 AU
+1. **SPS/PPS 重序列化**：从 `VAPictureParameterBufferH264` 经 Exp-Golomb 重建
+   SPS/PPS NAL。profile_idc 从 `VAProfile` 推导，level 按高度推算。
+   用真实 SPS/PPS 解析→重建→ffmpeg 解码验证逐像素一致。
+2. **slice 重组**：每帧所有 `VASliceDataBufferType` 拼接（保留 start code），
+   前置重建的 SPS/PPS → 完整 AU。
+3. **surface 映射**：v4l2 timestamp 携带 surface id（`tv_sec = surface_id`），
+   iris 透传到输出帧，`assign_frame` 按 timestamp 回填 surface。
+4. **异步模型**：`vaEndPicture` 只入队；`vaSyncSurface` 排水到目标 surface 帧出现。
+   同步 1 帧会超时（固件需约 4 帧入队才出第一帧）。
+5. **导出**：`vaExportSurfaceHandle` 用 `VIDIOC_EXPBUF` 把 CAPTURE buffer
+   导出为 DRM PRIME fd，填 `VADRMPRIMESurfaceDescriptor`（NV12 两层）。
 
-3. **surface 映射**：VASurfaceID ↔ CAPTURE buffer，用 v4l2 timestamp 携带
-   surface 标识匹配（iris 会把输入 timestamp 透传到输出帧）
+**已知限制**：
+- stateful 固件有 1 帧 hold 延迟：最后入队的画面需再喂一帧（或 EOS）才释放，
+  对应 `vaSyncSurface` 对最后一张画面会超时。
+- 每帧重发 SPS/PPS 会重置 DPB，P 帧参考依赖可能失效；真实 Chrome 只在参数
+  变更时发 SPS/PPS（驱动需加"参数变化才重发"逻辑）。
+- 单实例单引擎，不支持并发多视频流。
 
 ## 待办（P2）
 
-- `vaBeginPicture/vaRenderPicture/vaEndPicture` 真实实现
-- `vaSyncSurface/vaQuerySurfaceStatus`（帧完成跟踪）
-- `vaDeriveImage/vaExportSurfaceHandle`（NV12 给 Chrome 显示/复制）
-- Chrome 端 EGL/Wayland 显示互通验证
+- Chrome 端实际加载驱动解码验证（EGL/Wayland 显示互通）
+- 参数变化检测（避免每帧重发 SPS/PPS）
+- EOS flush 释放最后一帧
+- HEVC/VP9 slice 重组支持
 
 ## 测试工具
 

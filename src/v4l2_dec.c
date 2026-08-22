@@ -16,6 +16,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <stdint.h>
+
 #include "v4l2_dec.h"
 
 #define OUT_SIZEIMAGE	(16U * 1024 * 1024)	/* room for a 4K access unit */
@@ -280,7 +282,8 @@ int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms)
 	return poll(&pfd, 1, timeout_ms);
 }
 
-int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len)
+int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len,
+		  uint64_t timestamp)
 {
 	unsigned int idx;
 	struct v4l2_buffer *b;
@@ -300,6 +303,8 @@ int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len)
 	b = &d->out_meta[idx];
 	memset(&b->m.planes[0], 0, sizeof(b->m.planes[0]));
 	b->m.planes[0].bytesused = len;
+	b->timestamp.tv_sec = timestamp / 1000000000ULL;
+	b->timestamp.tv_usec = (timestamp % 1000000000ULL) / 1000ULL;
 	if (xioctl(d->fd, VIDIOC_QBUF, b) < 0) {
 		d->free_out[d->free_out_n++] = idx;
 		return -errno;
@@ -385,12 +390,41 @@ int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame)
 	return d->eos ? 1 : 0;
 }
 
+int v4l2_dec_qcap_idx(struct v4l2_dec *d, unsigned int index)
+{
+	memset(&d->cap_meta[index].m.planes[0], 0,
+	       sizeof(d->cap_meta[index].m.planes[0]));
+	return xioctl(d->fd, VIDIOC_QBUF, &d->cap_meta[index]) < 0 ?
+		-errno : 0;
+}
+
 int v4l2_dec_qcap(struct v4l2_dec *d, const struct v4l2_dec_frame *frame)
 {
-	memset(&d->cap_meta[frame->index].m.planes[0], 0,
-	       sizeof(d->cap_meta[frame->index].m.planes[0]));
-	return xioctl(d->fd, VIDIOC_QBUF, &d->cap_meta[frame->index]) < 0 ?
-		-errno : 0;
+	return v4l2_dec_qcap_idx(d, frame->index);
+}
+
+int v4l2_dec_export(struct v4l2_dec *d, unsigned int cap_index, int *fd,
+		    unsigned int *pitch, unsigned int *size)
+{
+	struct v4l2_exportbuffer exp;
+	struct v4l2_plane *pl = &d->cap_meta[cap_index].m.planes[0];
+
+	memset(&exp, 0, sizeof(exp));
+	exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	exp.index = cap_index;
+	if (xioctl(d->fd, VIDIOC_EXPBUF, &exp) < 0)
+		return -errno;
+	*fd = exp.fd;
+	*pitch = d->cap_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+	*size = d->cap_size[cap_index];
+	(void)pl;
+	return 0;
+}
+
+void v4l2_dec_size(struct v4l2_dec *d, unsigned int *w, unsigned int *h)
+{
+	*w = d->width;
+	*h = d->height;
 }
 
 /* Recycle a finished OUTPUT buffer so it can be reused. Returns 0 on success,

@@ -184,7 +184,7 @@ int main(int argc, char **argv)
 	if (ret) { fprintf(stderr, "open failed ret=%d\n", ret); return 1; }
 
 	/* Queue the first access unit before STREAMON, mirroring FFmpeg. */
-	ret = v4l2_dec_feed(&dec, aus[0].data, aus[0].len);
+	ret = v4l2_dec_feed(&dec, aus[0].data, aus[0].len, 0);
 	if (ret) { fprintf(stderr, "feed au 0 failed ret=%d\n", ret); return 1; }
 	fed = 1;
 
@@ -198,7 +198,7 @@ int main(int argc, char **argv)
 		int changed;
 
 		while (fed < n_aus && (int)(fed - recycled) < 4) {
-			ret = v4l2_dec_feed(&dec, aus[fed].data, aus[fed].len);
+			ret = v4l2_dec_feed(&dec, aus[fed].data, aus[fed].len, fed);
 			if (ret) {
 				fprintf(stderr, "feed au %u failed ret=%d\n",
 					fed, ret);
