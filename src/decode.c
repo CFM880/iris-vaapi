@@ -2,8 +2,13 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <linux/dma-heap.h>
 
 #include "decode.h"
 #include "h264_params.h"
@@ -11,11 +16,30 @@
 
 #define IRIS_MAX_SURFACES	64
 #define IRIS_AU_MAX		(16U * 1024 * 1024)
-#define NO_CAP			(~0U)
+
+#ifndef ALIGN_TO
+#define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#endif
+
+static int
+dma_heap_alloc(int heap_fd, unsigned int size)
+{
+	struct dma_heap_allocation_data data;
+
+	memset(&data, 0, sizeof(data));
+	data.len = size;
+	data.fd = 0;
+	data.fd_flags = O_RDWR | O_CLOEXEC;
+	if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) < 0)
+		return -1;
+	return data.fd;
+}
 
 struct iris_surface {
 	VASurfaceID id;
-	unsigned int cap_index;	/* engine CAPTURE buffer holding the frame */
+	int bfd;		/* DMA-heap backing fd (stable, exportable) */
+	void *bmap;		/* mmap of the backing */
+	unsigned int bsize;
 	int decoded;
 };
 
@@ -90,12 +114,40 @@ int
 iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
 	struct iris_surface *s;
+	unsigned int size;
+	int heap, bfd;
+	void *map;
 
-	if (ctx->n_surfaces >= IRIS_MAX_SURFACES)
+	if (ctx->n_surfaces >= 64)
 		return -1;
+
+	/* Stable, exportable backing buffer independent of the V4L2 session. */
+	size = ALIGN_TO(ctx->width, 16) * ALIGN_TO(ctx->height, 32) * 3 / 2;
+	fprintf(stderr, "[surf] id=%u size=%u w=%u h=%u\n", id, size,
+		ctx->width, ctx->height);
+	heap = open("/dev/dma_heap/system", O_RDWR);
+	if (heap < 0) {
+		perror("[surf] open heap");
+		return -1;
+	}
+	bfd = dma_heap_alloc(heap, size);
+	close(heap);
+	if (bfd < 0) {
+		perror("[surf] heap alloc");
+		return -1;
+	}
+	map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0);
+	if (map == MAP_FAILED) {
+		perror("[surf] mmap");
+		close(bfd);
+		return -1;
+	}
+
 	s = &ctx->surfaces[ctx->n_surfaces++];
 	s->id = id;
-	s->cap_index = NO_CAP;
+	s->bfd = bfd;
+	s->bmap = map;
+	s->bsize = size;
 	s->decoded = 0;
 	return 0;
 }
@@ -106,11 +158,12 @@ iris_decode_destroy_surface(struct iris_decode_ctx *ctx, VASurfaceID id)
 	int i;
 
 	for (i = 0; i < ctx->n_surfaces; i++) {
-		if (ctx->surfaces[i].id != id)
+		struct iris_surface *s = &ctx->surfaces[i];
+
+		if (s->id != id)
 			continue;
-		if (ctx->dec_open && ctx->surfaces[i].cap_index != NO_CAP)
-			v4l2_dec_qcap_idx(&ctx->dec,
-					  ctx->surfaces[i].cap_index);
+		munmap(s->bmap, s->bsize);
+		close(s->bfd);
 		ctx->surfaces[i] = ctx->surfaces[ctx->n_surfaces - 1];
 		ctx->n_surfaces--;
 		return 0;
@@ -132,6 +185,7 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 	return 0;
 }
 
+
 /* Assign one dequeued frame to its surface (matched by the timestamp we
  * encoded as the surface id).  Returns the surface id, or -1 if unknown. */
 static int
@@ -145,9 +199,12 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	}
-	if (s->cap_index != NO_CAP)
-		v4l2_dec_qcap_idx(&ctx->dec, s->cap_index);
-	s->cap_index = frame->index;
+	/* Copy the decoded frame into the surface's stable DMA-heap backing so
+	 * buffers exported before decoding stay valid, then recycle the
+	 * firmware buffer. */
+	if (frame->bytesused <= s->bsize)
+		memcpy(s->bmap, frame->mem, frame->bytesused);
+	v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 	s->decoded = 1;
 	return id;
 }
@@ -179,6 +236,7 @@ drain_available(struct iris_decode_ctx *ctx)
 int
 iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 {
+	fprintf(stderr, "[begin] target=%u\n", target);
 	ctx->current_target = target;
 	ctx->have_pic = 0;
 	ctx->slice_len = 0;
@@ -248,6 +306,11 @@ int
 iris_decode_end(struct iris_decode_ctx *ctx)
 {
 	uint8_t *au;
+	int rv;
+
+	fprintf(stderr, "[end] target=%u slice_len=%zu refs=%d/%d started=%d\n",
+		ctx->current_target, ctx->slice_len, ctx->refs_l0, ctx->refs_l1,
+		ctx->dec_started);
 	size_t au_len = 0, au_cap;
 	int n, ret;
 	static const uint8_t sc4[4] = { 0, 0, 0, 1 };
@@ -350,14 +413,15 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 	ctx->slice_len = 0;
 	ctx->have_pic = 0;
-	return 0;
+	rv = 0;
+	fprintf(stderr, "[end] done rv=%d\n", rv);
+	return rv;
 }
 
 int
 iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
 	int deadline = 200;	/* ~2 s */
-
 
 	if (iris_decode_surface_ready(ctx, id))
 		return 0;
@@ -378,7 +442,9 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
 		if (ret < 0)
 			continue;
-			assign_frame(ctx, &frame);
+		fprintf(stderr, "[sync] got ts=%llu\n",
+			(unsigned long long)frame.timestamp);
+		assign_frame(ctx, &frame);
 		if (iris_decode_surface_ready(ctx, id))
 			return 0;
 	}
@@ -404,14 +470,14 @@ iris_decode_surface_buffer(struct iris_decode_ctx *ctx, VASurfaceID id,
 {
 	struct iris_surface *s = find_surface(ctx, id);
 
-	if (!s || s->cap_index == NO_CAP)
+	if (!s)
 		return -1;
-	*cap_index = s->cap_index;
-	*mem = ctx->dec.cap_mem[s->cap_index];
-	*pitch = ctx->dec.cap_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-	*size = ctx->dec.cap_size[s->cap_index];
-	*width = ctx->dec.width;
-	*height = ctx->dec.height;
+	*cap_index = 0;
+	*mem = s->bmap;
+	*pitch = ALIGN_TO(ctx->width, 16);
+	*size = s->bsize;
+	*width = ctx->width;
+	*height = ctx->height;
 	return 0;
 }
 
@@ -422,10 +488,12 @@ iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
 {
 	struct iris_surface *s = find_surface(ctx, id);
 
-	if (!s || s->cap_index == NO_CAP)
+	if (!s)
 		return -1;
-	if (v4l2_dec_export(&ctx->dec, s->cap_index, fd, pitch, size))
-		return -1;
-	v4l2_dec_size(&ctx->dec, width, height);
+	*fd = s->bfd;
+	*pitch = ALIGN_TO(ctx->width, 16);
+	*size = s->bsize;
+	*width = ctx->width;
+	*height = ctx->height;
 	return 0;
 }

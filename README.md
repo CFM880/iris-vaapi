@@ -184,3 +184,76 @@ LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH=$PWD/build vainfo
 # P1: 引擎解码（输出帧与软件解码逐像素一致）
 ./build/test_v4l2_dec /path/to/stream.h264 1920 1080 /tmp/frame.nv12
 ```
+---
+
+## 工作总结（截至 2026-08-22）
+
+### 项目目标
+让 Chrome 在 Xiaomi Pad 5 (nabu) 上使用 Qualcomm Iris 硬件解码 H.264。
+Chrome 走 VA-API（按 slice 喂数据），iris 是"整比特流" stateful V4L2 解码器
+（固件自解析 SPS/PPS），两者接口模型不兼容 → 自写 VA-API 驱动做桥接。
+
+### 已完成
+
+| 里程碑 | 状态 | 验证 |
+|---|---|---|
+| P0: VA-API 驱动骨架 | ✅ | vainfo 识别 5 个 VLD profile |
+| P1: V4L2 解码引擎 | ✅ | 363 fps，与软解逐像素一致 |
+| P1: SPS/PPS 重序列化 | ✅ | 重建 NAL ffmpeg 解码一致 |
+| P1: 完整 VA-API 解码路径 | ✅ | 端到端 DECODE OK |
+| P2: 参数变化检测 + P 帧 | ✅ | IDR+P 帧逐像素一致 |
+| P2: ffmpeg VA-API 客户端 | ✅ | 75/77 帧，6.5x 超实时，逐字节一致 |
+| P2: Chrome 集成 | ⚠️ 部分 | 通过 FillProfileInfo，卡在 surface 导出探测 |
+
+### 关键成果
+**ffmpeg `-hwaccel vaapi` 作为第三方 VA-API 客户端解码成功**，且输出与
+FFmpeg 软件解码**逐字节一致**。这是驱动正确性的最强证明（真实客户端，
+非自定义测试）。
+
+### Chrome 集成的卡点（当前进度）
+Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹配**：
+
+1. Chrome 在解码前就 `vaExportSurfaceHandle` 导出 surface（帧池预分配），
+   要求每个 surface 有稳定、可导出的后备 buffer（`reference/vaapi_video_decoder.cc:930`）。
+2. stateful v4l2 解码器把帧写入固件控制的 CAPTURE buffer（会被复用），
+   无法预分配给具体 surface。
+3. 已解决：surface 属性查询（`VASurfaceAttribMaxWidth/Height`）、
+   `vaQueryConfigAttributes` 输出语义、profile 查询 lenient。
+4. 已实现：每个 surface 用 `/dev/dma_heap/system` 分配稳定 DMA-BUF 后备，
+   解码后拷贝进后备（`src/decode.c`）。**ffmpeg 已验证此模型可用**。
+5. 待验证：Chrome 探测（空 surface 的 sync+export）是否通过。注意
+   `/dev/dma_heap/system` 需要 `sudo chmod 0666`（root only）。
+
+### 已知限制
+- stateful 固件 hold 1 帧：最后一张画面需再喂一帧（或 EOS）才释放。
+- B 帧短序列引用未解析时丢帧（完整流正常，引擎解 74/75）。
+- 单实例单引擎，不支持并发多视频流。
+- H.264 4K60 高码率受固件解码上限（~49fps）。
+- 中断会话会让固件卡死（SESSION_INIT 超时 -110），需重载模块：
+  `sudo rmmod qcom_iris && sudo modprobe qcom_iris`
+
+### 构建与测试命令
+```sh
+make                                          # 构建驱动 + 测试工具
+LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH=$PWD/build vainfo   # P0
+./build/test_v4l2_dec 流.h264 1920 1088       # P1 引擎
+./build/test_va_decode 流.h264 输出.nv12      # P1 VA 路径
+LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=iris \
+  ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i 流.h264 -f null -  # P2 ffmpeg
+# 安装到系统供 Chrome 使用：
+sudo ./install-system.sh
+```
+
+### 参考
+`reference/` 保存了 Chromium 的 `vaapi_wrapper.cc` 与 `vaapi_video_decoder.cc`
+源码（调查 Chrome 初始化/导出流程用），勿删除。
+
+### git 提交历史
+```
+92e3ae3 iris-vaapi: real client (ffmpeg vaapi) decodes H.264 end-to-end
+a9464aa iris-vaapi: fix P-frame decode and add slice-param-driven PPS
+d32dca0 iris-vaapi: wire full VA-API H.264 decode path
+b04ea5a h264: re-serialize SPS/PPS NAL units from VAPictureParameterBufferH264
+c141778 docs: summarize VA-API Chrome hardware decode project status
+45cf083 iris-vaapi: VA-API driver skeleton and iris V4L2 decode engine
+```

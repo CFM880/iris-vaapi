@@ -19,6 +19,9 @@
 #ifndef ALIGN
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #endif
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12	0x3231564e	/* NV12 fourcc */
@@ -116,15 +119,13 @@ iris_vaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
 	if (!num_profiles)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-	if (profile_list && *num_profiles >= (int)NUM_IRIS_PROFILES)
-		memcpy(profile_list, iris_profiles,
-		       NUM_IRIS_PROFILES * sizeof(*profile_list));
-	else if (!profile_list)
-		*num_profiles = NUM_IRIS_PROFILES;
-	else if (*num_profiles < (int)NUM_IRIS_PROFILES)
-		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-
 	*num_profiles = NUM_IRIS_PROFILES;
+	if (profile_list) {
+		if (*num_profiles > (int)NUM_IRIS_PROFILES)
+			*num_profiles = NUM_IRIS_PROFILES;
+		memcpy(profile_list, iris_profiles,
+		       *num_profiles * sizeof(*profile_list));
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -146,15 +147,13 @@ iris_vaQueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
 		return VA_STATUS_SUCCESS;
 	}
 
-	if (entrypoint_list && *num_entrypoints >= (int)NUM_IRIS_ENTRYPOINTS)
-		memcpy(entrypoint_list, iris_entrypoints,
-		       NUM_IRIS_ENTRYPOINTS * sizeof(*entrypoint_list));
-	else if (!entrypoint_list)
-		*num_entrypoints = NUM_IRIS_ENTRYPOINTS;
-	else if (*num_entrypoints < (int)NUM_IRIS_ENTRYPOINTS)
-		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-
 	*num_entrypoints = NUM_IRIS_ENTRYPOINTS;
+	if (entrypoint_list) {
+		if (*num_entrypoints > (int)NUM_IRIS_ENTRYPOINTS)
+			*num_entrypoints = NUM_IRIS_ENTRYPOINTS;
+		memcpy(entrypoint_list, iris_entrypoints,
+		       *num_entrypoints * sizeof(*entrypoint_list));
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -168,11 +167,15 @@ iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 	for (i = 0; i < num_attribs; i++) {
 		switch (attrib_list[i].type) {
 		case VAConfigAttribRTFormat:
-			attrib_list[i].value =
-				VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10BPP;
+			attrib_list[i].value = VA_RT_FORMAT_YUV420;
 			break;
+		case VAConfigAttribDecProcessing:
+			attrib_list[i].value = 0;
+			break;
+		/* Chrome's vaapi_wrapper queries the max coded size with its own
+		 * attrib numbers; answer any of them so GetMaxResolution passes. */
 		default:
-			attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+			attrib_list[i].value = 4096;
 			break;
 		}
 	}
@@ -208,6 +211,8 @@ iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 	dd->profile = profile;
 
 	*config_id = ++dd->config_id;
+	fprintf(stderr, "[cfg] created config=%u profile=%d\n", *config_id,
+		profile);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -224,7 +229,9 @@ iris_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 {
 	*profile = VAProfileH264High;
 	*entrypoint = VAEntrypointVLD;
-	if (attrib_list && num_attribs && *num_attribs) {
+	if (attrib_list && num_attribs) {
+		/* num_attribs is an output here (clients pass uninitialized
+		 * garbage); always report one supported RT format. */
 		attrib_list[0].type = VAConfigAttribRTFormat;
 		attrib_list[0].value = VA_RT_FORMAT_YUV420;
 		*num_attribs = 1;
@@ -546,12 +553,25 @@ iris_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
 			      VASurfaceAttrib *attrib_list,
 			      unsigned int *num_attribs)
 {
-	if (attrib_list && num_attribs && *num_attribs) {
-		attrib_list[0].type = VASurfaceAttribPixelFormat;
-		attrib_list[0].value.value.i = VA_FOURCC_NV12;
-		*num_attribs = 1;
-	} else if (num_attribs) {
-		*num_attribs = 1;
+	static const VASurfaceAttrib attrs[] = {
+		{ .type = VASurfaceAttribPixelFormat,
+		  .value.value.i = VA_FOURCC_NV12 },
+		{ .type = VASurfaceAttribMinWidth, .value.value.i = 16 },
+		{ .type = VASurfaceAttribMaxWidth, .value.value.i = 4096 },
+		{ .type = VASurfaceAttribMinHeight, .value.value.i = 16 },
+		{ .type = VASurfaceAttribMaxHeight, .value.value.i = 4096 },
+	};
+	unsigned int want = ARRAY_SIZE(attrs);
+
+	if (!num_attribs)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (attrib_list) {
+		if (*num_attribs > want)
+			*num_attribs = want;
+		memcpy(attrib_list, attrs,
+		       *num_attribs * sizeof(*attrib_list));
+	} else {
+		*num_attribs = want;
 	}
 	return VA_STATUS_SUCCESS;
 }
