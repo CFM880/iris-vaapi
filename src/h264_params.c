@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <string.h>
+
+#include "h264_params.h"
+
+/* ---- RBSP bit writer ---- */
+
+struct bs {
+	uint8_t *buf;
+	size_t size;
+	int bits;		/* total bits written */
+};
+
+static void bs_put(struct bs *b, unsigned int val, int n)
+{
+	int i;
+
+	for (i = n - 1; i >= 0; i--) {
+		int byte = b->bits >> 3;
+		int bit = 7 - (b->bits & 7);
+
+		if (byte >= (int)b->size)
+			return;
+		if (val & (1u << i))
+			b->buf[byte] |= (1u << bit);
+		b->bits++;
+	}
+}
+
+static void bs_ue(struct bs *b, unsigned int val)
+{
+	int code = val + 1;
+	int n = 32 - __builtin_clz(code);
+
+	bs_put(b, 0, n - 1);
+	bs_put(b, code, n);
+}
+
+static void bs_se(struct bs *b, int val)
+{
+	unsigned int code = (val <= 0) ? (unsigned int)(-2 * val)
+				      : (unsigned int)(2 * val - 1);
+
+	bs_ue(b, code);
+}
+
+/* ---- profile mapping ---- */
+
+static int profile_idc(VAProfile profile)
+{
+	switch (profile) {
+	case VAProfileH264ConstrainedBaseline:
+	case VAProfileH264Baseline:
+		return 66;
+	case VAProfileH264Main:
+		return 77;
+	case VAProfileH264High:
+	case VAProfileH264High10:
+	case VAProfileH264High422:
+		return 100;
+	default:
+		return 100;
+	}
+}
+
+static int constraint_flags(VAProfile profile)
+{
+	return profile == VAProfileH264ConstrainedBaseline ? 0x40 : 0;
+}
+
+/* Pick a level from the coded height (conservative). */
+static int level_for_height(unsigned int height)
+{
+	if (height <= 480)
+		return 30;
+	if (height <= 720)
+		return 31;
+	if (height <= 1088)
+		return 40;
+	if (height <= 2176)
+		return 51;
+	return 60;
+}
+
+int h264_build_sps(uint8_t *out, size_t out_size,
+		   const VAPictureParameterBufferH264 *pic, VAProfile profile)
+{
+	struct bs b;
+	unsigned int sps_id = 0;
+	unsigned int cfi = pic->seq_fields.bits.chroma_format_idc;
+	int i;
+
+	memset(out, 0, out_size);
+	b.buf = out;
+	b.size = out_size;
+	b.bits = 0;
+
+	bs_put(&b, 0x67, 8);	/* NAL header: forbidden=0, ref_idc=3, type=7 */
+	bs_put(&b, profile_idc(profile), 8);
+	bs_put(&b, constraint_flags(profile), 8);
+	bs_put(&b, level_for_height(pic->picture_height_in_mbs_minus1 + 1),
+	       8);
+	bs_ue(&b, sps_id);
+	bs_ue(&b, cfi);
+	if (cfi == 3)
+		bs_put(&b, pic->seq_fields.bits.residual_colour_transform_flag,
+		       1);
+	bs_ue(&b, pic->bit_depth_luma_minus8);
+	bs_ue(&b, pic->bit_depth_chroma_minus8);
+	bs_put(&b, 0, 1);	/* qpprime_y_zero_transform_bypass_flag */
+	bs_put(&b, 0, 1);	/* seq_scaling_matrix_present_flag */
+
+	bs_ue(&b, pic->seq_fields.bits.log2_max_frame_num_minus4);
+	bs_ue(&b, pic->seq_fields.bits.pic_order_cnt_type);
+	if (pic->seq_fields.bits.pic_order_cnt_type == 0) {
+		bs_ue(&b, pic->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4);
+	} else if (pic->seq_fields.bits.pic_order_cnt_type == 1) {
+		bs_put(&b, pic->seq_fields.bits.delta_pic_order_always_zero_flag,
+		       1);
+		bs_se(&b, 0);	/* offset_for_non_ref_pic */
+		bs_se(&b, 0);	/* offset_for_top_to_bottom_field */
+		bs_ue(&b, 0);	/* num_ref_frames_in_pic_order_cnt_cycle */
+	}
+	bs_ue(&b, pic->num_ref_frames);
+	bs_put(&b, pic->seq_fields.bits.gaps_in_frame_num_value_allowed_flag,
+	       1);
+	bs_ue(&b, pic->picture_width_in_mbs_minus1);
+	bs_ue(&b, pic->picture_height_in_mbs_minus1);
+	bs_put(&b, pic->seq_fields.bits.frame_mbs_only_flag, 1);
+	if (!pic->seq_fields.bits.frame_mbs_only_flag)
+		bs_put(&b, pic->seq_fields.bits.mb_adaptive_frame_field_flag, 1);
+	bs_put(&b, pic->seq_fields.bits.direct_8x8_inference_flag, 1);
+	bs_put(&b, 0, 1);	/* frame_cropping_flag */
+	bs_put(&b, 0, 1);	/* vui_parameters_present_flag */
+
+	/* rbsp_stop_one_bit + alignment */
+	bs_put(&b, 1, 1);
+	while (b.bits & 7)
+		bs_put(&b, 0, 1);
+
+	(void)i;
+	return b.bits >> 3;
+}
+
+int h264_build_pps(uint8_t *out, size_t out_size,
+		   const VAPictureParameterBufferH264 *pic)
+{
+	struct bs b;
+	unsigned int sps_id = 0;
+	unsigned int pps_id = 0;
+	unsigned int cfi = pic->seq_fields.bits.chroma_format_idc;
+
+	memset(out, 0, out_size);
+	b.buf = out;
+	b.size = out_size;
+	b.bits = 0;
+
+	bs_put(&b, 0x68, 8);	/* NAL header: forbidden=0, ref_idc=3, type=8 */
+	bs_ue(&b, pps_id);
+	bs_ue(&b, sps_id);
+	bs_put(&b, pic->pic_fields.bits.entropy_coding_mode_flag, 1);
+	bs_put(&b, pic->pic_fields.bits.pic_order_present_flag, 1);
+	bs_ue(&b, 0);		/* num_slice_groups_minus1 */
+	bs_ue(&b, 0);		/* num_ref_idx_l0_default_active_minus1 */
+	bs_ue(&b, 0);		/* num_ref_idx_l1_default_active_minus1 */
+	bs_put(&b, pic->pic_fields.bits.weighted_pred_flag, 1);
+	bs_put(&b, pic->pic_fields.bits.weighted_bipred_idc, 2);
+	bs_se(&b, pic->pic_init_qp_minus26);
+	bs_se(&b, pic->pic_init_qs_minus26);
+	bs_se(&b, pic->chroma_qp_index_offset);
+	bs_put(&b, pic->pic_fields.bits.deblocking_filter_control_present_flag,
+	       1);
+	bs_put(&b, pic->pic_fields.bits.constrained_intra_pred_flag, 1);
+	bs_put(&b, pic->pic_fields.bits.redundant_pic_cnt_present_flag, 1);
+	if (cfi == 1)
+		bs_put(&b, pic->pic_fields.bits.transform_8x8_mode_flag, 1);
+	bs_put(&b, 0, 1);	/* pic_scaling_matrix_present_flag */
+	bs_se(&b, pic->second_chroma_qp_index_offset);
+
+	bs_put(&b, 1, 1);
+	while (b.bits & 7)
+		bs_put(&b, 0, 1);
+
+	return b.bits >> 3;
+}
