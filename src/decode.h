@@ -27,6 +27,9 @@ int iris_decode_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id);
 int iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target);
 int iris_decode_picture(struct iris_decode_ctx *ctx,
 			const VAPictureParameterBufferH264 *pic);
+/* Capture per-slice parameters (reference counts) for the PPS default. */
+int iris_decode_slice_params(struct iris_decode_ctx *ctx,
+			     const VASliceParameterBufferH264 *sp);
 int iris_decode_slice(struct iris_decode_ctx *ctx, const void *data,
 		      size_t len);
 

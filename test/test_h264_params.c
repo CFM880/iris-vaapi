@@ -219,7 +219,7 @@ int main(int argc, char **argv)
 
 	out_sps_len = h264_build_sps(out_sps, sizeof(out_sps), &pic,
 				    VAProfileH264High);
-	out_pps_len = h264_build_pps(out_pps, sizeof(out_pps), &pic);
+	out_pps_len = h264_build_pps(out_pps, sizeof(out_pps), &pic, 1, 0);
 	printf("rebuilt SPS %d bytes, PPS %d bytes\n", out_sps_len, out_pps_len);
 
 	out = fopen(outpath, "wb");

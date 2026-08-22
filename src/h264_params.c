@@ -99,8 +99,8 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0x67, 8);	/* NAL header: forbidden=0, ref_idc=3, type=7 */
 	bs_put(&b, profile_idc(profile), 8);
 	bs_put(&b, constraint_flags(profile), 8);
-	bs_put(&b, level_for_height(pic->picture_height_in_mbs_minus1 + 1),
-	       8);
+	bs_put(&b, level_for_height((pic->picture_height_in_mbs_minus1 + 1) *
+				    16), 8);
 	bs_ue(&b, sps_id);
 	bs_ue(&b, cfi);
 	if (cfi == 3)
@@ -132,7 +132,21 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 		bs_put(&b, pic->seq_fields.bits.mb_adaptive_frame_field_flag, 1);
 	bs_put(&b, pic->seq_fields.bits.direct_8x8_inference_flag, 1);
 	bs_put(&b, 0, 1);	/* frame_cropping_flag */
-	bs_put(&b, 0, 1);	/* vui_parameters_present_flag */
+
+	/* Minimal VUI timing so the firmware can pace P-frame references. */
+	bs_put(&b, 1, 1);	/* vui_parameters_present_flag */
+	bs_put(&b, 0, 1);	/* aspect_ratio_info_present_flag */
+	bs_put(&b, 0, 1);	/* overscan_info_present_flag */
+	bs_put(&b, 0, 1);	/* video_signal_type_present_flag */
+	bs_put(&b, 0, 1);	/* chroma_loc_info_present_flag */
+	bs_put(&b, 1, 1);	/* timing_info_present_flag */
+	bs_ue(&b, 1);		/* num_units_in_tick */
+	bs_ue(&b, 60);		/* time_scale */
+	bs_put(&b, 0, 1);	/* fixed_frame_rate_flag */
+	bs_put(&b, 0, 1);	/* nal_hrd_parameters_present_flag */
+	bs_put(&b, 0, 1);	/* vcl_hrd_parameters_present_flag */
+	bs_put(&b, 0, 1);	/* pic_struct_present_flag */
+	bs_put(&b, 0, 1);	/* bitstream_restriction_flag */
 
 	/* rbsp_stop_one_bit + alignment */
 	bs_put(&b, 1, 1);
@@ -144,7 +158,9 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 }
 
 int h264_build_pps(uint8_t *out, size_t out_size,
-		   const VAPictureParameterBufferH264 *pic)
+		   const VAPictureParameterBufferH264 *pic,
+		   int num_ref_idx_l0_default_active_minus1,
+		   int num_ref_idx_l1_default_active_minus1)
 {
 	struct bs b;
 	unsigned int sps_id = 0;
@@ -162,8 +178,8 @@ int h264_build_pps(uint8_t *out, size_t out_size,
 	bs_put(&b, pic->pic_fields.bits.entropy_coding_mode_flag, 1);
 	bs_put(&b, pic->pic_fields.bits.pic_order_present_flag, 1);
 	bs_ue(&b, 0);		/* num_slice_groups_minus1 */
-	bs_ue(&b, 0);		/* num_ref_idx_l0_default_active_minus1 */
-	bs_ue(&b, 0);		/* num_ref_idx_l1_default_active_minus1 */
+	bs_ue(&b, num_ref_idx_l0_default_active_minus1);
+	bs_ue(&b, num_ref_idx_l1_default_active_minus1);
 	bs_put(&b, pic->pic_fields.bits.weighted_pred_flag, 1);
 	bs_put(&b, pic->pic_fields.bits.weighted_bipred_idc, 2);
 	bs_se(&b, pic->pic_init_qp_minus26);

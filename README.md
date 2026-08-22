@@ -113,17 +113,30 @@ mplane 常见坑：
 5. **导出**：`vaExportSurfaceHandle` 用 `VIDIOC_EXPBUF` 把 CAPTURE buffer
    导出为 DRM PRIME fd，填 `VADRMPRIMESurfaceDescriptor`（NV12 两层）。
 
+**P 帧解码（P2，✅）**：修正两个固件严格校验的字段后，P 帧逐像素正确：
+1. **level 计算 bug**：`level_for_height` 收到的是宏块数而非像素，1080p 被算成
+   level 3.0（承载不了 1080p），固件拒绝。已改为 `(mbs+1)*16`。
+2. **PPS `num_ref_idx_l0_default_active_minus1`**：从 `VASliceParameterBufferH264`
+   捕获（Chrome 填的是 slice 实际使用的参考数），重建进 PPS，否则固件
+   参考解析失败（refs=0 时 62/75 帧，refs=1 时 75/75）。
+3. **参数变化检测**：SPS/PPS 只在内容变化时重发（每帧重发会重置 DPB）。
+
+**验证**（无 B 帧流，IDR + 9 个 P 帧）：
+```
+surf0=a6ebf5b5=ref0(IDR)   surf1=bef7950e=ref1(P)
+surf3=8646c3c1=ref3(P)     surf5=d825880e=ref5(P)
+```
+全部与 FFmpeg 软件解码**逐像素一致**。
+
 **已知限制**：
 - stateful 固件有 1 帧 hold 延迟：最后入队的画面需再喂一帧（或 EOS）才释放，
   对应 `vaSyncSurface` 对最后一张画面会超时。
-- 每帧重发 SPS/PPS 会重置 DPB，P 帧参考依赖可能失效；真实 Chrome 只在参数
-  变更时发 SPS/PPS（驱动需加"参数变化才重发"逻辑）。
+- B 帧流需要解码顺序处理（固件内部处理，但测试喂显示序 slice 会丢帧）。
 - 单实例单引擎，不支持并发多视频流。
 
-## 待办（P2）
+## 待办（P2 剩余 / 后续）
 
-- Chrome 端实际加载驱动解码验证（EGL/Wayland 显示互通）
-- 参数变化检测（避免每帧重发 SPS/PPS）
+- **Chrome 端实际加载驱动解码验证**（EGL/Wayland 显示互通）
 - EOS flush 释放最后一帧
 - HEVC/VP9 slice 重组支持
 

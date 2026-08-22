@@ -14,8 +14,11 @@
 int h264_build_sps(uint8_t *out, size_t out_size,
 		   const VAPictureParameterBufferH264 *pic, VAProfile profile);
 
-/* Build a PPS NAL unit (without start code).  Returns the NAL size. */
+/* Build a PPS NAL unit (without start code).  Returns the NAL size.
+ * num_ref_idx_l0/l1_default_active_minus1 come from the slice parameters. */
 int h264_build_pps(uint8_t *out, size_t out_size,
-		   const VAPictureParameterBufferH264 *pic);
+		   const VAPictureParameterBufferH264 *pic,
+		   int num_ref_idx_l0_default_active_minus1,
+		   int num_ref_idx_l1_default_active_minus1);
 
 #endif

@@ -35,6 +35,12 @@ struct iris_decode_ctx {
 	size_t slice_len;
 	size_t slice_cap;
 	VASurfaceID current_target;
+
+	uint8_t last_sps[256];
+	int last_sps_len;
+	uint8_t last_pps[128];
+	int last_pps_len;
+	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
 };
 
 static struct iris_surface *
@@ -167,6 +173,19 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 	ctx->current_target = target;
 	ctx->have_pic = 0;
 	ctx->slice_len = 0;
+	ctx->refs_l0 = 0;
+	ctx->refs_l1 = 0;
+	return 0;
+}
+
+int
+iris_decode_slice_params(struct iris_decode_ctx *ctx,
+			 const VASliceParameterBufferH264 *sp)
+{
+		if (sp->num_ref_idx_l0_active_minus1 > ctx->refs_l0)
+		ctx->refs_l0 = sp->num_ref_idx_l0_active_minus1;
+	if (sp->num_ref_idx_l1_active_minus1 > ctx->refs_l1)
+		ctx->refs_l1 = sp->num_ref_idx_l1_active_minus1;
 	return 0;
 }
 
@@ -236,19 +255,31 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	if (ret)
 		return ret;
 
+	/* Only re-emit SPS/PPS when they change; a per-picture repetition
+	 * resets the firmware DPB and breaks P-frame references. */
 	n = h264_build_sps(au + 4, au_cap - 4 - ctx->slice_len, &ctx->pic,
 			   ctx->profile);
 	if (n <= 0)
 		return -1;
-	memcpy(au, sc4, 4);
-	au_len = 4 + n;
+	if (n != ctx->last_sps_len ||
+	    memcmp(au + 4, ctx->last_sps, n) != 0) {
+		memcpy(au, sc4, 4);
+		memcpy(ctx->last_sps, au + 4, n);
+		ctx->last_sps_len = n;
+		au_len = 4 + n;
+	}
 
-	n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
-			   ctx->slice_len, &ctx->pic);
+		n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
+			   ctx->slice_len, &ctx->pic, ctx->refs_l0, ctx->refs_l1);
 	if (n <= 0)
 		return -1;
-	memcpy(au + au_len, sc4, 4);
-	au_len += 4 + n;
+	if (n != ctx->last_pps_len ||
+	    memcmp(au + au_len + 4, ctx->last_pps, n) != 0) {
+		memcpy(au + au_len, sc4, 4);
+		memcpy(ctx->last_pps, au + au_len + 4, n);
+		ctx->last_pps_len = n;
+		au_len += 4 + n;
+	}
 
 	if (au_len + ctx->slice_len > au_cap) {
 		free(au);
@@ -276,16 +307,19 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			}
 			ctx->dec_started = 1;
 		} else {
-			/* Wait for a free OUTPUT buffer, then queue. */
-			for (;;) {
+			/* Wait for a free OUTPUT buffer, then queue.  The firmware
+			 * stops consuming input when its CAPTURE queue fills, so
+			 * drain finished frames while we wait or we deadlock. */
+			for (int spin = 0; spin < 100; spin++) {
 				while (v4l2_dec_dqout(&ctx->dec) == 0)
 					;
 				ret = v4l2_dec_feed(&ctx->dec, au, au_len, ts);
 				if (ret != -EAGAIN)
 					break;
-				v4l2_dec_poll(&ctx->dec, 100);
+				drain_available(ctx);
+				v4l2_dec_poll(&ctx->dec, 50);
 			}
-			if (ret) {
+						if (ret) {
 				free(au);
 				return ret;
 			}
@@ -313,6 +347,7 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 		ret = v4l2_dec_poll(&ctx->dec, 20);
 		if (ret <= 0)
 			continue;
+		(void)changed;
 		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
 		if (ret)
 			return ret;
@@ -321,7 +356,8 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
 		if (ret < 0)
 			continue;
-		if (assign_frame(ctx, &frame) == (int)id)
+			assign_frame(ctx, &frame);
+		if (iris_decode_surface_ready(ctx, id))
 			return 0;
 	}
 	return -1;

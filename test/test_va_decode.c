@@ -163,6 +163,8 @@ static void parse_pps(const uint8_t *nal, size_t len,
 	pic->second_chroma_qp_index_offset = br_se(&b);
 }
 
+static int g_nrl0, g_nrl1;
+
 int main(int argc, char **argv)
 {
 	const char *path = argc > 1 ? argv[1] : "/home/cfm880/qcom/test-1080p-3s.h264";
@@ -171,9 +173,9 @@ int main(int argc, char **argv)
 	FILE *fp;
 	long pos;
 	VAPictureParameterBufferH264 pic;
-	uint8_t sps[256], pps[64], slice[6][1 << 20];
+	static uint8_t sps[256], pps[64], slice[12][1 << 20];
 	int sps_len = -1, pps_len = -1;
-	int slice_len[6], n_slices = 0;
+	int slice_len[12], n_slices = 0;
 	VADisplay dpy;
 	VAConfigID cfg;
 	VAContextID ctx;
@@ -194,7 +196,7 @@ int main(int argc, char **argv)
 	fclose(fp);
 
 	pos = find_start(data, fsize, 0);
-	while (pos >= 0 && (sps_len < 0 || pps_len < 0 || n_slices < 5)) {
+	while (pos >= 0 && (sps_len < 0 || pps_len < 0 || n_slices < 10)) {
 		long next = find_start(data, fsize, pos + 1);
 		int t = data[pos] & 0x1f;
 		size_t end = next < 0 ? fsize : (size_t)next;
@@ -204,7 +206,7 @@ int main(int argc, char **argv)
 			memcpy(sps, data + pos, nalsz); sps_len = nalsz;
 		} else if (t == 8 && pps_len < 0) {
 			memcpy(pps, data + pos, nalsz); pps_len = nalsz;
-		} else if (t >= 1 && t <= 5 && n_slices < 5) {
+		} else if (t >= 1 && t <= 5 && n_slices < 10) {
 			memcpy(slice[n_slices], data + pos, nalsz);
 			slice_len[n_slices] = nalsz;
 			n_slices++;
@@ -217,9 +219,10 @@ int main(int argc, char **argv)
 
 	parse_sps(sps, sps_len, &pic);
 	parse_pps(pps, pps_len, &pic);
-	printf("picture %ux%u mbs\n",
+	printf("picture %ux%u mbs, g_nrl0=%d g_nrl1=%d\n",
 	       (pic.picture_width_in_mbs_minus1 + 1) * 16,
-	       (pic.picture_height_in_mbs_minus1 + 1) * 16);
+	       (pic.picture_height_in_mbs_minus1 + 1) * 16,
+	       g_nrl0, g_nrl1);
 
 	fd = open("/dev/dri/renderD128", O_RDWR);
 	if (fd < 0) { perror("open renderD128"); return 1; }
@@ -240,31 +243,49 @@ int main(int argc, char **argv)
 			      NULL, 0);
 	if (st) { fprintf(stderr, "vaCreateSurfaces: %s\n", vaErrorStr(st)); return 1; }
 
-	st = vaCreateBuffer(dpy, ctx, VAPictureParameterBufferType,
-			    sizeof(VAPictureParameterBufferH264), 1, &pic,
-			    &bufs[0]);
-	if (st) { fprintf(stderr, "pic buf: %s\n", vaErrorStr(st)); return 1; }
+	/* Mirror Chrome: each picture carries slice params carrying the
+	 * PPS default reference counts (rebuilt into the PPS NAL). */
+	{
+		VASliceParameterBufferH264 sp;
+		unsigned int i;
 
-	/* Feed 5 pictures (the firmware pipeline needs several in flight).
-	 * Repeat the IDR to avoid cross-picture reference dependencies. */
-	for (int i = 0; i < 5; i++) {
-		int si = 0;
-		st = vaCreateBuffer(dpy, ctx, VASliceDataBufferType,
-				    slice_len[si], 1, slice[si], &bufs[1]);
-		if (st) { fprintf(stderr, "slice buf: %s\n", vaErrorStr(st)); return 1; }
-		st = vaBeginPicture(dpy, ctx, surf[i]);
-		if (st) { fprintf(stderr, "vaBeginPicture: %s\n", vaErrorStr(st)); return 1; }
-		st = vaRenderPicture(dpy, ctx, bufs, 2);
-		if (st) { fprintf(stderr, "vaRenderPicture: %s\n", vaErrorStr(st)); return 1; }
-		st = vaEndPicture(dpy, ctx);
-		if (st) { fprintf(stderr, "vaEndPicture %d: %s\n", i, vaErrorStr(st)); return 1; }
-		vaDestroyBuffer(dpy, bufs[1]);
+		/* Chrome fills these with the reference count each slice actually
+		 * uses (via num_ref_idx_active_override_flag); P-frames here use
+		 * one reference. */
+		memset(&sp, 0, sizeof(sp));
+		sp.num_ref_idx_l0_active_minus1 = 1;
+		sp.num_ref_idx_l1_active_minus1 = 0;
+		st = vaCreateBuffer(dpy, ctx, VASliceParameterBufferType,
+				    sizeof(sp), 1, &sp, &bufs[0]);
+		if (st) { fprintf(stderr, "slice param buf: %s\n", vaErrorStr(st)); return 1; }
+
+		/* Feed 10 real consecutive pictures so the pipeline fills. */
+		for (i = 0; i < 10; i++) {
+			VABufferID rb[3];
+
+			st = vaCreateBuffer(dpy, ctx, VASliceDataBufferType,
+					    slice_len[i], 1, slice[i], &bufs[1]);
+			if (st) { fprintf(stderr, "slice buf: %s\n", vaErrorStr(st)); return 1; }
+			st = vaCreateBuffer(dpy, ctx, VAPictureParameterBufferType,
+					    sizeof(pic), 1, &pic, &rb[2]);
+			if (st) { fprintf(stderr, "pic buf: %s\n", vaErrorStr(st)); return 1; }
+			rb[0] = bufs[0];	/* slice params */
+			rb[1] = bufs[1];	/* slice data */
+			st = vaBeginPicture(dpy, ctx, surf[i]);
+			if (st) { fprintf(stderr, "vaBeginPicture: %s\n", vaErrorStr(st)); return 1; }
+			st = vaRenderPicture(dpy, ctx, rb, 3);
+			if (st) { fprintf(stderr, "vaRenderPicture: %s\n", vaErrorStr(st)); return 1; }
+			st = vaEndPicture(dpy, ctx);
+			if (st) { fprintf(stderr, "vaEndPicture %d: %s\n", i, vaErrorStr(st)); return 1; }
+			vaDestroyBuffer(dpy, bufs[1]);
+			vaDestroyBuffer(dpy, rb[2]);
+		}
 	}
 
 	/* The last picture stays held in the firmware pipeline (stateful
-	 * one-frame latency), so sync the fourth picture which is ready. */
+	 * one-frame latency), so sync a middle picture which is ready. */
 	{
-		int sync_idx = 3;
+		int sync_idx = 6;
 		int si;
 		VASurfaceID s;
 
@@ -276,36 +297,31 @@ int main(int argc, char **argv)
 		st = vaSyncSurface(dpy, s);
 		if (st) { fprintf(stderr, "vaSyncSurface: %s\n", vaErrorStr(st)); return 1; }
 		printf("synced surface %u\n", s);
+		{
+			int exi[] = { 0, 1, 3, 5 };
+			VADRMPRIMESurfaceDescriptor dsc;
+
+			for (int k = 0; k < 4; k++) {
+				char path[64];
+				void *mp;
+				FILE *out;
+
+				st = vaExportSurfaceHandle(dpy, surf[exi[k]],
+							   VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+							   VA_EXPORT_SURFACE_READ_ONLY, &dsc);
+				if (st) { fprintf(stderr, "export %d: %s\n", exi[k], vaErrorStr(st)); continue; }
+				mp = mmap(NULL, dsc.objects[0].size, PROT_READ, MAP_SHARED,
+					  dsc.objects[0].fd, 0);
+				if (mp == MAP_FAILED) { perror("mmap"); continue; }
+				snprintf(path, sizeof(path), "/tmp/va-s%d.nv12", exi[k]);
+				out = fopen(path, "wb");
+				if (out) { fwrite(mp, 1, dsc.objects[0].size, out); fclose(out); }
+				else perror("fopen");
+				munmap(mp, dsc.objects[0].size);
+			}
+		}
 	}
 
-	{
-		VADRMPRIMESurfaceDescriptor desc;
-		unsigned int w, h, size;
-		void *map;
-		FILE *out = argc > 2 ? fopen(argv[2], "wb") : NULL;
-
-		st = vaExportSurfaceHandle(dpy, surf[0],
-					   VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-					   VA_EXPORT_SURFACE_READ_ONLY, &desc);
-		if (st) { fprintf(stderr, "export: %s\n", vaErrorStr(st)); return 1; }
-		printf("exported: %ux%u fourcc=%c%c%c%c layers=%u objects=%u\n",
-		       desc.width, desc.height,
-		       desc.fourcc & 0xff, (desc.fourcc >> 8) & 0xff,
-		       (desc.fourcc >> 16) & 0xff, (desc.fourcc >> 24) & 0xff,
-		       desc.num_layers, desc.num_objects);
-
-		map = mmap(NULL, desc.objects[0].size, PROT_READ, MAP_SHARED,
-			   desc.objects[0].fd, 0);
-		if (map == MAP_FAILED) {
-			perror("mmap export");
-			return 1;
-		}
-		if (out) {
-			fwrite(map, 1, desc.objects[0].size, out);
-			fclose(out);
-		}
-		munmap(map, desc.objects[0].size);
-	}
 
 	vaDestroyConfig(dpy, cfg);
 	vaTerminate(dpy);

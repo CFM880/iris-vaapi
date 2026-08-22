@@ -398,7 +398,7 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			return VA_STATUS_ERROR_INVALID_BUFFER;
 		data = dd->buf_data[idx];
 		type = dd->buf_types[idx];
-
+	
 		switch (type) {
 		case VAPictureParameterBufferType:
 			if (dd->buf_sizes[idx] <
@@ -407,7 +407,9 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			iris_decode_picture(dd->dec, data);
 			break;
 		case VASliceParameterBufferType:
-			/* Slice headers are inside the data buffers. */
+			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264))
+				return VA_STATUS_ERROR_INVALID_BUFFER;
+			iris_decode_slice_params(dd->dec, data);
 			break;
 		case VASliceDataBufferType:
 			iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]);
