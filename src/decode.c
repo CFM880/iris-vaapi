@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <linux/dma-heap.h>
 
@@ -19,6 +20,10 @@
 
 #ifndef ALIGN_TO
 #define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#endif
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC	0x0001U
 #endif
 
 static int
@@ -35,9 +40,27 @@ dma_heap_alloc(int heap_fd, unsigned int size)
 	return data.fd;
 }
 
+/* Fallback backing for when /dev/dma_heap/system is not accessible (root
+ * only): an anonymous memfd is mmappable and readable by local tests and the
+ * ffmpeg CPU readback path, but is NOT a DRM buffer and cannot be imported by
+ * EGL/GPU clients like Chrome. */
+static int
+memfd_alloc(unsigned int size)
+{
+	int fd = (int)syscall(SYS_memfd_create, "iris-surface", MFD_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	if (ftruncate(fd, size) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 struct iris_surface {
 	VASurfaceID id;
-	int bfd;		/* DMA-heap backing fd (stable, exportable) */
+	int bfd;		/* backing fd (DMA-heap, or memfd fallback) */
 	void *bmap;		/* mmap of the backing */
 	unsigned int bsize;
 	int decoded;
@@ -121,19 +144,25 @@ iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id)
 	if (ctx->n_surfaces >= 64)
 		return -1;
 
-	/* Stable, exportable backing buffer independent of the V4L2 session. */
+	/* Stable, exportable backing buffer independent of the V4L2 session.
+	 * Prefer a real DMA-heap buffer so the exported fd can be imported by
+	 * GPU clients (Chrome/EGL); fall back to a plain memfd when the heap
+	 * node is root-only, which keeps local tests and CPU readback working. */
 	size = ALIGN_TO(ctx->width, 16) * ALIGN_TO(ctx->height, 32) * 3 / 2;
 	fprintf(stderr, "[surf] id=%u size=%u w=%u h=%u\n", id, size,
 		ctx->width, ctx->height);
 	heap = open("/dev/dma_heap/system", O_RDWR);
-	if (heap < 0) {
-		perror("[surf] open heap");
-		return -1;
+	if (heap >= 0) {
+		bfd = dma_heap_alloc(heap, size);
+		close(heap);
+	} else {
+		fprintf(stderr, "[surf] dma_heap unavailable (%s); "
+			"using memfd backing (not GPU-importable)\n",
+			strerror(errno));
+		bfd = memfd_alloc(size);
 	}
-	bfd = dma_heap_alloc(heap, size);
-	close(heap);
 	if (bfd < 0) {
-		perror("[surf] heap alloc");
+		perror("[surf] alloc backing");
 		return -1;
 	}
 	map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0);

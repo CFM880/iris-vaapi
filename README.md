@@ -221,6 +221,11 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
    `vaQueryConfigAttributes` 输出语义、profile 查询 lenient。
 4. 已实现：每个 surface 用 `/dev/dma_heap/system` 分配稳定 DMA-BUF 后备，
    解码后拷贝进后备（`src/decode.c`）。**ffmpeg 已验证此模型可用**。
+   若 `/dev/dma_heap/system` 不可访问（root only，默认权限），驱动自动
+   回退到 **memfd 后备**：本地测试与 ffmpeg CPU 读回路径仍可无 root 运行
+   （输出与软解逐字节一致），但该 fd 不是 DRM buffer，**无法被 GPU/EGL
+   客户端（Chrome）导入**。真实 Chrome 显示互通仍需：
+   `sudo chmod 0666 /dev/dma_heap/system`。
 5. 待验证：Chrome 探测（空 surface 的 sync+export）是否通过。注意
    `/dev/dma_heap/system` 需要 `sudo chmod 0666`（root only）。
 
@@ -231,6 +236,9 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
 - H.264 4K60 高码率受固件解码上限（~49fps）。
 - 中断会话会让固件卡死（SESSION_INIT 超时 -110），需重载模块：
   `sudo rmmod qcom_iris && sudo modprobe qcom_iris`
+- surface 后备缺省用 DMA-heap（GPU 可导入）；未 chmod 时自动回退 memfd，
+  本地测试/ffmpeg 仍可用，但 Chrome 显示互通需要
+  `sudo chmod 0666 /dev/dma_heap/system`。
 
 ### 构建与测试命令
 ```sh

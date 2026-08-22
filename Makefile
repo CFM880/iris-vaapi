@@ -11,6 +11,7 @@ H264_OBJ = $(BUILD)/h264_params.o
 TEST_VA = $(BUILD)/test_va
 TEST_V4L2 = $(BUILD)/test_v4l2_dec
 TEST_H264 = $(BUILD)/test_h264_params
+TEST_VADEC = $(BUILD)/test_va_decode
 
 .PHONY: all clean install
 
@@ -32,7 +33,7 @@ $(V4L2_OBJ): src/v4l2_dec.c src/v4l2_dec.h
 
 $(TEST_VA): test/test_va.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
 
 $(TEST_V4L2): test/test_v4l2_dec.c $(V4L2_OBJ) src/v4l2_dec.h
 	@mkdir -p $(BUILD)
@@ -45,8 +46,6 @@ $(H264_OBJ): src/h264_params.c src/h264_params.h
 $(TEST_H264): test/test_h264_params.c $(H264_OBJ) src/h264_params.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(H264_OBJ)
-
-TEST_VADEC = $(BUILD)/test_va_decode
 
 $(TEST_VADEC): test/test_va_decode.c
 	@mkdir -p $(BUILD)
