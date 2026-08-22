@@ -22,7 +22,7 @@
 
 #define OUT_SIZEIMAGE	(16U * 1024 * 1024)	/* room for a 4K access unit */
 #define OUT_BUFFERS	16
-#define CAP_BUFFERS	20
+#define CAP_BUFFERS	32
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {

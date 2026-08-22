@@ -16,6 +16,10 @@
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
 
+#ifndef ALIGN
+#define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#endif
+
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12	0x3231564e	/* NV12 fourcc */
 #endif
@@ -39,6 +43,17 @@ struct iris_drv_data {
 	VABufferType buf_types[256];
 	unsigned int buf_sizes[256];
 	void *buf_data[256];
+
+	/* Derived images (vaDeriveImage) map a VABufferID to a CAPTURE buffer. */
+	VABufferID derived_ids[256];
+	void *derived_mem[256];
+	int derived_n;
+
+	/* vaCreateImage/vaGetImage CPU transfer buffers. */
+	VABufferID img_ids[64];
+	unsigned int img_sizes[64];
+	void *img_data[64];
+	int img_n;
 };
 
 static const VAProfile iris_profiles[] = {
@@ -85,8 +100,9 @@ iris_vaTerminate(VADriverContextP ctx)
 
 	if (dd) {
 		iris_free_buffers(dd);
-		if (dd->dec)
+		if (dd->dec) {
 			iris_decode_destroy(dd->dec);
+		}
 		free(dd);
 		ctx->pDriverData = NULL;
 	}
@@ -163,6 +179,19 @@ iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 	return VA_STATUS_SUCCESS;
 }
 
+static int
+iris_ensure_decode_ctx(struct iris_drv_data *dd, unsigned int w, unsigned int h)
+{
+	if (dd->dec)
+		return 0;
+	dd->dec = iris_decode_create();
+	if (!dd->dec)
+		return -1;
+	iris_decode_setup(dd->dec, w ? w : dd->width, h ? h : dd->height,
+			  dd->profile);
+	return 0;
+}
+
 static VAStatus
 iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 		    VAEntrypoint entrypoint, VAConfigAttrib *attrib_list,
@@ -218,13 +247,9 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 
 	dd->width = picture_width;
 	dd->height = picture_height;
-	if (!dd->dec) {
-		dd->dec = iris_decode_create();
-		if (!dd->dec)
-			return VA_STATUS_ERROR_ALLOCATION_FAILED;
-		iris_decode_setup(dd->dec, picture_width, picture_height,
-				  dd->profile);
-	}
+	if (iris_ensure_decode_ctx(dd, picture_width, picture_height))
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	iris_decode_setup(dd->dec, picture_width, picture_height, dd->profile);
 	*context_id = ++dd->context_id;
 	return VA_STATUS_SUCCESS;
 }
@@ -246,10 +271,15 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
+	/* The decode context may not exist yet if the client creates surfaces
+	 * before the context; make sure surface ids are always tracked. */
+	if (iris_ensure_decode_ctx(dd, width, height))
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
 	for (i = 0; i < num_surfaces; i++) {
 		VASurfaceID id = ++dd->surface_id;
 
-		if (dd->dec && iris_decode_create_surface(dd->dec, id))
+		if (iris_decode_create_surface(dd->dec, id))
 			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 		surfaces[i] = id;
 	}
@@ -334,6 +364,21 @@ iris_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 	*pbuf = NULL;
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
+
+	for (i = 0; i < dd->derived_n; i++) {
+		if (dd->derived_ids[i] != buf_id)
+			continue;
+		*pbuf = dd->derived_mem[i];
+		return VA_STATUS_SUCCESS;
+	}
+
+	for (i = 0; i < dd->img_n; i++) {
+		if (dd->img_ids[i] != buf_id)
+			continue;
+		*pbuf = dd->img_data[i];
+		return VA_STATUS_SUCCESS;
+	}
+
 	i = iris_find_buffer(dd, buf_id);
 	if (i < 0)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -524,18 +569,96 @@ static VAStatus
 iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 		   int height, VAImage *image)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+	unsigned int pitch, size;
+	VABufferID bid;
+
+	if (!dd || !image)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (dd->img_n >= 64)
+		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+
+	pitch = ALIGN(width, 16);
+	size = (unsigned int)pitch * ALIGN(height, 32) * 3 / 2;
+	dd->img_data[dd->img_n] = calloc(1, size);
+	if (!dd->img_data[dd->img_n])
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	bid = ++dd->buffer_id;
+	dd->img_ids[dd->img_n] = bid;
+	dd->img_sizes[dd->img_n] = size;
+
+	memset(image, 0, sizeof(*image));
+	image->image_id = bid;
+	image->width = width;
+	image->height = height;
+	image->format = *format;
+	image->data_size = size;
+	image->num_planes = 2;
+	image->pitches[0] = pitch;
+	image->pitches[1] = pitch;
+	image->offsets[0] = 0;
+	image->offsets[1] = (unsigned int)pitch * ALIGN(height, 32);
+	image->buf = bid;
+	dd->img_n++;
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+	unsigned int cap, pitch, size, w, h;
+	void *mem;
+	VABufferID bid;
+
+	if (!dd || !dd->dec || !image)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (iris_decode_surface_buffer(dd->dec, surface, &cap, &mem, &pitch,
+				       &size, &w, &h))
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (dd->derived_n >= 256)
+		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+
+	bid = ++dd->buffer_id;
+	dd->derived_ids[dd->derived_n] = bid;
+	dd->derived_mem[dd->derived_n] = mem;
+	dd->derived_n++;
+
+	memset(image, 0, sizeof(*image));
+	image->image_id = bid;
+	image->width = w;
+	image->height = h;
+	image->format.fourcc = VA_FOURCC_NV12;
+	image->format.byte_order = VA_LSB_FIRST;
+	image->format.bits_per_pixel = 12;
+	image->data_size = size;
+	image->num_planes = 2;
+	image->pitches[0] = pitch;
+	image->pitches[1] = pitch;
+	image->offsets[0] = 0;
+	image->offsets[1] = pitch * h;
+	image->buf = bid;
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaDestroyImage(VADriverContextP ctx, VAImageID image)
 {
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
+	if (!dd)
+		return VA_STATUS_SUCCESS;
+	for (i = 0; i < dd->img_n; i++) {
+		if (dd->img_ids[i] != image)
+			continue;
+		free(dd->img_data[i]);
+		dd->img_ids[i] = dd->img_ids[dd->img_n - 1];
+		dd->img_data[i] = dd->img_data[dd->img_n - 1];
+		dd->img_sizes[i] = dd->img_sizes[dd->img_n - 1];
+		dd->img_n--;
+		break;
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -550,7 +673,27 @@ static VAStatus
 iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 		unsigned int width, unsigned int height, VAImageID image)
 {
-	return VA_STATUS_ERROR_UNIMPLEMENTED;
+	struct iris_drv_data *dd = ctx->pDriverData;
+	unsigned int cap, pitch, size, w, h;
+	void *mem, *dst = NULL;
+	int i;
+
+	if (!dd || !dd->dec)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (iris_decode_surface_buffer(dd->dec, surface, &cap, &mem, &pitch,
+				       &size, &w, &h))
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	for (i = 0; i < dd->img_n; i++)
+		if (dd->img_ids[i] == image) {
+			dst = dd->img_data[i];
+			break;
+		}
+	if (!dst)
+		return VA_STATUS_ERROR_INVALID_IMAGE;
+
+	/* Copy the (possibly height-aligned) NV12 frame into the image. */
+	memcpy(dst, mem, size);
+	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus

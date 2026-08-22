@@ -43,4 +43,10 @@ int iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
 		       unsigned int *pitch, unsigned int *size,
 		       unsigned int *width, unsigned int *height);
 
+/* Look up the decoded CAPTURE buffer of @id (for vaDeriveImage/vaMapBuffer). */
+int iris_decode_surface_buffer(struct iris_decode_ctx *ctx, VASurfaceID id,
+			       unsigned int *cap_index, void **mem,
+			       unsigned int *pitch, unsigned int *size,
+			       unsigned int *width, unsigned int *height);
+
 #endif

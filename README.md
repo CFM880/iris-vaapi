@@ -134,6 +134,32 @@ surf3=8646c3c1=ref3(P)     surf5=d825880e=ref5(P)
 - B 帧流需要解码顺序处理（固件内部处理，但测试喂显示序 slice 会丢帧）。
 - 单实例单引擎，不支持并发多视频流。
 
+## 真实客户端验证（ffmpeg VA-API，✅）
+
+用 ffmpeg 的 `-hwaccel vaapi` 作为第三方 VA-API 客户端验证：
+
+```
+# 无 B 帧流: 75 帧全部解码，6.5x 超实时
+$ ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i nob.h264 -f null -
+frame= 75  ...  speed=6.54x   EXIT=0
+
+# B 帧流: 77 帧全部解码（含 B 帧重排）
+frame= 77  ...  speed=6.93x   EXIT=0
+
+# 内容校验：前 5 帧与软件解码 md5 逐字节一致
+frame0..4: vaapi = ref（全部匹配）
+```
+
+**过程中修复的关键问题**：
+1. **surface id 注册时机**：ffmpeg 在 `vaCreateContext` 前创建 surface 1，此时
+   decode ctx 不存在 → surface 未注册。改为 `iris_ensure_decode_ctx` 懒创建。
+2. **surface 匹配从 timestamp 改为序列号映射**：不依赖客户端 surface id
+   的连续性，用 seq→target surface 的 FIFO 映射。
+3. **`vaCreateImage`/`vaGetImage`/`vaDeriveImage`**：实现 CPU 读回路径
+   （ffmpeg 用 vaCreateImage 传输帧）。
+4. **同步**：`vaEndPicture` 喂入后排空，让上一帧（固件 hold）立即就绪，
+   避免逐帧 sync 的客户端死锁。
+
 ## 待办（P2 剩余 / 后续）
 
 - **Chrome 端实际加载驱动解码验证**（EGL/Wayland 显示互通）

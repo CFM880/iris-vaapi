@@ -41,6 +41,12 @@ struct iris_decode_ctx {
 	uint8_t last_pps[128];
 	int last_pps_len;
 	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
+
+	/* Map decode sequence numbers back to target surfaces so frame
+	 * matching does not depend on the (possibly non-contiguous) VASurfaceID
+	 * values that the client happens to use. */
+	uint64_t seq;
+	VASurfaceID target_of[512];
 };
 
 static struct iris_surface *
@@ -131,11 +137,14 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 static int
 assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 {
-	VASurfaceID id = (VASurfaceID)(frame->timestamp / 1000000000ULL);
+	uint64_t seq = (frame->timestamp / 1000000000ULL) - 1000;
+	VASurfaceID id = (seq < 512) ? ctx->target_of[seq] : 0;
 	struct iris_surface *s = find_surface(ctx, id);
 
-	if (!s)
+	if (!s) {
+		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
+	}
 	if (s->cap_index != NO_CAP)
 		v4l2_dec_qcap_idx(&ctx->dec, s->cap_index);
 	s->cap_index = frame->index;
@@ -252,15 +261,17 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	if (!au)
 		return -1;
 	ret = ensure_decoder(ctx);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	/* Only re-emit SPS/PPS when they change; a per-picture repetition
 	 * resets the firmware DPB and breaks P-frame references. */
 	n = h264_build_sps(au + 4, au_cap - 4 - ctx->slice_len, &ctx->pic,
 			   ctx->profile);
-	if (n <= 0)
+	if (n <= 0) {
 		return -1;
+	}
 	if (n != ctx->last_sps_len ||
 	    memcmp(au + 4, ctx->last_sps, n) != 0) {
 		memcpy(au, sc4, 4);
@@ -289,7 +300,11 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	au_len += ctx->slice_len;
 
 	{
-		uint64_t ts = (uint64_t)ctx->current_target * 1000000000ULL;
+		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;
+
+		if (ctx->seq < 512)
+			ctx->target_of[ctx->seq] = ctx->current_target;
+		ctx->seq++;
 
 		if (!ctx->dec_started) {
 			/* Mirror FFmpeg: queue the first access unit before
@@ -327,6 +342,12 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	}
 	free(au);
 
+	/* The stateful firmware holds each frame until the next access unit
+	 * arrives.  Draining right after this feed makes the *previous*
+	 * picture's frame available so a client that syncs one picture at a
+	 * time (ffmpeg/Chrome) does not deadlock. */
+	drain_available(ctx);
+
 	ctx->slice_len = 0;
 	ctx->have_pic = 0;
 	return 0;
@@ -336,6 +357,7 @@ int
 iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
 	int deadline = 200;	/* ~2 s */
+
 
 	if (iris_decode_surface_ready(ctx, id))
 		return 0;
@@ -372,6 +394,25 @@ iris_decode_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id)
 
 		return s ? s->decoded : 0;
 	}
+}
+
+int
+iris_decode_surface_buffer(struct iris_decode_ctx *ctx, VASurfaceID id,
+			   unsigned int *cap_index, void **mem,
+			   unsigned int *pitch, unsigned int *size,
+			   unsigned int *width, unsigned int *height)
+{
+	struct iris_surface *s = find_surface(ctx, id);
+
+	if (!s || s->cap_index == NO_CAP)
+		return -1;
+	*cap_index = s->cap_index;
+	*mem = ctx->dec.cap_mem[s->cap_index];
+	*pitch = ctx->dec.cap_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+	*size = ctx->dec.cap_size[s->cap_index];
+	*width = ctx->dec.width;
+	*height = ctx->dec.height;
+	return 0;
 }
 
 int
