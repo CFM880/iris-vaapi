@@ -63,7 +63,8 @@ struct iris_surface {
 	int bfd;		/* backing fd (DMA-heap, or memfd fallback) */
 	void *bmap;		/* mmap of the backing */
 	unsigned int bsize;
-	int decoded;
+	int decoded;		/* a frame has been copied into the backing */
+	int queued;		/* some picture was decoded into this surface */
 };
 
 struct iris_decode_ctx {
@@ -248,6 +249,7 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		memcpy(s->bmap, frame->mem, frame->bytesused);
 	v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 	s->decoded = 1;
+	s->queued = 1;
 	return id;
 }
 
@@ -463,6 +465,12 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;
 
 		ctx->last_target = ctx->current_target;
+		{
+			struct iris_surface *qt = find_surface(ctx,
+							       ctx->current_target);
+			if (qt)
+				qt->queued = 1;
+		}
 		if (ctx->seq < 512)
 			ctx->target_of[ctx->seq] = ctx->current_target;
 		ctx->seq++;
@@ -519,7 +527,14 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 int
 iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
+	struct iris_surface *s = find_surface(ctx, id);
 	int deadline = 200;	/* ~2 s */
+
+	/* Chrome preallocates a surface pool and syncs each freshly created
+	 * (never-decoded) surface before exporting it.  The backing buffer is
+	 * already valid, so an unqueued surface syncs immediately. */
+	if (s && !s->queued)
+		return 0;
 
 	if (iris_decode_surface_ready(ctx, id))
 		return 0;

@@ -26,6 +26,15 @@
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12	0x3231564e	/* NV12 fourcc */
 #endif
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR	0
+#endif
+#ifndef DRM_FORMAT_R8
+#define DRM_FORMAT_R8		0x20203852	/* 'R' '8' 0x20 */
+#endif
+#ifndef DRM_FORMAT_GR88
+#define DRM_FORMAT_GR88		0x38385247	/* 'GR88' */
+#endif
 
 #include "decode.h" 
 
@@ -809,6 +818,8 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	if (!dd || !dd->dec)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
+	fprintf(stderr, "[export] surf=%u type=%u flags=0x%x\n", surface_id,
+		mem_type, flags);
 	if (iris_decode_export(dd->dec, surface_id, &fd, &pitch, &size,
 			       &w, &h))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
@@ -820,15 +831,21 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	d->num_objects = 1;
 	d->objects[0].fd = fd;
 	d->objects[0].size = size;
-	d->num_layers = 1;
-	d->layers[0].drm_format = DRM_FORMAT_NV12;
-	d->layers[0].num_planes = 2;
+	d->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+	/* Chrome requests VA_EXPORT_SURFACE_SEPARATE_LAYERS and DCHECKs that
+	 * each layer carries exactly one plane, so describe NV12 as two
+	 * single-plane layers sharing the one backing object. */
+	d->num_layers = 2;
+	d->layers[0].drm_format = DRM_FORMAT_R8;
+	d->layers[0].num_planes = 1;
 	d->layers[0].object_index[0] = 0;
-	d->layers[0].object_index[1] = 0;
 	d->layers[0].offset[0] = 0;
-	d->layers[0].offset[1] = pitch * h;
 	d->layers[0].pitch[0] = pitch;
-	d->layers[0].pitch[1] = pitch;
+	d->layers[1].drm_format = DRM_FORMAT_GR88;
+	d->layers[1].num_planes = 1;
+	d->layers[1].object_index[0] = 0;
+	d->layers[1].offset[0] = pitch * h;
+	d->layers[1].pitch[0] = pitch;
 
 	(void)flags;
 	return VA_STATUS_SUCCESS;

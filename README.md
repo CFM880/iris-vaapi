@@ -176,8 +176,33 @@ frame0..4: vaapi = ref（全部匹配）
 
 ## 待办（P2 剩余 / 后续）
 
-- **Chrome 端实际加载驱动解码验证**（EGL/Wayland 显示互通）
 - HEVC/VP9 slice 重组支持
+
+## Chrome 集成（✅ 核心验证通过）
+
+Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**：
+
+```
+# 页面 onloadeddata 触发，标题显示 "LOADED 1920x1080"
+# 驱动日志（GPU 进程 stderr）：
+[surf] id=1 size=3133440 w=1920 h=1088        # 帧池 surface 分配（DMA-heap）
+[export] surf=1 type=1073741824 flags=0x5      # vaExportSurfaceHandle 成功
+[begin] target=2 ... [end] done rv=0           # slice 喂入解码成功
+# 持续解码：675 次 begin（约 40fps 循环播放），无错误
+```
+
+**Chrome 探测卡点的修复**（对应之前"卡在 surface 导出探测"）：
+
+| 卡点 | 修复 |
+|---|---|
+| 空 surface 的 `vaSyncSurface` 超时 | surface 从未入队解码时 sync 立即成功（`src/decode.c`：`queued` 标志）|
+| `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/iris_vaapi.c`）；Chrome DCHECK 每层必须单平面 |
+| `drm_format_modifier` 缺失 | 填 `DRM_FORMAT_MOD_LINEAR`（Chrome 校验 modifier 一致性）|
+
+**运行方式**：Chrome GPU 进程需继承 `LIBVA_DRIVER_NAME=iris`（用包装脚本
+`export LIBVA_DRIVER_NAME=iris; google-chrome ...`），驱动装到
+`/usr/lib/aarch64-linux-gnu/dri/iris_drv_video.so`，`/dev/dma_heap/system`
+需 `sudo chmod 0666`（GPU 导入需要真实 DMA-BUF，memfd 回退不可用）。
 
 ## 测试工具
 
@@ -217,14 +242,14 @@ Chrome 走 VA-API（按 slice 喂数据），iris 是"整比特流" stateful V4L
 | P1: 完整 VA-API 解码路径 | ✅ | 端到端 DECODE OK |
 | P2: 参数变化检测 + P 帧 | ✅ | IDR+P 帧逐像素一致 |
 | P2: ffmpeg VA-API 客户端 | ✅ | 75/77 帧，6.5x 超实时，逐字节一致 |
-| P2: Chrome 集成 | ⚠️ 部分 | 通过 FillProfileInfo，卡在 surface 导出探测 |
+| P2: Chrome 集成 | ✅ | Wayland 下流畅解码 H.264，页面 LOADED 1920x1080 |
 
 ### 关键成果
 **ffmpeg `-hwaccel vaapi` 作为第三方 VA-API 客户端解码成功**，且输出与
 FFmpeg 软件解码**逐字节一致**。这是驱动正确性的最强证明（真实客户端，
 非自定义测试）。
 
-### Chrome 集成的卡点（当前进度）
+### Chrome 集成的卡点（已解决）
 Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹配**：
 
 1. Chrome 在解码前就 `vaExportSurfaceHandle` 导出 surface（帧池预分配），
@@ -240,11 +265,12 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
    （输出与软解逐字节一致），但该 fd 不是 DRM buffer，**无法被 GPU/EGL
    客户端（Chrome）导入**。真实 Chrome 显示互通仍需：
    `sudo chmod 0666 /dev/dma_heap/system`。
-5. 待验证：Chrome 探测（空 surface 的 sync+export）是否通过。注意
-   `/dev/dma_heap/system` 需要 `sudo chmod 0666`（root only）。
+5. 已解决：空 surface 的 sync 探测（Chrome 帧池预分配后立即 sync+export）——
+   surface 未入队解码时 `vaSyncSurface` 立即成功；`vaExportSurfaceHandle`
+   按 `SEPARATE_LAYERS` 返回 2 层单平面 + `DRM_FORMAT_MOD_LINEAR`。
 
 ### 已知限制
-- stateful 固件 hold 1 帧：最后一张画面需再喂一帧（或 EOS）才释放。
+- stateful 固件 hold 1 帧：最后一张画面由 EOS flush 释放（已解决，见上）。
 - B 帧短序列引用未解析时丢帧（完整流正常，引擎解 74/75）。
 - 单实例单引擎，不支持并发多视频流。
 - H.264 4K60 高码率受固件解码上限（~49fps）。
@@ -264,6 +290,9 @@ LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=iris \
   ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i 流.h264 -f null -  # P2 ffmpeg
 # 安装到系统供 Chrome 使用：
 sudo ./install-system.sh
+# Chrome（GPU 进程需继承 LIBVA_DRIVER_NAME）：
+export LIBVA_DRIVER_NAME=iris
+google-chrome --enable-logging=stderr --v=1 file:///path/to/video.html
 ```
 
 ### 参考
@@ -272,6 +301,7 @@ sudo ./install-system.sh
 
 ### git 提交历史
 ```
+faf3c9e decode: fall back to memfd surface backing when dma_heap is root-only
 92e3ae3 iris-vaapi: real client (ffmpeg vaapi) decodes H.264 end-to-end
 a9464aa iris-vaapi: fix P-frame decode and add slice-param-driven PPS
 d32dca0 iris-vaapi: wire full VA-API H.264 decode path
