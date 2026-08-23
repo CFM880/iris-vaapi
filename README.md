@@ -129,10 +129,24 @@ surf3=8646c3c1=ref3(P)     surf5=d825880e=ref5(P)
 全部与 FFmpeg 软件解码**逐像素一致**。
 
 **已知限制**：
-- stateful 固件有 1 帧 hold 延迟：最后入队的画面需再喂一帧（或 EOS）才释放，
-  对应 `vaSyncSurface` 对最后一张画面会超时。
 - B 帧流需要解码顺序处理（固件内部处理，但测试喂显示序 slice 会丢帧）。
 - 单实例单引擎，不支持并发多视频流。
+
+**EOS flush（✅ 已解决）**：stateful 固件 hold 最后一帧，之前 `vaSyncSurface`
+对最后一张画面必超时。现在 `iris_decode_sync` 检测到目标是最后入队画面时
+自动喂 EOS 标记（`v4l2_dec_flush`），固件返回 `V4L2_BUF_FLAG_LAST` 帧，
+释放最后一张。flush 后再解码（Chrome flush/reset、loop）会经 `ensure_decoder`
+自动重开会话。
+
+```
+$ ./build/test_va_decode nob.h264      # 新增：sync 最后一张 surface
+synced last surface 10
+DECODE OK
+$ ./build/one_pic                      # 单图场景（唯一出路是 flush）
+[sync] last_target=1: flushing
+[flush] got ts=1000000000000 flags=0x4009
+sync ret=success (no error)
+```
 
 ## 真实客户端验证（ffmpeg VA-API，✅）
 
@@ -163,7 +177,6 @@ frame0..4: vaapi = ref（全部匹配）
 ## 待办（P2 剩余 / 后续）
 
 - **Chrome 端实际加载驱动解码验证**（EGL/Wayland 显示互通）
-- EOS flush 释放最后一帧
 - HEVC/VP9 slice 重组支持
 
 ## 测试工具
@@ -173,6 +186,7 @@ frame0..4: vaapi = ref（全部匹配）
 | `test/test_va.c` | 最小 libva 客户端，验证驱动加载与 profile 枚举 |
 | `test/test_v4l2_dec.c` | V4L2 引擎测试：Annex-B 切 AU → 解码 → NV12 校验 |
 | `test/test_h264_params.c` | SPS/PPS 解析 + 重序列化验证 |
+| `test/test_va_decode.c` | 端到端 VA-API 解码 + 导出，含最后一张 sync（EOS flush） |
 | `test/ioctllog.c` | LD_PRELOAD ioctl 记录器（反推 mpv 真实序列）|
 
 ## 复现命令

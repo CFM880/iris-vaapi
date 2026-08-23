@@ -283,7 +283,9 @@ int main(int argc, char **argv)
 	}
 
 	/* The last picture stays held in the firmware pipeline (stateful
-	 * one-frame latency), so sync a middle picture which is ready. */
+	 * one-frame latency).  Sync a middle picture normally, then sync the
+	 * FINAL picture: iris_decode_sync feeds an EOS marker so the firmware
+	 * releases it instead of timing out. */
 	{
 		int sync_idx = 6;
 		int si;
@@ -296,7 +298,12 @@ int main(int argc, char **argv)
 		s = surf[sync_idx];
 		st = vaSyncSurface(dpy, s);
 		if (st) { fprintf(stderr, "vaSyncSurface: %s\n", vaErrorStr(st)); return 1; }
-		printf("synced surface %u\n", s);
+		printf("synced middle surface %u\n", s);
+
+		s = surf[9];	/* the final, firmware-held picture */
+		st = vaSyncSurface(dpy, s);
+		if (st) { fprintf(stderr, "vaSyncSurface last: %s\n", vaErrorStr(st)); return 1; }
+		printf("synced last surface %u\n", s);
 		{
 			int exi[] = { 0, 1, 3, 5 };
 			VADRMPRIMESurfaceDescriptor dsc;

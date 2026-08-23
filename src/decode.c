@@ -94,6 +94,8 @@ struct iris_decode_ctx {
 	 * values that the client happens to use. */
 	uint64_t seq;
 	VASurfaceID target_of[512];
+	VASurfaceID last_target;	/* most recently queued picture */
+	int eos_sent;			/* EOS (v4l2_dec_flush) queued */
 };
 
 static struct iris_surface *
@@ -205,8 +207,19 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 {
 	int ret;
 
-	if (ctx->dec_open)
-		return 0;
+	if (ctx->dec_open) {
+		/* After an EOS flush the firmware is done; a client that keeps
+		 * decoding (Chrome flush/reset, looped playback) needs a fresh
+		 * session. */
+		if (ctx->eos_sent) {
+			v4l2_dec_close(&ctx->dec);
+			ctx->dec_open = 0;
+			ctx->dec_started = 0;
+			ctx->eos_sent = 0;
+		} else {
+			return 0;
+		}
+	}
 	ret = v4l2_dec_open(&ctx->dec, "/dev/video0", ctx->width, ctx->height);
 	if (ret)
 		return ret;
@@ -236,6 +249,61 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 	s->decoded = 1;
 	return id;
+}
+
+/* Force the firmware to release the picture it is holding.  The stateful
+ * decoder keeps the most recent picture until the next access unit (or an
+ * EOS marker) arrives; without this, vaSyncSurface on the last picture
+ * always times out. */
+int
+iris_decode_flush(struct iris_decode_ctx *ctx)
+{
+	struct v4l2_dec_frame frame;
+	int ret, deadline = 100;
+
+	if (!ctx->dec_open || !ctx->dec_started || ctx->eos_sent)
+		return 0;
+
+	ret = v4l2_dec_flush(&ctx->dec);
+	if (ret)
+		return ret;
+	ctx->eos_sent = 1;
+
+	/* Drain until the EOS frame (V4L2_BUF_FLAG_LAST) is dequeued.  Its
+	 * timestamp is the last AU's timestamp, so it maps to the right
+	 * surface; if the firmware reports the empty flush buffer's zero
+	 * timestamp instead, fall back to the last queued target. */
+	while (deadline-- > 0) {
+		int changed;
+
+		ret = v4l2_dec_poll(&ctx->dec, 20);
+		if (ret <= 0)
+			continue;
+		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
+		if (ret)
+			return ret;
+		while (v4l2_dec_dqout(&ctx->dec) == 0)
+			;
+		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
+		if (ret < 0)
+			continue;
+		fprintf(stderr, "[flush] got ts=%llu flags=0x%x\n",
+			(unsigned long long)frame.timestamp, frame.flags);
+		if (assign_frame(ctx, &frame) < 0 && ctx->last_target) {
+			struct iris_surface *s = find_surface(ctx,
+							       ctx->last_target);
+			if (s) {
+				if (frame.bytesused <= s->bsize)
+					memcpy(s->bmap, frame.mem,
+					       frame.bytesused);
+				v4l2_dec_qcap_idx(&ctx->dec, frame.index);
+				s->decoded = 1;
+			}
+		}
+		if (ret == 1)
+			break;
+	}
+	return 0;
 }
 
 /* Non-blocking drain of whatever frames are ready. */
@@ -394,6 +462,7 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	{
 		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;
 
+		ctx->last_target = ctx->current_target;
 		if (ctx->seq < 512)
 			ctx->target_of[ctx->seq] = ctx->current_target;
 		ctx->seq++;
@@ -454,6 +523,16 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 
 	if (iris_decode_surface_ready(ctx, id))
 		return 0;
+
+	/* The stateful firmware holds the last queued picture until an EOS
+	 * marker arrives.  If the client is syncing that final picture, feed
+	 * EOS to force it out instead of spinning until the timeout. */
+	if (id == ctx->last_target && !ctx->eos_sent) {
+		fprintf(stderr, "[sync] last_target=%u: flushing\n", id);
+		if (iris_decode_flush(ctx) == 0 &&
+		    iris_decode_surface_ready(ctx, id))
+			return 0;
+	}
 
 	while (deadline-- > 0) {
 		struct v4l2_dec_frame frame;

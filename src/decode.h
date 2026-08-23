@@ -37,6 +37,8 @@ int iris_decode_slice(struct iris_decode_ctx *ctx, const void *data,
 int iris_decode_end(struct iris_decode_ctx *ctx);
 /* Wait until @id has a decoded frame (drains the engine). */
 int iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id);
+/* Feed EOS so the firmware releases the picture it is holding. */
+int iris_decode_flush(struct iris_decode_ctx *ctx);
 
 /* Export the decoded buffer of @id as a DRM PRIME fd. */
 int iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
