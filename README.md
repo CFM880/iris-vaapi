@@ -189,34 +189,65 @@ frame= 422 全部解码
 引擎与 VA-API 层均按 profile 选择 V4L2 OUTPUT 像素格式
 （H264/HEVC/VP9），`V4L2_PIX_FMT_VP9` 直通喂帧。
 
-## HEVC（⚠️ 引擎级可用，VA-API 固件不接受重建参数集）
+## HEVC（⚠️ 引擎级可用，VA-API 参数集重建对 ffmpeg 有效、固件 IDR 待解决）
 
 **引擎级已验证**：固件能解 HEVC（422 AU → 404 帧，像素级正确），
 但需**完整参数集**（VPS/SPS/PPS）。用原始参数集前置可稳定解码
 （`./build/test_hevc_au`）。
 
-**VA-API 参数集重建**（`src/hevc_params.c`）：Chrome/ffmpeg 传 slice data
-不含参数集，驱动从 `VAPictureParameterBufferHEVC` 重建 VPS/SPS/PPS。
-修复的位布局问题：
-1. `bs_put` 32→64 位 UB（`1u<<i` 对 i≥32）导致 reserved_zero_44 写入错
-2. **`conformance_window_flag`** 缺失导致 bit_depth 错位
-3. `scaling_list_enabled_flag`/`max_transform_*` 顺序
+### VA-API 参数集重建（`src/hevc_params.c`）
+
+Chrome/ffmpeg 传 slice data **不含参数集**（已确认 vps=0 sps=0 pps=0），
+驱动从 `VAPictureParameterBufferHEVC` 重建 VPS/SPS/PPS。
+
+**逆向 ffmpeg 源码**（下载 `FFmpeg` tag `n8.0.1`）确认的关键映射
+（`libavcodec/vaapi_hevc.c:146-211`、`libavcodec/hevc/ps.c`）：
+- `pps_loop_filter_across_slices_enabled_flag` ← `pps->seq_loop_filter_across_slices_enabled_flag`
+  （`seq_` 前缀是 ffmpeg 对 bitstream `pps_loop_filter_across_slices_enabled_flag` 的命名，ps.c:2341）
+- `pps_beta_offset_div2 = pps->beta_offset / 2`，其中 `pps->beta_offset = 2 * beta_offset_div2`（ps.c:2362）
+- ffmpeg 的 VA 字段**正确反映 bitstream**（标准解析器），所以重建用 ffmpeg
+  填的值理论上应与原始一致
+
+**修复的位级 bug**（逐条对照 ffmpeg `trace_headers` 权威输出定位）：
+1. `bs_put` 32→64 位 UB（`1u<<i` 对 i≥32）→ reserved_zero_44bits 写入损坏
+2. SPS 缺 **`conformance_window_flag`** → bit_depth 起错位
+3. `scaling_list_enabled_flag`/`amp_enabled_flag`/`max_transform_*` 字段顺序
 4. `pic_width/height_in_luma_samples` 不应 -1
-5. VPS/SPS 的 profile_tier_level 区分（VPS progressive=1/level=120，
-   SPS 0/192）
-6. 多余 VUI 导致 "Overread SPS"（去掉后 ffmpeg 完全接受）
+5. **PPS 缺 `deblocking_filter_control_present_flag`(=1) + beta/tc offset**：
+   PPS 从 7 字节变 8 字节（48 payload bit），缺了 slice 头解析依赖的
+   deblocking 字段
+6. **SPS 缺 VUI**：原始带 `vui_parameters_present_flag=1` + timing info，
+   且 `vui_num_units_in_tick`/`vui_time_scale` 是 **u(32)** 不是 ue(v)
+   —— 用 ue 写会导致 "Overread SPS by 8 bits"
+7. SPS/VPS 的 profile_tier_level：progressive=1、frame_only=1、level=120
+   （ffmpeg trace 权威，两者一致，非 0/0/192）
 
-**验证结果**：
-- ✅ 重建 SPS/PPS 被 **ffmpeg 软件解码完全接受**（字段逐位对齐原始流，
-  完整解码 25 帧 exit=0）
-- ❌ **固件硬件拒绝重建 PPS**（IDR/P 帧 corrupt，flags=0x8）——重建 PPS
-  与原始 PPS 在字节布局有差异（`...44 80` vs `...62 40`），尽管字段值
-  对 ffmpeg 权威一致。差异源于 ffmpeg VA-API 填充的字段与原始 bitstream
-  编码存在微妙映射差异，固件对参数集字节布局要求严格。
+### 验证状态
 
-**结论**：HEVC VA-API 参数集重建在 ffmpeg/Chrome 软件层有效，但固件
-硬件不接受重建结果。驱动保留 HEVCMain profile 与重建代码作为基础，
-实际 HEVC VA-API 解码待解决字段映射后可用。
+| 层级 | 结果 |
+|---|---|
+| ffmpeg 软件解码 | ✅ 10/10 帧，帧 1-5 内容与原始逐像素一致 |
+| 固件硬件 | ⚠️ 8 帧 ok + 1 帧 **IDR corrupt**（flags=0x8）|
+
+### 仍未解决（两个残留差异）
+
+重建参数集与原始 bitstream 仍有**字节级差异**（字段值对 ffmpeg 权威一致，
+但固件硬件对参数集字节布局要求严格）：
+
+1. **固件 IDR corrupt**（第 1 帧）：
+   - ffmpeg 软件解码第 1 帧正确，但固件硬件对 IDR slice 头解析失败
+   - VPS byte 11：重建 `90`（progressive=1）vs 原始 `00`——**VPS 的
+     `reserved_zero_44bits` 我硬编码了 x265 值 `0x78a003`，但原始 VPS 是 0**
+   - PPS byte 6：`44` vs 原始 `40`（bit2 差异）
+2. **帧 7+ 内容漂移**（P 帧参考累积误差 1363→8116 样本）：某个参考管理
+   字段仍不完全匹配
+
+### 结论
+
+重建参数集对 **ffmpeg 软件解码完全有效**（证明字段值/结构正确），但
+**固件硬件对参数集有字节级严格要求**。下一步：把 VPS 的 reserved_zero_44
+改为 0（匹配原始 VPS），逐字节对齐重建与原始参数集，固件 IDR corrupt
+应随之消除。驱动保留 HEVCMain profile 与重建代码作为基础。
 
 ## Chrome 集成（✅ 核心验证通过）
 
@@ -287,7 +318,7 @@ Chrome 走 VA-API（按 slice 喂数据），iris 是"整比特流" stateful V4L
 | P2: Chrome 集成 | ✅ | Wayland 下流畅解码 H.264，页面 LOADED 1920x1080 |
 | P3: VP9 支持 | ✅ | VA-API + ffmpeg 全解，25 帧逐字节一致 |
 | P3: HEVC 引擎级 | ✅ | 固件 422 AU → 404 帧，像素正确（需完整参数集）|
-| P3: HEVC VA-API | ⚠️ | 重建参数集 ffmpeg 接受但固件拒绝；字段映射待解决 |
+| P3: HEVC VA-API | ⚠️ | 重建参数集 ffmpeg 软件解码 10/10 帧；固件 IDR corrupt（字节级差异待消除）|
 
 ### 关键成果
 **ffmpeg `-hwaccel vaapi` 作为第三方 VA-API 客户端解码成功**，且输出与

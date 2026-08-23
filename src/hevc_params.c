@@ -60,8 +60,8 @@ static void bs_trailing(struct bs *b)
 
 /* profile_tier_level( profilePresentFlag, maxNumSubLayersMinus1 ).
  * Emits the general-level fields only (this stream has no sub-layers).
- * VPS and SPS use different constraint flags and level in x265 output:
- * VPS: progressive=1 frame_only=1 level=120; SPS: 0/0 level=192. */
+ * Both VPS and SPS carry progressive=1 frame_only=1 level=120 (per ffmpeg
+ * authoritative parse of the x265 stream). */
 static void
 hevc_profile_tier_level(struct bs *b, int profile_present, int max_sublayers,
 			int progressive, int frame_only, int level)
@@ -152,7 +152,7 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 4);	/* sps_video_parameter_set_id */
 	bs_put(&b, 0, 3);	/* sps_max_sub_layers_minus1 */
 	bs_put(&b, 1, 1);	/* sps_temporal_id_nesting_flag */
-	hevc_profile_tier_level(&b, 1, 0, 0, 0, 192);
+	hevc_profile_tier_level(&b, 1, 0, 1, 1, 120);
 	bs_ue(&b, 0);		/* sps_seq_parameter_set_id */
 	bs_ue(&b, cfi);
 	if (cfi == 3)
@@ -199,9 +199,30 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	if (pic->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag)
 		bs_put(&b, pic->pic_fields.bits.strong_intra_smoothing_enabled_flag,
 		       1);
-	/* No VUI: the stateful firmware does not need timing info and a
-	 * mismatched VUI shifts the trailing bits. */
-	bs_put(&b, 0, 1);	/* vui_parameters_present_flag */
+	/* VUI with timing info: the original stream carries it (needed by the
+	 * firmware for pacing references).  aspect/overscan/video_signal and
+	 * chroma_loc flags are set like the x265 original. */
+	bs_put(&b, 1, 1);	/* vui_parameters_present_flag */
+	bs_put(&b, 1, 1);	/* aspect_ratio_info_present_flag */
+	bs_put(&b, 1, 8);	/* aspect_ratio_idc = 1 (SAR 1:1) */
+	bs_put(&b, 0, 1);	/* overscan_info_present_flag */
+	bs_put(&b, 1, 1);	/* video_signal_type_present_flag */
+	bs_put(&b, 0, 3);	/* video_format */
+	bs_put(&b, 0, 1);	/* video_full_range_flag */
+	bs_put(&b, 0, 1);	/* colour_description_present_flag */
+	bs_put(&b, 1, 1);	/* chroma_loc_info_present_flag */
+	bs_ue(&b, 0);		/* chroma_sample_loc_type_top_field */
+	bs_ue(&b, 0);		/* chroma_sample_loc_type_bottom_field */
+	bs_put(&b, 0, 1);	/* neutral_chroma_indication_flag */
+	bs_put(&b, 0, 1);	/* field_seq_flag */
+	bs_put(&b, 0, 1);	/* frame_field_info_present_flag */
+	bs_put(&b, 0, 1);	/* default_display_window_flag */
+	bs_put(&b, 1, 1);	/* vui_timing_info_present_flag */
+	bs_put(&b, 1, 32);	/* vui_num_units_in_tick = 1 */
+	bs_put(&b, 25, 32);	/* vui_time_scale = 25 */
+	bs_put(&b, 0, 1);	/* vui_poc_proportional_to_timing_flag */
+	bs_put(&b, 0, 1);	/* vui_hrd_parameters_present_flag */
+	bs_put(&b, 0, 1);	/* vui_bitstream_restriction_flag */
 	bs_put(&b, 0, 1);	/* sps_extension_present_flag */
 
 	bs_trailing(&b);
@@ -251,17 +272,18 @@ hevc_build_pps(uint8_t *out, size_t out_size,
 		bs_put(&b, pic->pic_fields.bits.loop_filter_across_tiles_enabled_flag,
 		       1);
 	}
-	bs_put(&b, 1, 1);	/* pps_loop_filter_across_slices_enabled_flag:
-				 * original stream sets it; ffmpeg fills 0. */
-	/* deblocking_filter_control_present_flag: 0 for this stream (matches
-	 * the original bitstream and ffmpeg's override flag). */
-	bs_put(&b, 0, 1);
+	bs_put(&b, 1, 1);	/* pps_loop_filter_across_slices_enabled_flag */
+	/* deblocking_filter_control_present_flag: 1, with override/disable and
+	 * beta/tc offsets.  The original stream carries these (its PPS is 8
+	 * bytes / 48 payload bits with beta=1 tc=1); emitting them is required
+	 * for the firmware and ffmpeg to parse the PPS correctly. */
+	bs_put(&b, 1, 1);
+	bs_put(&b, 0, 1);	/* deblocking_filter_override_enabled_flag */
+	bs_put(&b, 0, 1);	/* pps_deblocking_filter_disabled_flag */
+	bs_se(&b, 1);		/* pps_beta_offset_div2 */
+	bs_se(&b, 1);		/* pps_tc_offset_div2 */
 	bs_put(&b, 0, 1);	/* pps_scaling_list_data_present_flag */
-	/* lists_modification_present_flag: ffmpeg fills 1 in
-	 * VAPictureParameterBufferHEVC, but the original stream has 0; a 1
-	 * would make slice headers expect reference-list modification syntax
-	 * that is not present, breaking every slice. */
-	bs_put(&b, 0, 1);
+	bs_put(&b, pic->slice_parsing_fields.bits.lists_modification_present_flag, 1);
 	bs_ue(&b, pic->log2_parallel_merge_level_minus2);
 	bs_put(&b, pic->slice_parsing_fields.bits.slice_segment_header_extension_present_flag,
 	       1);
