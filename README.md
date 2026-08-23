@@ -189,22 +189,34 @@ frame= 422 全部解码
 引擎与 VA-API 层均按 profile 选择 V4L2 OUTPUT 像素格式
 （H264/HEVC/VP9），`V4L2_PIX_FMT_VP9` 直通喂帧。
 
-## HEVC（⚠️ 部分：引擎级可用，VA-API 未接入）
+## HEVC（⚠️ 引擎级可用，VA-API 固件不接受重建参数集）
 
 **引擎级已验证**：固件能解 HEVC（422 AU → 404 帧，像素级正确），
 但需**完整参数集**（VPS/SPS/PPS）。用原始参数集前置可稳定解码
 （`./build/test_hevc_au`）。
 
-**VA-API 卡点**：Chrome/ffmpeg 传 slice data 不含参数集
-（已确认 vps=0 sps=0 pps=0），驱动需从 `VAPictureParameterBufferHEVC`
-重建 VPS/SPS/PPS。原因：
-1. 重建参数集不被固件接受（session error 0x1004）
-2. HEVC 的 `profile_tier_level.reserved_zero_44bits`（constraint flags）
-   等字段**不在 VA-API 结构里**，无法完整重建
+**VA-API 参数集重建**（`src/hevc_params.c`）：Chrome/ffmpeg 传 slice data
+不含参数集，驱动从 `VAPictureParameterBufferHEVC` 重建 VPS/SPS/PPS。
+修复的位布局问题：
+1. `bs_put` 32→64 位 UB（`1u<<i` 对 i≥32）导致 reserved_zero_44 写入错
+2. **`conformance_window_flag`** 缺失导致 bit_depth 错位
+3. `scaling_list_enabled_flag`/`max_transform_*` 顺序
+4. `pic_width/height_in_luma_samples` 不应 -1
+5. VPS/SPS 的 profile_tier_level 区分（VPS progressive=1/level=120，
+   SPS 0/192）
+6. 多余 VUI 导致 "Overread SPS"（去掉后 ffmpeg 完全接受）
 
-**当前决策**：驱动**不声明 HEVC profile**（避免 Chrome/ffmpeg 走未完成
-的 HEVC VA-API 路径卡固件），引擎级 HEVC 支持保留在 `test_hevc_au.c`
-（独立 V4L2 引擎测试，不依赖驱动）。HEVC VA-API 列为后续工作。
+**验证结果**：
+- ✅ 重建 SPS/PPS 被 **ffmpeg 软件解码完全接受**（字段逐位对齐原始流，
+  完整解码 25 帧 exit=0）
+- ❌ **固件硬件拒绝重建 PPS**（IDR/P 帧 corrupt，flags=0x8）——重建 PPS
+  与原始 PPS 在字节布局有差异（`...44 80` vs `...62 40`），尽管字段值
+  对 ffmpeg 权威一致。差异源于 ffmpeg VA-API 填充的字段与原始 bitstream
+  编码存在微妙映射差异，固件对参数集字节布局要求严格。
+
+**结论**：HEVC VA-API 参数集重建在 ffmpeg/Chrome 软件层有效，但固件
+硬件不接受重建结果。驱动保留 HEVCMain profile 与重建代码作为基础，
+实际 HEVC VA-API 解码待解决字段映射后可用。
 
 ## Chrome 集成（✅ 核心验证通过）
 
@@ -275,7 +287,7 @@ Chrome 走 VA-API（按 slice 喂数据），iris 是"整比特流" stateful V4L
 | P2: Chrome 集成 | ✅ | Wayland 下流畅解码 H.264，页面 LOADED 1920x1080 |
 | P3: VP9 支持 | ✅ | VA-API + ffmpeg 全解，25 帧逐字节一致 |
 | P3: HEVC 引擎级 | ✅ | 固件 422 AU → 404 帧，像素正确（需完整参数集）|
-| P3: HEVC VA-API | ❌ 未接入 | 参数集重建不被固件接受；驱动暂不声明 HEVC profile |
+| P3: HEVC VA-API | ⚠️ | 重建参数集 ffmpeg 接受但固件拒绝；字段映射待解决 |
 
 ### 关键成果
 **ffmpeg `-hwaccel vaapi` 作为第三方 VA-API 客户端解码成功**，且输出与

@@ -72,6 +72,7 @@ static const VAProfile iris_profiles[] = {
 	VAProfileH264ConstrainedBaseline,
 	VAProfileH264Main,
 	VAProfileH264High,
+	VAProfileHEVCMain,
 	VAProfileVP9Profile0,
 };
 #define NUM_IRIS_PROFILES (sizeof(iris_profiles) / sizeof(iris_profiles[0]))
@@ -462,12 +463,21 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 		switch (type) {
 		case VAPictureParameterBufferType:
 			/* VP9 frames carry their own header, so ignore the
-			 * (larger) VP9 picture parameter buffer. */
+			 * (larger) VP9 picture parameter buffer.  HEVC parses
+			 * it to re-serialize VPS/SPS/PPS. */
 			if (dd->profile == VAProfileVP9Profile0 ||
 			    dd->profile == VAProfileVP9Profile1 ||
 			    dd->profile == VAProfileVP9Profile2 ||
 			    dd->profile == VAProfileVP9Profile3)
 				break;
+			if (dd->profile == VAProfileHEVCMain ||
+			    dd->profile == VAProfileHEVCMain10) {
+				if (dd->buf_sizes[idx] <
+				    sizeof(VAPictureParameterBufferHEVC))
+					return VA_STATUS_ERROR_INVALID_BUFFER;
+				iris_decode_hevc_picture(dd->dec, data);
+				break;
+			}
 			if (dd->buf_sizes[idx] <
 			    sizeof(VAPictureParameterBufferH264))
 				return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -479,6 +489,14 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			    dd->profile == VAProfileVP9Profile2 ||
 			    dd->profile == VAProfileVP9Profile3)
 				break;
+			if (dd->profile == VAProfileHEVCMain ||
+			    dd->profile == VAProfileHEVCMain10) {
+				if (dd->buf_sizes[idx] <
+				    sizeof(VASliceParameterBufferHEVC))
+					return VA_STATUS_ERROR_INVALID_BUFFER;
+				iris_decode_hevc_slice_params(dd->dec, data);
+				break;
+			}
 			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264))
 				return VA_STATUS_ERROR_INVALID_BUFFER;
 			iris_decode_slice_params(dd->dec, data);

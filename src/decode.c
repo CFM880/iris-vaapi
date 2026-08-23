@@ -13,6 +13,7 @@
 
 #include "decode.h"
 #include "h264_params.h"
+#include "hevc_params.h"
 #include "v4l2_dec.h"
 
 #define IRIS_MAX_SURFACES	64
@@ -80,6 +81,8 @@ struct iris_decode_ctx {
 
 	VAPictureParameterBufferH264 pic;
 	int have_pic;
+	VAPictureParameterBufferHEVC hevc_pic;
+	int have_hevc_pic;
 	uint8_t *slice_data;
 	size_t slice_len;
 	size_t slice_cap;
@@ -89,6 +92,13 @@ struct iris_decode_ctx {
 	int last_sps_len;
 	uint8_t last_pps[128];
 	int last_pps_len;
+	/* HEVC parameter-set cache (only emit when changed). */
+	uint8_t last_hevc_vps[64];
+	int last_hevc_vps_len;
+	uint8_t last_hevc_sps[256];
+	int last_hevc_sps_len;
+	uint8_t last_hevc_pps[128];
+	int last_hevc_pps_len;
 	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
 
 	/* Map decode sequence numbers back to target surfaces so frame
@@ -98,6 +108,10 @@ struct iris_decode_ctx {
 	VASurfaceID target_of[512];
 	VASurfaceID last_target;	/* most recently queued picture */
 	int eos_sent;			/* EOS (v4l2_dec_flush) queued */
+	/* HEVC firmware does not propagate per-frame timestamps; all dequeued
+	 * frames carry the same value.  Match frames to surfaces by output
+	 * order instead. */
+	uint64_t next_out_seq;
 };
 
 static struct iris_surface *
@@ -136,6 +150,10 @@ iris_decode_setup(struct iris_decode_ctx *ctx, unsigned int width,
 	ctx->height = height;
 	ctx->profile = profile;
 	switch (profile) {
+	case VAProfileHEVCMain:
+	case VAProfileHEVCMain10:
+		ctx->out_pixfmt = V4L2_PIX_FMT_HEVC;
+		break;
 	case VAProfileVP9Profile0:
 	case VAProfileVP9Profile1:
 	case VAProfileVP9Profile2:
@@ -242,14 +260,28 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 }
 
 
-/* Assign one dequeued frame to its surface (matched by the timestamp we
- * encoded as the surface id).  Returns the surface id, or -1 if unknown. */
+/* Assign one dequeued frame to its surface.  For H.264/VP9 the firmware
+ * propagates the timestamp we encoded with the surface id; for HEVC it
+ * stamps every frame with the same value, so fall back to output-order
+ * matching.  Returns the surface id, or -1 if unknown. */
 static int
 assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 {
-	uint64_t seq = (frame->timestamp / 1000000000ULL) - 1000;
-	VASurfaceID id = (seq < 512) ? ctx->target_of[seq] : 0;
-	struct iris_surface *s = find_surface(ctx, id);
+	uint64_t seq;
+	VASurfaceID id;
+	struct iris_surface *s;
+
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+		seq = ctx->next_out_seq++;
+		if (seq >= 512)
+			return -1;
+	} else {
+		seq = (frame->timestamp / 1000000000ULL) - 1000;
+		if (seq >= 512)
+			return -1;
+	}
+	id = ctx->target_of[seq];
+	s = find_surface(ctx, id);
 
 	if (!s) {
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
@@ -377,6 +409,26 @@ iris_decode_picture(struct iris_decode_ctx *ctx,
 	return 0;
 }
 
+int
+iris_decode_hevc_picture(struct iris_decode_ctx *ctx,
+			 const VAPictureParameterBufferHEVC *pic)
+{
+	memcpy(&ctx->hevc_pic, pic, sizeof(*pic));
+	ctx->have_hevc_pic = 1;
+	return 0;
+}
+
+int
+iris_decode_hevc_slice_params(struct iris_decode_ctx *ctx,
+			      const VASliceParameterBufferHEVC *sp)
+{
+	if (sp->num_ref_idx_l0_active_minus1 > ctx->refs_l0)
+		ctx->refs_l0 = sp->num_ref_idx_l0_active_minus1;
+	if (sp->num_ref_idx_l1_active_minus1 > ctx->refs_l1)
+		ctx->refs_l1 = sp->num_ref_idx_l1_active_minus1;
+	return 0;
+}
+
 static int
 has_start_code(const uint8_t *p, size_t len)
 {
@@ -427,7 +479,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	int n, ret;
 	static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 
-	if (!ctx->have_pic && ctx->out_pixfmt != V4L2_PIX_FMT_VP9)
+	if (!ctx->have_pic && ctx->out_pixfmt != V4L2_PIX_FMT_VP9 &&
+	    !ctx->have_hevc_pic)
 		return -1;
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
@@ -442,15 +495,52 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 	/* Assemble the access unit to feed the stateful firmware.
 	 *
-	 * H.264: the client (Chrome/ffmpeg) sends picture/slice parameter
-	 * buffers but no parameter-set NALs, so re-serialize SPS/PPS and
-	 * prepend them, only when they change.
+	 * H.264/HEVC: the client (Chrome/ffmpeg) sends picture/slice parameter
+	 * buffers but no parameter-set NALs, so re-serialize SPS/PPS (or
+	 * VPS/SPS/PPS) and prepend them, only when they change.
 	 *
 	 * VP9: each frame is self-contained (its own uncompressed+compressed
 	 * header); the slice data is the whole frame, feed it verbatim. */
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9) {
 		au_len = ctx->slice_len;
 		memcpy(au, ctx->slice_data, au_len);
+	} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+		/* Re-serialize VPS/SPS/PPS from the picture params and prepend
+		 * only when they change (per-picture repetition resets the
+		 * firmware DPB).  ffmpeg/Chrome send bare slice NALs. */
+		n = hevc_build_vps(au + 4, au_cap - 4 - ctx->slice_len,
+				   &ctx->hevc_pic);
+		if (n > 0 && (n != ctx->last_hevc_vps_len ||
+			      memcmp(au + 4, ctx->last_hevc_vps, n) != 0)) {
+			memcpy(au, sc4, 4);
+			memcpy(ctx->last_hevc_vps, au + 4, n);
+			ctx->last_hevc_vps_len = n;
+			au_len = 4 + n;
+		}
+		n = hevc_build_sps(au + au_len + 4, au_cap - au_len - 4 -
+				   ctx->slice_len, &ctx->hevc_pic);
+		if (n > 0 && (n != ctx->last_hevc_sps_len ||
+			      memcmp(au + au_len + 4, ctx->last_hevc_sps, n) != 0)) {
+			memcpy(au + au_len, sc4, 4);
+			memcpy(ctx->last_hevc_sps, au + au_len + 4, n);
+			ctx->last_hevc_sps_len = n;
+			au_len += 4 + n;
+		}
+		n = hevc_build_pps(au + au_len + 4, au_cap - au_len - 4 -
+				   ctx->slice_len, &ctx->hevc_pic);
+		if (n > 0 && (n != ctx->last_hevc_pps_len ||
+			      memcmp(au + au_len + 4, ctx->last_hevc_pps, n) != 0)) {
+			memcpy(au + au_len, sc4, 4);
+			memcpy(ctx->last_hevc_pps, au + au_len + 4, n);
+			ctx->last_hevc_pps_len = n;
+			au_len += 4 + n;
+		}
+		if (au_len + ctx->slice_len > au_cap) {
+			free(au);
+			return -1;
+		}
+		memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
+		au_len += ctx->slice_len;
 	} else {
 	/* Only re-emit SPS/PPS when they change; a per-picture repetition
 	 * resets the firmware DPB and breaks P-frame references. */
