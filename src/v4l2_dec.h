@@ -47,9 +47,11 @@ struct v4l2_dec {
 	int eos;
 };
 
-/* Open /dev/video0 (or @dev) for H.264 decode of a @width x @height stream. */
+/* Open /dev/video0 (or @dev) for decode of a @width x @height stream using
+ * the given bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...). */
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
-		  unsigned int width, unsigned int height);
+		  unsigned int width, unsigned int height,
+		  unsigned int pixelformat);
 /* STREAMON the OUTPUT queue (CAPTURE comes up after the first DRC event). */
 int v4l2_dec_start(struct v4l2_dec *d);
 /* poll the device fd. Returns poll() result. */

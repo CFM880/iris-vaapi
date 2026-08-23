@@ -174,9 +174,37 @@ frame0..4: vaapi = ref（全部匹配）
 4. **同步**：`vaEndPicture` 喂入后排空，让上一帧（固件 hold）立即就绪，
    避免逐帧 sync 的客户端死锁。
 
-## 待办（P2 剩余 / 后续）
+## VP9 支持（✅）
 
-- HEVC/VP9 slice 重组支持
+VP9 帧自包含（无 SPS/PPS），slice data 即完整帧，直接喂入固件：
+
+```
+$ ./build/test_va_vp9 /tmp/test-vp9.ivf      # VA-API 端到端
+fed 422 frames / VP9 DECODE OK
+$ ffmpeg -hwaccel vaapi ... -i vp9.webm       # ffmpeg VA-API
+frame= 422 全部解码
+# 内容校验：25 帧无 surface 复用流与软解逐字节一致（0 差异）
+```
+
+引擎与 VA-API 层均按 profile 选择 V4L2 OUTPUT 像素格式
+（H264/HEVC/VP9），`V4L2_PIX_FMT_VP9` 直通喂帧。
+
+## HEVC（⚠️ 部分：引擎级可用，VA-API 未接入）
+
+**引擎级已验证**：固件能解 HEVC（422 AU → 404 帧，像素级正确），
+但需**完整参数集**（VPS/SPS/PPS）。用原始参数集前置可稳定解码
+（`./build/test_hevc_au`）。
+
+**VA-API 卡点**：Chrome/ffmpeg 传 slice data 不含参数集
+（已确认 vps=0 sps=0 pps=0），驱动需从 `VAPictureParameterBufferHEVC`
+重建 VPS/SPS/PPS。原因：
+1. 重建参数集不被固件接受（session error 0x1004）
+2. HEVC 的 `profile_tier_level.reserved_zero_44bits`（constraint flags）
+   等字段**不在 VA-API 结构里**，无法完整重建
+
+**当前决策**：驱动**不声明 HEVC profile**（避免 Chrome/ffmpeg 走未完成
+的 HEVC VA-API 路径卡固件），引擎级 HEVC 支持保留在 `test_hevc_au.c`
+（独立 V4L2 引擎测试，不依赖驱动）。HEVC VA-API 列为后续工作。
 
 ## Chrome 集成（✅ 核心验证通过）
 
@@ -212,6 +240,8 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 | `test/test_v4l2_dec.c` | V4L2 引擎测试：Annex-B 切 AU → 解码 → NV12 校验 |
 | `test/test_h264_params.c` | SPS/PPS 解析 + 重序列化验证 |
 | `test/test_va_decode.c` | 端到端 VA-API 解码 + 导出，含最后一张 sync（EOS flush） |
+| `test/test_va_vp9.c` | 端到端 VP9 VA-API 解码 + 导出（IVF 逐帧喂入）|
+| `test/test_hevc_au.c` | HEVC 引擎测试：整体流喂入 + EOS，统计帧数 |
 | `test/ioctllog.c` | LD_PRELOAD ioctl 记录器（反推 mpv 真实序列）|
 
 ## 复现命令
@@ -243,6 +273,9 @@ Chrome 走 VA-API（按 slice 喂数据），iris 是"整比特流" stateful V4L
 | P2: 参数变化检测 + P 帧 | ✅ | IDR+P 帧逐像素一致 |
 | P2: ffmpeg VA-API 客户端 | ✅ | 75/77 帧，6.5x 超实时，逐字节一致 |
 | P2: Chrome 集成 | ✅ | Wayland 下流畅解码 H.264，页面 LOADED 1920x1080 |
+| P3: VP9 支持 | ✅ | VA-API + ffmpeg 全解，25 帧逐字节一致 |
+| P3: HEVC 引擎级 | ✅ | 固件 422 AU → 404 帧，像素正确（需完整参数集）|
+| P3: HEVC VA-API | ❌ 未接入 | 参数集重建不被固件接受；驱动暂不声明 HEVC profile |
 
 ### 关键成果
 **ffmpeg `-hwaccel vaapi` 作为第三方 VA-API 客户端解码成功**，且输出与

@@ -177,7 +177,8 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 }
 
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
-		  unsigned int width, unsigned int height)
+		  unsigned int width, unsigned int height,
+		  unsigned int pixelformat)
 {
 	struct v4l2_capability cap;
 	struct v4l2_requestbuffers req;
@@ -216,7 +217,7 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	d->out_fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	d->out_fmt.fmt.pix_mp.width = width;
 	d->out_fmt.fmt.pix_mp.height = height;
-	d->out_fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
+	d->out_fmt.fmt.pix_mp.pixelformat = pixelformat;
 	d->out_fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	d->out_fmt.fmt.pix_mp.num_planes = 1;
 	d->out_fmt.fmt.pix_mp.plane_fmt[0].sizeimage = OUT_SIZEIMAGE;

@@ -73,6 +73,7 @@ struct iris_decode_ctx {
 	int dec_started;
 	unsigned int width, height;
 	VAProfile profile;
+	unsigned int out_pixfmt;	/* V4L2 OUTPUT pixel format */
 
 	struct iris_surface surfaces[IRIS_MAX_SURFACES];
 	int n_surfaces;
@@ -134,6 +135,17 @@ iris_decode_setup(struct iris_decode_ctx *ctx, unsigned int width,
 	ctx->width = width;
 	ctx->height = height;
 	ctx->profile = profile;
+	switch (profile) {
+	case VAProfileVP9Profile0:
+	case VAProfileVP9Profile1:
+	case VAProfileVP9Profile2:
+	case VAProfileVP9Profile3:
+		ctx->out_pixfmt = V4L2_PIX_FMT_VP9;
+		break;
+	default:
+		ctx->out_pixfmt = V4L2_PIX_FMT_H264;
+		break;
+	}
 }
 
 int
@@ -221,7 +233,8 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 			return 0;
 		}
 	}
-	ret = v4l2_dec_open(&ctx->dec, "/dev/video0", ctx->width, ctx->height);
+	ret = v4l2_dec_open(&ctx->dec, "/dev/video0", ctx->width,
+			    ctx->height, ctx->out_pixfmt);
 	if (ret)
 		return ret;
 	ctx->dec_open = 1;
@@ -391,7 +404,7 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 		ctx->slice_cap = ncap;
 	}
 
-	if (!has_start_code(p, len)) {
+	if (!has_start_code(p, len) && ctx->out_pixfmt != V4L2_PIX_FMT_VP9) {
 		static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 		memcpy(ctx->slice_data + ctx->slice_len, sc4, 4);
 		ctx->slice_len += 4;
@@ -414,7 +427,7 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	int n, ret;
 	static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 
-	if (!ctx->have_pic)
+	if (!ctx->have_pic && ctx->out_pixfmt != V4L2_PIX_FMT_VP9)
 		return -1;
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
@@ -427,11 +440,24 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		return ret;
 	}
 
+	/* Assemble the access unit to feed the stateful firmware.
+	 *
+	 * H.264: the client (Chrome/ffmpeg) sends picture/slice parameter
+	 * buffers but no parameter-set NALs, so re-serialize SPS/PPS and
+	 * prepend them, only when they change.
+	 *
+	 * VP9: each frame is self-contained (its own uncompressed+compressed
+	 * header); the slice data is the whole frame, feed it verbatim. */
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9) {
+		au_len = ctx->slice_len;
+		memcpy(au, ctx->slice_data, au_len);
+	} else {
 	/* Only re-emit SPS/PPS when they change; a per-picture repetition
 	 * resets the firmware DPB and breaks P-frame references. */
 	n = h264_build_sps(au + 4, au_cap - 4 - ctx->slice_len, &ctx->pic,
 			   ctx->profile);
 	if (n <= 0) {
+		free(au);
 		return -1;
 	}
 	if (n != ctx->last_sps_len ||
@@ -442,10 +468,12 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		au_len = 4 + n;
 	}
 
-		n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
+	n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
 			   ctx->slice_len, &ctx->pic, ctx->refs_l0, ctx->refs_l1);
-	if (n <= 0)
+	if (n <= 0) {
+		free(au);
 		return -1;
+	}
 	if (n != ctx->last_pps_len ||
 	    memcmp(au + au_len + 4, ctx->last_pps, n) != 0) {
 		memcpy(au + au_len, sc4, 4);
@@ -460,6 +488,7 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	}
 	memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
 	au_len += ctx->slice_len;
+	}
 
 	{
 		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;

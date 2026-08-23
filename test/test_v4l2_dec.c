@@ -180,7 +180,8 @@ int main(int argc, char **argv)
 
 	printf("access units found: %u\n", n_aus);
 
-	ret = v4l2_dec_open(&dec, "/dev/video0", width, height);
+	ret = v4l2_dec_open(&dec, "/dev/video0", width, height,
+			    V4L2_PIX_FMT_H264);
 	if (ret) { fprintf(stderr, "open failed ret=%d\n", ret); return 1; }
 
 	/* Queue the first access unit before STREAMON, mirroring FFmpeg. */
