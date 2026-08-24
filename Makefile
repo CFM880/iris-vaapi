@@ -19,12 +19,13 @@ TEST_HEVC = $(BUILD)/test_hevc_au
 TEST_HEVC_PARAMS = $(BUILD)/test_hevc_params
 TEST_HEVC_REWRITE = $(BUILD)/test_hevc_slice_rewrite
 TEST_VA_STRESS = $(BUILD)/test_va_stress
+TEST_SURFACE_FENCE = $(BUILD)/test_surface_fence
 
 .PHONY: all clean install
 
 all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
 	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) \
-	$(TEST_VA_STRESS)
+	$(TEST_VA_STRESS) $(TEST_SURFACE_FENCE)
 
 DECODE_OBJ = $(BUILD)/decode.o
 
@@ -44,7 +45,7 @@ $(HEVC_REWRITE_OBJ): src/hevc_slice_rewrite.c src/hevc_slice_rewrite.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
-$(V4L2_OBJ): src/v4l2_dec.c src/v4l2_dec.h
+$(V4L2_OBJ): src/v4l2_dec.c src/v4l2_dec.h src/iris_surface_fence.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
 
@@ -87,6 +88,10 @@ $(TEST_HEVC_REWRITE): test/test_hevc_slice_rewrite.c $(HEVC_REWRITE_OBJ) src/hev
 $(TEST_VA_STRESS): test/test_va_stress.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+
+$(TEST_SURFACE_FENCE): test/test_surface_fence.c src/iris_surface_fence.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $<
 
 clean:
 	rm -rf $(BUILD)

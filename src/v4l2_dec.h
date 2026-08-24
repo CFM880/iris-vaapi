@@ -80,6 +80,9 @@ void v4l2_dec_size(struct v4l2_dec *d, unsigned int *w, unsigned int *h);
 int v4l2_dec_dqout(struct v4l2_dec *d);
 /* Signal EOS through the stateful-decoder drain command. */
 int v4l2_dec_flush(struct v4l2_dec *d);
+int v4l2_dec_attach_surface_fence(struct v4l2_dec *d, int dmabuf_fd,
+				  uint64_t token);
+int v4l2_dec_signal_surface_fence(struct v4l2_dec *d, uint64_t token);
 int v4l2_dec_stop(struct v4l2_dec *d);
 void v4l2_dec_close(struct v4l2_dec *d);
 

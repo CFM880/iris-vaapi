@@ -101,13 +101,56 @@ struct iris_surface {
 	unsigned int sw, sh;	/* coded size the backing was created for */
 	int decoded;		/* a frame has been copied into the backing */
 	int queued;		/* some picture was decoded into this surface */
+	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
+	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
 	struct iris_decode_ctx *owner;	/* engine that queued the picture */
 };
 
 static int
-surface_copy(struct iris_surface *s, const void *src, size_t size)
+surface_finish_write(struct v4l2_dec *dec, struct iris_surface *s)
 {
-	int sync_started = 0;
+	int ret = 0;
+
+	if (s->write_started &&
+	    dma_buf_cpu_sync(s->bfd,
+			     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE) < 0)
+		ret = -errno;
+	s->write_started = 0;
+	if (s->fence_token) {
+		int signal_ret = v4l2_dec_signal_surface_fence(dec,
+							 s->fence_token);
+
+		s->fence_token = 0;
+		if (!ret && signal_ret)
+			ret = signal_ret;
+	}
+	return ret;
+}
+
+static void
+surface_begin_write(struct v4l2_dec *dec, struct iris_surface *s,
+		    uint64_t token)
+{
+	if (s->write_started || s->fence_token)
+		surface_finish_write(dec, s);
+	if (dma_buf_cpu_sync(s->bfd,
+			     DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) < 0)
+		return;
+	s->write_started = 1;
+	if (!v4l2_dec_attach_surface_fence(dec, s->bfd, token)) {
+		s->fence_token = token;
+	} else {
+		dma_buf_cpu_sync(s->bfd,
+				 DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+		s->write_started = 0;
+	}
+}
+
+static int
+surface_copy(struct v4l2_dec *dec, struct iris_surface *s,
+	     const void *src, size_t size)
+{
+	int sync_started = s->write_started;
 
 	if (size > s->bsize)
 		return -E2BIG;
@@ -117,16 +160,17 @@ surface_copy(struct iris_surface *s, const void *src, size_t size)
 	 * 4K frames can be sampled with stale cache lines and appear torn or
 	 * partially corrupted.  memfd fallback buffers do not support this
 	 * ioctl and remain ordinary coherent CPU mappings. */
-	if (dma_buf_cpu_sync(s->bfd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0)
+	if (!sync_started && dma_buf_cpu_sync(s->bfd,
+				    DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
 		sync_started = 1;
-	else if (errno != ENOTTY && errno != EINVAL)
+	} else if (!sync_started && errno != ENOTTY && errno != EINVAL) {
 		return -errno;
+	}
 
 	memcpy(s->bmap, src, size);
 
-	if (sync_started &&
-	    dma_buf_cpu_sync(s->bfd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE) < 0)
-		return -errno;
+	if (sync_started)
+		return surface_finish_write(dec, s);
 	return 0;
 }
 
@@ -210,6 +254,36 @@ struct iris_decode_ctx {
 	unsigned int hevc_ring_head, hevc_ring_len;
 };
 
+static void
+finish_pending_writes(struct iris_decode_ctx *ctx)
+{
+	int i;
+
+	if (!ctx->surfs || !ctx->dec_open)
+		return;
+	for (i = 0; i < ctx->surfs->n; i++) {
+		struct iris_surface *s = &ctx->surfs->s[i];
+
+		if (s->owner == ctx && (s->write_started || s->fence_token))
+			surface_finish_write(&ctx->dec, s);
+	}
+}
+
+static void
+detach_owned_surfaces(struct iris_decode_ctx *ctx)
+{
+	int i;
+
+	if (!ctx->surfs)
+		return;
+	for (i = 0; i < ctx->surfs->n; i++) {
+		struct iris_surface *s = &ctx->surfs->s[i];
+
+		if (s->owner == ctx)
+			s->owner = NULL;
+	}
+}
+
 static struct iris_surface *
 surfs_find(struct iris_surfs *t, VASurfaceID id)
 {
@@ -278,8 +352,11 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 {
 	if (!ctx)
 		return;
-	if (ctx->dec_open)
+	if (ctx->dec_open) {
+		finish_pending_writes(ctx);
 		v4l2_dec_close(&ctx->dec);
+	}
+	detach_owned_surfaces(ctx);
 	free(ctx->slice_data);
 	free(ctx);
 }
@@ -353,6 +430,7 @@ iris_decode_reset(struct iris_decode_ctx *ctx)
 	if (!ctx)
 		return;
 	if (ctx->dec_open) {
+		finish_pending_writes(ctx);
 		v4l2_dec_close(&ctx->dec);
 		ctx->dec_open = 0;
 	}
@@ -375,6 +453,11 @@ iris_surfs_destroy(struct iris_surfs *t)
 	if (!t)
 		return;
 	for (i = 0; i < t->n; i++) {
+		struct iris_surface *s = &t->s[i];
+
+		if (s->owner && s->owner->dec_open &&
+		    (s->write_started || s->fence_token))
+			surface_finish_write(&s->owner->dec, s);
 		munmap(t->s[i].bmap, t->s[i].bsize);
 		close(t->s[i].bfd);
 	}
@@ -431,6 +514,8 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	s->sh = height;
 	s->decoded = 0;
 	s->queued = 0;
+	s->write_started = 0;
+	s->fence_token = 0;
 	s->owner = NULL;
 	return 0;
 }
@@ -447,6 +532,9 @@ iris_surfs_free(struct iris_surfs *t, VASurfaceID id)
 
 		if (s->id != id)
 			continue;
+		if (s->owner && s->owner->dec_open &&
+		    (s->write_started || s->fence_token))
+			surface_finish_write(&s->owner->dec, s);
 		munmap(s->bmap, s->bsize);
 		close(s->bfd);
 		t->s[i] = t->s[t->n - 1];
@@ -567,6 +655,7 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 		 * decoding (Chrome flush/reset, looped playback) needs a fresh
 		 * session. */
 		if (ctx->eos_sent) {
+			finish_pending_writes(ctx);
 			v4l2_dec_close(&ctx->dec);
 			ctx->dec_open = 0;
 			reset_stream_state(ctx);
@@ -666,10 +755,12 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 			"[copy] WARNING frame %u bytes > backing %u; "
 			"dropping surface %u\n",
 			frame->bytesused, s->bsize, id);
+		surface_finish_write(&ctx->dec, s);
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	} else if (frame->bytesused) {
-		int copy_ret = surface_copy(s, frame->mem, frame->bytesused);
+		int copy_ret = surface_copy(&ctx->dec, s, frame->mem,
+					    frame->bytesused);
 
 		if (copy_ret < 0) {
 			fprintf(stderr,
@@ -678,6 +769,8 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 			return -1;
 		}
+	} else {
+		surface_finish_write(&ctx->dec, s);
 	}
 	v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 	s->decoded = 1;
@@ -1212,8 +1305,11 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 							       ctx->current_target);
 
 			if (qt) {
+				uint64_t token = ctx->seq + 1;
+
 				qt->queued = 1;
 				qt->owner = ctx;
+				surface_begin_write(&ctx->dec, qt, token);
 			}
 		}
 		/* Ring mapping: only a handful of frames (bounded by the
@@ -1235,11 +1331,13 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			 * setup (0x1004). */
 			ret = v4l2_dec_feed(&ctx->dec, au, au_len, ts);
 			if (ret) {
+				finish_pending_writes(ctx);
 				free(au);
 				return ret;
 			}
 			ret = v4l2_dec_start(&ctx->dec);
 			if (ret) {
+				finish_pending_writes(ctx);
 				free(au);
 				return ret;
 			}
@@ -1257,7 +1355,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 				drain_available(ctx);
 				v4l2_dec_poll(&ctx->dec, 50);
 			}
-						if (ret) {
+			if (ret) {
+				finish_pending_writes(ctx);
 				free(au);
 				return ret;
 			}

@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "v4l2_dec.h"
+#include "iris_surface_fence.h"
 
 #define OUT_BUFFERS	16
 #define CAP_BUFFERS	20
@@ -45,6 +46,31 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	} while (r == -1 && errno == EINTR);
 
 	return r;
+}
+
+int v4l2_dec_attach_surface_fence(struct v4l2_dec *d, int dmabuf_fd,
+				  uint64_t token)
+{
+	struct iris_surface_fence_cmd cmd = {
+		.op = IRIS_SURFACE_FENCE_ATTACH,
+		.dmabuf_fd = dmabuf_fd,
+		.token = token,
+	};
+
+	return xioctl(d->fd, VIDIOC_IRIS_SURFACE_FENCE, &cmd) < 0 ?
+		-errno : 0;
+}
+
+int v4l2_dec_signal_surface_fence(struct v4l2_dec *d, uint64_t token)
+{
+	struct iris_surface_fence_cmd cmd = {
+		.op = IRIS_SURFACE_FENCE_SIGNAL,
+		.dmabuf_fd = -1,
+		.token = token,
+	};
+
+	return xioctl(d->fd, VIDIOC_IRIS_SURFACE_FENCE, &cmd) < 0 ?
+		-errno : 0;
 }
 
 static void v4l2_dec_enable_decode_order(struct v4l2_dec *d)

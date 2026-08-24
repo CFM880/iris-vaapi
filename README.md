@@ -371,6 +371,7 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 | 会话中途死亡（GPU 进程被杀/错误路径） | 固件 wedge，之后所有解码 SESSION_INIT -110 → 永久回退 | close 前 DECODER_CMD STOP + 有界 drain |
 | 重建 H.264 SPS 的 VUI 非法 | `Overread VUI`、PPS 失配 | 按 Chromium packed-H264 builder 重建合法 VUI；展示重排仍由 Chromium DPB 完成 |
 | 固件按显示顺序延迟返还 CAPTURE | Chrome 已输出 VA surface，但对应 CAPTURE 帧尚未产生 → 4K 卡顿、短暂旧帧/花屏 | qcom-iris 暴露标准 display-delay 控制并向 Gen1 固件请求 decode-order output；VA 驱动在会话启动前设置 delay=0 |
+| Gen1 即使 decode-order 仍会成批返还 CAPTURE（实测每 3 帧） | `vaEndPicture` 已返回，但目标 surface 尚未写入；Chrome 不调用 `vaSyncSurface` 就交给 GPU，因而采到旧帧或写到一半的帧 | `vaEndPicture` 给稳定 DMA-BUF 挂未完成的 reservation write fence；CAPTURE 拷贝和 cache sync 完成后再 signal。GPU 自动等待，V4L2 解码仍保持流水线，不必逐帧同步阻塞 |
 
 排查工具：
 
@@ -381,6 +382,8 @@ export IRIS_VAAPI_DEBUG=1
 ./build/test_va_stress /home/cfm880/qcom/test-1080p-nob.h264 700
 # Chrome 侧确认当前用的解码器：
 # chrome://media-internals → kVideoDecoderName；chrome://gpu → Video Acceleration
+# 安装/重载新内核模块后先验证 reservation fence 接口：
+./build/test_surface_fence /dev/video0
 ```
 
 注意：压力测试中途被杀（Ctrl-C/timeout）会 wedge 固件，先重载模块再继续调试。
@@ -395,7 +398,8 @@ LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=iris \
   ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i 流.h264 -f null -  # P2 ffmpeg
 # 安装到系统供 Chrome 使用：
 sudo ./install-system.sh
-# decode-order 修复还需要安装同一源码树编译的 qcom-iris 模块，关闭 Chrome 后：
+# decode-order 和异步 surface fence 修复需要安装同一源码树编译的
+# qcom-iris 模块；只更新 VA 驱动不会生效。关闭 Chrome 后：
 sudo install -m 0644 ../nabu-linux/linux/out-iris1/drivers/media/platform/qcom/iris/qcom-iris.ko \
   /lib/modules/$(uname -r)/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko
 sudo depmod -a && sudo modprobe -r qcom_iris && sudo modprobe qcom_iris
