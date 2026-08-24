@@ -372,6 +372,7 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 | 重建 H.264 SPS 的 VUI 非法 | `Overread VUI`、PPS 失配 | 按 Chromium packed-H264 builder 重建合法 VUI；展示重排仍由 Chromium DPB 完成 |
 | 固件按显示顺序延迟返还 CAPTURE | Chrome 已输出 VA surface，但对应 CAPTURE 帧尚未产生 → 4K 卡顿、短暂旧帧/花屏 | qcom-iris 暴露标准 display-delay 控制并向 Gen1 固件请求 decode-order output；VA 驱动在会话启动前设置 delay=0 |
 | Gen1 即使 decode-order 仍会成批返还 CAPTURE（实测每 3 帧） | `vaEndPicture` 已返回，但目标 surface 尚未写入；Chrome 不调用 `vaSyncSurface` 就交给 GPU，因而采到旧帧或写到一半的帧 | `vaEndPicture` 给稳定 DMA-BUF 挂未完成的 reservation write fence；CAPTURE 拷贝和 cache sync 完成后再 signal。GPU 自动等待，V4L2 解码仍保持流水线，不必逐帧同步阻塞 |
+| Chromium Flush 只排空软件 DPB，不向 libva/stateful V4L2 发送 EOS | 固件扣住片尾帧；context reset 后最后一个 surface 仍是其上一次内容，表现为片尾跳回上一帧 | 每个 H.264 AU 尾部附加 AUD 边界，促使固件异步释放当前帧；不在 `vaEndPicture` 等待，性能保持流水线 |
 
 排查工具：
 
