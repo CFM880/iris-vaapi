@@ -1274,11 +1274,23 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	 * operation that sends EOS to a stateful V4L2 decoder.  Iris would then
 	 * keep the final picture internally while Chromium presents its surface;
 	 * when the context is reset that surface still contains its previous
-	 * frame.  A trailing H.264 AUD starts the next access-unit boundary and
-	 * makes firmware release the current picture without making vaEndPicture
-	 * wait, so normal decode remains pipelined behind the DMA-BUF fence. */
+	 * frame.  A trailing AUD starts the next access-unit boundary and makes
+	 * firmware release the current picture without making vaEndPicture wait,
+	 * so normal decode remains pipelined behind the DMA-BUF fence. */
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
 		static const uint8_t aud[] = { 0, 0, 0, 1, 0x09, 0xf0 };
+
+		if (au_len + sizeof(aud) > au_cap) {
+			free(au);
+			return -1;
+		}
+		memcpy(au + au_len, aud, sizeof(aud));
+		au_len += sizeof(aud);
+	} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+		/* AUD_NUT, layer_id 0, temporal_id_plus1 1, pic_type 2. */
+		static const uint8_t aud[] = {
+			0, 0, 0, 1, 0x46, 0x01, 0x50
+		};
 
 		if (au_len + sizeof(aud) > au_cap) {
 			free(au);
