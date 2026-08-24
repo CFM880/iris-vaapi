@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Decode backend for the iris-vaapi driver: wraps the V4L2 engine, tracks VA
  * surfaces, accumulates picture parameters + slices, reassembles a whole H.264
- * access unit and maps decoded NV12 CAPTURE buffers back to VA surfaces. */
+ * access unit and maps decoded NV12 CAPTURE buffers back to VA surfaces.
+ *
+ * Threading/lifecycle model (matches how Chrome uses libva):
+ * - Surfaces live in a display-level registry (iris_surfs) and may outlive
+ *   the decode context that produced them.
+ * - Each VA context owns its own iris_decode_ctx (its own V4L2 session), so
+ *   concurrent videos do not share engine state and switching codec or
+ *   resolution always starts from a clean firmware session.
+ */
 
 #ifndef IRIS_VAAPI_DECODE_H
 #define IRIS_VAAPI_DECODE_H
@@ -11,17 +19,54 @@
 #include <va/va.h>
 
 struct iris_decode_ctx;
+struct iris_surfs;
 
+/* ---- Display-level surface registry ---- */
+struct iris_surfs *iris_surfs_create(void);
+void iris_surfs_destroy(struct iris_surfs *t);
+int iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
+		     unsigned int width, unsigned int height);
+void iris_surfs_free(struct iris_surfs *t, VASurfaceID id);
+/* Sync routing: drains the owning engine until @id is ready.  Unknown,
+ * never-queued, already-decoded surfaces and surfaces whose engine is gone
+ * succeed immediately (Chrome syncs pool surfaces before decoding into them,
+ * and must not get spurious timeouts). */
+int iris_surfs_sync(struct iris_surfs *t, VASurfaceID id);
+/* Advisory readiness without draining an engine. */
+int iris_surfs_ready(struct iris_surfs *t, VASurfaceID id);
+/* Export the backing of @id as a fresh DRM PRIME fd (caller owns it). */
+int iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
+		      unsigned int *pitch, unsigned int *size,
+		      unsigned int *width, unsigned int *height);
+/* Backing memory layout of @id (for vaDeriveImage/vaGetImage). */
+int iris_surfs_buffer(struct iris_surfs *t, VASurfaceID id, void **mem,
+		      unsigned int *pitch, unsigned int *size,
+		      unsigned int *width, unsigned int *height);
+
+/* ---- Per-context decode engines ---- */
 struct iris_decode_ctx *iris_decode_create(void);
 void iris_decode_destroy(struct iris_decode_ctx *ctx);
 
 void iris_decode_setup(struct iris_decode_ctx *ctx, unsigned int width,
 		       unsigned int height, VAProfile profile);
 
-/* Surface lifecycle. */
+/* Attach the display-level registry this engine reads/writes surfaces in. */
+void iris_decode_set_surfaces(struct iris_decode_ctx *ctx,
+			      struct iris_surfs *t);
+/* Legacy shims: allocate/free a surface in the attached registry. */
 int iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id);
-int iris_decode_destroy_surface(struct iris_decode_ctx *ctx, VASurfaceID id);
-int iris_decode_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id);
+void iris_decode_destroy_surface(struct iris_decode_ctx *ctx, VASurfaceID id);
+
+/* Update coded dimensions of a context that has not started decoding. */
+void iris_decode_reconfigure(struct iris_decode_ctx *ctx, unsigned int width,
+			     unsigned int height);
+/* Tear down the firmware session and per-stream state (seek/reset). */
+void iris_decode_reset(struct iris_decode_ctx *ctx);
+
+/* Wait until @id has a decoded frame (drains this engine). */
+int iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id);
+/* Feed EOS so the firmware releases the picture it is holding. */
+int iris_decode_flush(struct iris_decode_ctx *ctx);
 
 /* Per-picture accumulation (called from vaRenderPicture). */
 int iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target);
@@ -40,20 +85,5 @@ int iris_decode_slice(struct iris_decode_ctx *ctx, const void *data,
 
 /* Reassemble and feed the engine.  Returns once queued (async). */
 int iris_decode_end(struct iris_decode_ctx *ctx);
-/* Wait until @id has a decoded frame (drains the engine). */
-int iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id);
-/* Feed EOS so the firmware releases the picture it is holding. */
-int iris_decode_flush(struct iris_decode_ctx *ctx);
-
-/* Export the decoded buffer of @id as a DRM PRIME fd. */
-int iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
-		       unsigned int *pitch, unsigned int *size,
-		       unsigned int *width, unsigned int *height);
-
-/* Look up the decoded CAPTURE buffer of @id (for vaDeriveImage/vaMapBuffer). */
-int iris_decode_surface_buffer(struct iris_decode_ctx *ctx, VASurfaceID id,
-			       unsigned int *cap_index, void **mem,
-			       unsigned int *pitch, unsigned int *size,
-			       unsigned int *width, unsigned int *height);
 
 #endif

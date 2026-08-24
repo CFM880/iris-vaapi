@@ -290,13 +290,34 @@ int v4l2_dec_start(struct v4l2_dec *d)
 	return v4l2_dec_setup_capture(d);
 }
 
-/* poll the device for readable events / CAPTURE frames. Returns >0 ready. */
+/* Poll the device for any progress (CAPTURE frames, events, OUTPUT space).
+ *
+ * Used by feed/drain loops: the OUTPUT queue being writable must wake the
+ * caller promptly so consumed bitstream buffers get recycled, otherwise the
+ * pipeline stalls waiting for frames that need more input first.
+ */
 int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms)
 {
 	struct pollfd pfd;
 
 	pfd.fd = d->fd;
-	pfd.events = POLLIN | POLLOUT;
+	pfd.events = POLLIN | POLLPRI | POLLOUT;
+	pfd.revents = 0;
+	return poll(&pfd, 1, timeout_ms);
+}
+
+/* Poll waiting specifically for a decoded CAPTURE frame or an event.
+ *
+ * Only POLLIN|POLLPRI: adding POLLOUT here made vaSyncSurface-style waiters
+ * spin through their whole retry budget in microseconds (OUTPUT is almost
+ * always writable) and report a timeout while the frame was still in flight.
+ */
+int v4l2_dec_poll_cap(struct v4l2_dec *d, int timeout_ms)
+{
+	struct pollfd pfd;
+
+	pfd.fd = d->fd;
+	pfd.events = POLLIN | POLLPRI;
 	pfd.revents = 0;
 	return poll(&pfd, 1, timeout_ms);
 }
@@ -484,18 +505,32 @@ int v4l2_dec_flush(struct v4l2_dec *d)
 int v4l2_dec_stop(struct v4l2_dec *d)
 {
 	enum v4l2_buf_type type;
+	int ret = 0;
 
-	if (d->streaming_cap) {
-		type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		xioctl(d->fd, VIDIOC_STREAMOFF, &type);
-		d->streaming_cap = 0;
-	}
+	/* A stateful decoder must stop accepting compressed input before its
+	 * decoded-output buffers are torn down.  For qcom-iris this ordering is
+	 * especially important: OUTPUT STREAMOFF issues HFI_FLUSH_ALL and moves
+	 * the session out of IRIS_INST_STREAMING; stopping CAPTURE first only
+	 * issues HFI_FLUSH_OUTPUT and can time out while 4K pictures are still in
+	 * flight, leaving subsequent SESSION_INIT commands wedged. */
 	if (d->streaming) {
 		type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-		xioctl(d->fd, VIDIOC_STREAMOFF, &type);
+		if (xioctl(d->fd, VIDIOC_STREAMOFF, &type) < 0) {
+			ret = -errno;
+			perror("STREAMOFF OUTPUT");
+		}
 		d->streaming = 0;
 	}
-	return 0;
+	if (d->streaming_cap) {
+		type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		if (xioctl(d->fd, VIDIOC_STREAMOFF, &type) < 0) {
+			if (!ret)
+				ret = -errno;
+			perror("STREAMOFF CAPTURE");
+		}
+		d->streaming_cap = 0;
+	}
+	return ret;
 }
 
 void v4l2_dec_close(struct v4l2_dec *d)
@@ -504,6 +539,27 @@ void v4l2_dec_close(struct v4l2_dec *d)
 
 	if (!d)
 		return;
+	/* Politely drain before tearing the queues down.  A stateful session
+	 * killed mid-flight (client error path, context destroyed between
+	 * pictures) is what wedges the firmware into SESSION_INIT timeouts
+	 * until the module is reloaded; V4L2_DEC_CMD_STOP + FLAG_LAST lets
+	 * the firmware finish its current picture first. */
+	if (d->streaming && !d->eos && v4l2_dec_flush(d) == 0) {
+		int spin;
+
+		for (spin = 0; spin < 25; spin++) {
+			struct v4l2_dec_frame frame;
+			int r;
+
+			while (v4l2_dec_dqout(d) == 0)
+				;
+			r = v4l2_dec_dqcap(d, &frame);
+			if (r == 1)
+				break;	/* FLAG_LAST seen */
+			if (r < 0)
+				v4l2_dec_poll_cap(d, 10);
+		}
+	}
 	v4l2_dec_stop(d);
 	if (d->cap_meta) {
 		for (i = 0; i < d->cap_count; i++) {

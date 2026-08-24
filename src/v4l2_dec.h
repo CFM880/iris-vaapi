@@ -56,6 +56,8 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 int v4l2_dec_start(struct v4l2_dec *d);
 /* poll the device fd. Returns poll() result. */
 int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms);
+/* Poll for CAPTURE progress only (frame ready / event), never POLLOUT. */
+int v4l2_dec_poll_cap(struct v4l2_dec *d, int timeout_ms);
 /* Queue one full access unit on the OUTPUT queue.  The decoder propagates
  * @timestamp to the produced CAPTURE frame, which the driver uses to match
  * decoded frames back to VA surfaces. */

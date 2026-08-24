@@ -42,7 +42,27 @@
 #define IRIS_VAAPI_VERSION	"0.0.1"
 #define IRIS_VAAPI_VENDOR	"iris-vaapi P0: Qualcomm Iris SM8150 (V4L2) "
 
+/* Per-surface tracing is chatty and the GPU process inherits this stderr;
+ * opt in with IRIS_VAAPI_DEBUG=1. */
+static int dbg_enabled(void)
+{
+	static int dbg = -1;
+
+	if (dbg < 0)
+		dbg = getenv("IRIS_VAAPI_DEBUG") != NULL;
+	return dbg;
+}
+
+#define DBG(...)	do { if (dbg_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 /* vtable needs a little state to hand out ids */
+#define IRIS_MAX_ENGINES	8
+
+struct iris_engine {
+	VAContextID ctx_id;
+	struct iris_decode_ctx *dec;
+};
+
 struct iris_drv_data {
 	unsigned int config_id;
 	unsigned int context_id;
@@ -50,7 +70,14 @@ struct iris_drv_data {
 	unsigned int buffer_id;
 	unsigned int width, height;
 	VAProfile profile;
-	struct iris_decode_ctx *dec;
+	/* Display-level surface registry: pool surfaces outlive the contexts
+	 * that decode into them (Chrome destroys contexts on navigation while
+	 * frames are still exported/displayed). */
+	struct iris_surfs *surfs;
+	/* One engine (one V4L2 session) per VA context so concurrent videos
+	 * never share firmware DPB/queue state. */
+	struct iris_engine engines[IRIS_MAX_ENGINES];
+	int n_engines;
 	int n_bufs;
 	unsigned int buf_ids[256];
 	VABufferType buf_types[256];
@@ -66,6 +93,8 @@ struct iris_drv_data {
 	/* vaCreateImage/vaGetImage CPU transfer buffers. */
 	VABufferID img_ids[64];
 	unsigned int img_sizes[64];
+	unsigned int img_ws[64];
+	unsigned int img_hs[64];
 	void *img_data[64];
 	int img_n;
 };
@@ -111,12 +140,15 @@ static VAStatus
 iris_vaTerminate(VADriverContextP ctx)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
 
 	if (dd) {
 		iris_free_buffers(dd);
-		if (dd->dec) {
-			iris_decode_destroy(dd->dec);
-		}
+		for (i = 0; i < dd->n_engines; i++)
+			iris_decode_destroy(dd->engines[i].dec);
+		dd->n_engines = 0;
+		iris_surfs_destroy(dd->surfs);
+		dd->surfs = NULL;
 		free(dd);
 		ctx->pDriverData = NULL;
 	}
@@ -193,17 +225,23 @@ iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 	return VA_STATUS_SUCCESS;
 }
 
-static int
-iris_ensure_decode_ctx(struct iris_drv_data *dd, unsigned int w, unsigned int h)
+static struct iris_surfs *
+iris_ensure_surfs(struct iris_drv_data *dd)
 {
-	if (dd->dec)
-		return 0;
-	dd->dec = iris_decode_create();
-	if (!dd->dec)
-		return -1;
-	iris_decode_setup(dd->dec, w ? w : dd->width, h ? h : dd->height,
-			  dd->profile);
-	return 0;
+	if (!dd->surfs)
+		dd->surfs = iris_surfs_create();
+	return dd->surfs;
+}
+
+static struct iris_decode_ctx *
+iris_context_engine(struct iris_drv_data *dd, VAContextID context_id)
+{
+	int i;
+
+	for (i = 0; i < dd->n_engines; i++)
+		if (dd->engines[i].ctx_id == context_id)
+			return dd->engines[i].dec;
+	return NULL;
 }
 
 static VAStatus
@@ -258,23 +296,58 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 		     int num_render_targets, VAContextID *context_id)
 {
 	struct iris_drv_data *dd;
+	struct iris_surfs *t;
+	struct iris_decode_ctx *eng;
 
 	dd = iris_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	t = iris_ensure_surfs(dd);
+	if (!t)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (dd->n_engines >= IRIS_MAX_ENGINES)
+		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+
+	/* One fresh engine (V4L2 session) per context: Chrome recreates the
+	 * context for every stream and on resolution changes.  Reusing a
+	 * session across streams leaks firmware DPB state and queued buffers,
+	 * and a codec switch would feed the wrong pixfmt into a live OUTPUT
+	 * queue; either way decoding breaks and Chrome falls back to
+	 * software. */
+	eng = iris_decode_create();
+	if (!eng)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	iris_decode_setup(eng, picture_width, picture_height, dd->profile);
+	iris_decode_set_surfaces(eng, t);
 
 	dd->width = picture_width;
 	dd->height = picture_height;
-	if (iris_ensure_decode_ctx(dd, picture_width, picture_height))
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	iris_decode_setup(dd->dec, picture_width, picture_height, dd->profile);
-	*context_id = ++dd->context_id;
+	dd->engines[dd->n_engines].ctx_id = ++dd->context_id;
+	dd->engines[dd->n_engines].dec = eng;
+	dd->n_engines++;
+	*context_id = dd->context_id;
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
 iris_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
 {
+	struct iris_drv_data *dd = ctx->pDriverData;
+	int i;
+
+	if (!dd)
+		return VA_STATUS_SUCCESS;
+	for (i = 0; i < dd->n_engines; i++) {
+		if (dd->engines[i].ctx_id != context_id)
+			continue;
+		/* Clean teardown between streams; sessions killed mid-flight
+		 * are what wedges the firmware (SESSION_INIT timeouts until
+		 * rmmod). */
+		iris_decode_destroy(dd->engines[i].dec);
+		dd->engines[i] = dd->engines[dd->n_engines - 1];
+		dd->n_engines--;
+		return VA_STATUS_SUCCESS;
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -283,21 +356,20 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 		      int num_surfaces, VASurfaceID *surfaces)
 {
 	struct iris_drv_data *dd;
+	struct iris_surfs *t;
 	int i;
 
 	dd = iris_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
-	/* The decode context may not exist yet if the client creates surfaces
-	 * before the context; make sure surface ids are always tracked. */
-	if (iris_ensure_decode_ctx(dd, width, height))
+	t = iris_ensure_surfs(dd);
+	if (!t)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
 	for (i = 0; i < num_surfaces; i++) {
 		VASurfaceID id = ++dd->surface_id;
 
-		if (iris_decode_create_surface(dd->dec, id))
+		if (iris_surfs_alloc(t, id, width, height))
 			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 		surfaces[i] = id;
 	}
@@ -312,10 +384,10 @@ iris_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 	struct iris_drv_data *dd = ctx->pDriverData;
 	int i;
 
-	if (!dd || !dd->dec)
+	if (!dd || !dd->surfs)
 		return VA_STATUS_SUCCESS;
 	for (i = 0; i < num_surfaces; i++)
-		iris_decode_destroy_surface(dd->dec, surface_list[i]);
+		iris_surfs_free(dd->surfs, surface_list[i]);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -440,10 +512,14 @@ iris_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
 		    VASurfaceID render_target)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
+	struct iris_decode_ctx *eng;
 
-	if (!dd || !dd->dec)
+	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	iris_decode_begin(dd->dec, render_target);
+	eng = iris_context_engine(dd, context_id);
+	if (!eng)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	iris_decode_begin(eng, render_target);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -452,9 +528,13 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 		     VABufferID *buffers, int num_buffers)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
+	struct iris_decode_ctx *eng;
 	int i;
 
-	if (!dd || !dd->dec)
+	if (!dd)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	eng = iris_context_engine(dd, context_id);
+	if (!eng)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
 	for (i = 0; i < num_buffers; i++) {
@@ -466,7 +546,7 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			return VA_STATUS_ERROR_INVALID_BUFFER;
 		data = dd->buf_data[idx];
 		type = dd->buf_types[idx];
-	
+
 		switch (type) {
 		case VAPictureParameterBufferType:
 			/* VP9 frames carry their own header, so ignore the
@@ -482,14 +562,14 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 				if (dd->buf_sizes[idx] <
 				    sizeof(VAPictureParameterBufferHEVC))
 					return VA_STATUS_ERROR_INVALID_BUFFER;
-				if (iris_decode_hevc_picture(dd->dec, data))
+				if (iris_decode_hevc_picture(eng, data))
 					return VA_STATUS_ERROR_INVALID_BUFFER;
 				break;
 			}
 			if (dd->buf_sizes[idx] <
 			    sizeof(VAPictureParameterBufferH264))
 				return VA_STATUS_ERROR_INVALID_BUFFER;
-			iris_decode_picture(dd->dec, data);
+			iris_decode_picture(eng, data);
 			break;
 		case VASliceParameterBufferType:
 			if (dd->profile == VAProfileVP9Profile0 ||
@@ -504,7 +584,7 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 				    dd->buf_num_elements[idx])
 					return VA_STATUS_ERROR_INVALID_BUFFER;
 				for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
-					if (iris_decode_hevc_slice_params(dd->dec,
+					if (iris_decode_hevc_slice_params(eng,
 						(const VASliceParameterBufferHEVC *)data + j))
 						return VA_STATUS_ERROR_INVALID_BUFFER;
 				break;
@@ -513,11 +593,11 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			    dd->buf_num_elements[idx])
 				return VA_STATUS_ERROR_INVALID_BUFFER;
 			for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
-				iris_decode_slice_params(dd->dec,
+				iris_decode_slice_params(eng,
 					(const VASliceParameterBufferH264 *)data + j);
 			break;
 		case VASliceDataBufferType:
-			if (iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]))
+			if (iris_decode_slice(eng, data, dd->buf_sizes[idx]))
 				return VA_STATUS_ERROR_DECODING_ERROR;
 			break;
 		default:
@@ -532,10 +612,14 @@ static VAStatus
 iris_vaEndPicture(VADriverContextP ctx, VAContextID context_id)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
+	struct iris_decode_ctx *eng;
 
-	if (!dd || !dd->dec)
+	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	return iris_decode_end(dd->dec) ?
+	eng = iris_context_engine(dd, context_id);
+	if (!eng)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	return iris_decode_end(eng) ?
 		VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
 
@@ -544,10 +628,17 @@ iris_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_target)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
 
-	if (!dd || !dd->dec)
+	if (!dd)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	return iris_decode_sync(dd->dec, render_target) ?
-		VA_STATUS_ERROR_TIMEDOUT : VA_STATUS_SUCCESS;
+	/* Route through the registry: the picture being synced may belong to
+	 * any live engine, and never-queued pool surfaces succeed without
+	 * draining anything. */
+	{
+		int r = iris_surfs_sync(dd->surfs, render_target);
+
+		DBG("[sync] surf=%u -> r=%d\n", render_target, r);
+		return r ? VA_STATUS_ERROR_TIMEDOUT : VA_STATUS_SUCCESS;
+	}
 }
 
 static VAStatus
@@ -556,9 +647,9 @@ iris_vaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target,
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
 
-	if (!dd || !dd->dec || !status)
+	if (!dd || !status)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	*status = iris_decode_surface_ready(dd->dec, render_target) ?
+	*status = iris_surfs_ready(dd->surfs, render_target) ?
 		VASurfaceReady : VASurfaceRendering;
 	return VA_STATUS_SUCCESS;
 }
@@ -661,6 +752,8 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 	bid = ++dd->buffer_id;
 	dd->img_ids[dd->img_n] = bid;
 	dd->img_sizes[dd->img_n] = size;
+	dd->img_ws[dd->img_n] = width;
+	dd->img_hs[dd->img_n] = height;
 
 	memset(image, 0, sizeof(*image));
 	image->image_id = bid;
@@ -686,10 +779,10 @@ iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 	void *mem;
 	VABufferID bid;
 
-	if (!dd || !dd->dec || !image)
+	if (!dd || !image)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	if (iris_decode_surface_buffer(dd->dec, surface, &cap, &mem, &pitch,
-				       &size, &w, &h))
+	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
+			      &w, &h))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	if (dd->derived_n >= 256)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
@@ -711,7 +804,7 @@ iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 	image->pitches[0] = pitch;
 	image->pitches[1] = pitch;
 	image->offsets[0] = 0;
-	image->offsets[1] = pitch * ALIGN(h, 32);
+	image->offsets[1] = pitch * h;
 	image->buf = bid;
 	return VA_STATUS_SUCCESS;
 }
@@ -749,25 +842,49 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 		unsigned int width, unsigned int height, VAImageID image)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
-	unsigned int cap, pitch, size, w, h;
+	unsigned int pitch, size, cap_w, cap_h;
+	int img_i = -1;
 	void *mem, *dst = NULL;
 	int i;
 
-	if (!dd || !dd->dec)
+	if (!dd)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	if (iris_decode_surface_buffer(dd->dec, surface, &cap, &mem, &pitch,
-				       &size, &w, &h))
+	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
+			      &cap_w, &cap_h))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	for (i = 0; i < dd->img_n; i++)
 		if (dd->img_ids[i] == image) {
 			dst = dd->img_data[i];
+			img_i = i;
 			break;
 		}
 	if (!dst)
 		return VA_STATUS_ERROR_INVALID_IMAGE;
 
-	/* Copy the (possibly height-aligned) NV12 frame into the image. */
-	memcpy(dst, mem, size);
+	/* The image was created with the aligned coded layout; the buffer may
+	 * carry the CAPTURE-negotiated one.  Copy row-wise between them so
+	 * diverging strides cannot garble rows or overrun the image. */
+	{
+		unsigned int img_w = dd->img_ws[img_i];
+		unsigned int img_h = dd->img_hs[img_i];
+		unsigned int img_pitch = ALIGN(img_w, 128);
+		unsigned int img_chroma = img_pitch * ALIGN(img_h, 32);
+		unsigned int rows = img_h < cap_h ? img_h : cap_h;
+		unsigned int row_bytes = pitch < img_pitch ? pitch : img_pitch;
+		const uint8_t *src = mem;
+		uint8_t *d = dst;
+
+		for (i = 0; i < (int)rows; i++)
+			memcpy(d + (unsigned int)i * img_pitch,
+			       src + (unsigned int)i * pitch, row_bytes);
+		src = (const uint8_t *)mem + pitch * cap_h;
+		d = dst + img_chroma;
+		rows = (img_h + 1) / 2 < (cap_h + 1) / 2 ?
+		       (img_h + 1) / 2 : (cap_h + 1) / 2;
+		for (i = 0; i < (int)rows; i++)
+			memcpy(d + (unsigned int)i * img_pitch,
+			       src + (unsigned int)i * pitch, row_bytes);
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -861,13 +978,13 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 
 	if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
 		return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
-	if (!dd || !dd->dec)
+	if (!dd || !dd->surfs)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
-	fprintf(stderr, "[export] surf=%u type=%u flags=0x%x\n", surface_id,
-		mem_type, flags);
-	if (iris_decode_export(dd->dec, surface_id, &fd, &pitch, &size,
-			       &w, &h))
+	DBG("[export] surf=%u type=%u flags=0x%x\n", surface_id,
+	    mem_type, flags);
+	if (iris_surfs_export(dd->surfs, surface_id, &fd, &pitch, &size,
+			      &w, &h))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
 	memset(d, 0, sizeof(*d));
@@ -890,7 +1007,9 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	d->layers[1].drm_format = DRM_FORMAT_GR88;
 	d->layers[1].num_planes = 1;
 	d->layers[1].object_index[0] = 0;
-	d->layers[1].offset[0] = pitch * ALIGN(h, 32);
+	/* surfs_export returned the CAPTURE-negotiated layout height in @h,
+	 * which is exactly where the chroma plane starts. */
+	d->layers[1].offset[0] = pitch * h;
 	d->layers[1].pitch[0] = pitch;
 
 	(void)flags;
