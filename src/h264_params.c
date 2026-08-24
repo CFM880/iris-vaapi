@@ -140,20 +140,34 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, pic->seq_fields.bits.direct_8x8_inference_flag, 1);
 	bs_put(&b, 0, 1);	/* frame_cropping_flag */
 
-	/* Minimal VUI timing so the firmware can pace P-frame references. */
+	/* VAPictureParameterBufferH264 does not retain the original VUI, but a
+	 * stateful decoder must not hold pictures for presentation reordering:
+	 * Chromium already performs that reordering with its VA-picture DPB.  Its
+	 * packed-H264 builder therefore emits a minimal, legal VUI bitstream
+	 * restriction with max_num_reorder_frames=0 to make the decoder return a
+	 * completed picture immediately.  This is especially important here
+	 * because CAPTURE is copied asynchronously into the VA target surface.
+	 *
+	 * Do not add invented timing information.  num_units_in_tick/time_scale
+	 * are fixed u(32), not Exp-Golomb fields; the old encoding shifted the
+	 * remainder of the SPS and made the following PPS invalid. */
 	bs_put(&b, 1, 1);	/* vui_parameters_present_flag */
 	bs_put(&b, 0, 1);	/* aspect_ratio_info_present_flag */
 	bs_put(&b, 0, 1);	/* overscan_info_present_flag */
 	bs_put(&b, 0, 1);	/* video_signal_type_present_flag */
 	bs_put(&b, 0, 1);	/* chroma_loc_info_present_flag */
-	bs_put(&b, 1, 1);	/* timing_info_present_flag */
-	bs_ue(&b, 1);		/* num_units_in_tick */
-	bs_ue(&b, 60);		/* time_scale */
-	bs_put(&b, 0, 1);	/* fixed_frame_rate_flag */
+	bs_put(&b, 0, 1);	/* timing_info_present_flag */
 	bs_put(&b, 0, 1);	/* nal_hrd_parameters_present_flag */
 	bs_put(&b, 0, 1);	/* vcl_hrd_parameters_present_flag */
 	bs_put(&b, 0, 1);	/* pic_struct_present_flag */
-	bs_put(&b, 0, 1);	/* bitstream_restriction_flag */
+	bs_put(&b, 1, 1);	/* bitstream_restriction_flag */
+	bs_put(&b, 0, 1);	/* motion_vectors_over_pic_boundaries_flag */
+	bs_ue(&b, 2);		/* max_bytes_per_pic_denom */
+	bs_ue(&b, 1);		/* max_bits_per_mb_denom */
+	bs_ue(&b, 16);		/* log2_max_mv_length_horizontal */
+	bs_ue(&b, 16);		/* log2_max_mv_length_vertical */
+	bs_ue(&b, 0);		/* max_num_reorder_frames */
+	bs_ue(&b, pic->num_ref_frames); /* max_dec_frame_buffering */
 
 	/* rbsp_stop_one_bit + alignment */
 	bs_put(&b, 1, 1);
