@@ -357,6 +357,33 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
   本地测试/ffmpeg 仍可用，但 Chrome 显示互通需要
   `sudo chmod 0666 /dev/dma_heap/system`。
 
+### Chrome 回退 FFmpegVideoDecoder 排查（2026-08-24）
+
+Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退软件解码。
+已定位并修复的回退根因：
+
+| 根因 | 现象 | 修复 |
+|---|---|---|
+| `/dev/dma_heap/system` root-only（每次重启复现） | surface 后备退化为 memfd，EGL 导入失败 → "Failed to create VASurface" → 秒回退 | udev 规则 `tools/99-iris-dmaheap.rules`（install-system.sh 自动安装） |
+| seq→surface 映射硬上限 512 帧 | 连播 ~10–20s 后每帧映射失败且 CAPTURE 缓冲泄漏 → 固件饿死 → sync 超时回退 | `target_ring[1024]` 环带 seq 校验；未命中帧必回收 CAPTURE 缓冲 |
+| `v4l2_dec_poll` 含 POLLOUT | m2m OUTPUT 几乎常写就绪 → sync 轮询瞬间烧完重试预算 → 假超时 | 仅 POLLIN\|POLLPRI |
+| 导出 pitch/chroma offset 用猜测对齐 | 固件 CAPTURE 实际 stride/高度与假设不符时画面花屏/错位 | 以协商的 CAPTURE fmt 为准（`iris_surfs_*`） |
+| 会话中途死亡（GPU 进程被杀/错误路径） | 固件 wedge，之后所有解码 SESSION_INIT -110 → 永久回退 | close 前 DECODER_CMD STOP + 有界 drain |
+| 重建 H.264 SPS 的 VUI 非法/缺少提前输出约束 | `Overread VUI`、PPS 失配，或 4K surface 尚未复制完成就交给 Chrome → 花屏/卡顿 | 按 Chromium packed-H264 builder 重建合法 VUI，`max_num_reorder_frames=0`；展示重排仍由 Chromium DPB 完成 |
+
+排查工具：
+
+```sh
+# 驱动侧跟踪（GPU 进程继承 stderr）：
+export IRIS_VAAPI_DEBUG=1
+# >512 帧连播回归（Chrome 式流水线 sync）：
+./build/test_va_stress /home/cfm880/qcom/test-1080p-nob.h264 700
+# Chrome 侧确认当前用的解码器：
+# chrome://media-internals → kVideoDecoderName；chrome://gpu → Video Acceleration
+```
+
+注意：压力测试中途被杀（Ctrl-C/timeout）会 wedge 固件，先重载模块再继续调试。
+
 ### 构建与测试命令
 ```sh
 make                                          # 构建驱动 + 测试工具

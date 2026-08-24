@@ -18,11 +18,13 @@ TEST_VP9 = $(BUILD)/test_va_vp9
 TEST_HEVC = $(BUILD)/test_hevc_au
 TEST_HEVC_PARAMS = $(BUILD)/test_hevc_params
 TEST_HEVC_REWRITE = $(BUILD)/test_hevc_slice_rewrite
+TEST_VA_STRESS = $(BUILD)/test_va_stress
 
 .PHONY: all clean install
 
 all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
-	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE)
+	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) \
+	$(TEST_VA_STRESS)
 
 DECODE_OBJ = $(BUILD)/decode.o
 
@@ -81,6 +83,10 @@ $(TEST_HEVC_PARAMS): test/test_hevc_params.c $(HEVC_OBJ) src/hevc_params.h
 $(TEST_HEVC_REWRITE): test/test_hevc_slice_rewrite.c $(HEVC_REWRITE_OBJ) src/hevc_slice_rewrite.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(HEVC_REWRITE_OBJ)
+
+$(TEST_VA_STRESS): test/test_va_stress.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
 
 clean:
 	rm -rf $(BUILD)
