@@ -47,6 +47,30 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	return r;
 }
 
+static void v4l2_dec_enable_decode_order(struct v4l2_dec *d)
+{
+	struct v4l2_control ctrl = {
+		.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,
+		.value = 0,
+	};
+
+	if (xioctl(d->fd, VIDIOC_S_CTRL, &ctrl) < 0)
+		goto unsupported;
+
+	ctrl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+	ctrl.value = 1;
+	if (xioctl(d->fd, VIDIOC_S_CTRL, &ctrl) < 0)
+		goto unsupported;
+
+	printf("v4l2-dec: firmware decode-order output enabled\n");
+	return;
+
+unsupported:
+	fprintf(stderr,
+		"v4l2-dec: firmware decode-order output unavailable: %s\n",
+		strerror(errno));
+}
+
 static int v4l2_dec_mmap(struct v4l2_dec *d, enum v4l2_buf_type type)
 {
 	struct v4l2_buffer *meta;
@@ -243,6 +267,12 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		perror("S_FMT OUTPUT");
 		return -errno;
 	}
+
+	/* Chrome can release a VA surface for presentation before a stateful
+	 * decoder has emitted that frame in display order.  Decode-order output
+	 * makes reference frames available early enough for the driver's stable
+	 * exported backing store to be populated before presentation. */
+	v4l2_dec_enable_decode_order(d);
 
 	memset(&req, 0, sizeof(req));
 	req.count = OUT_BUFFERS;

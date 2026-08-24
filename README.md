@@ -369,7 +369,8 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 | `v4l2_dec_poll` 含 POLLOUT | m2m OUTPUT 几乎常写就绪 → sync 轮询瞬间烧完重试预算 → 假超时 | 仅 POLLIN\|POLLPRI |
 | 导出 pitch/chroma offset 用猜测对齐 | 固件 CAPTURE 实际 stride/高度与假设不符时画面花屏/错位 | 以协商的 CAPTURE fmt 为准（`iris_surfs_*`） |
 | 会话中途死亡（GPU 进程被杀/错误路径） | 固件 wedge，之后所有解码 SESSION_INIT -110 → 永久回退 | close 前 DECODER_CMD STOP + 有界 drain |
-| 重建 H.264 SPS 的 VUI 非法/缺少提前输出约束 | `Overread VUI`、PPS 失配，或 4K surface 尚未复制完成就交给 Chrome → 花屏/卡顿 | 按 Chromium packed-H264 builder 重建合法 VUI，`max_num_reorder_frames=0`；展示重排仍由 Chromium DPB 完成 |
+| 重建 H.264 SPS 的 VUI 非法 | `Overread VUI`、PPS 失配 | 按 Chromium packed-H264 builder 重建合法 VUI；展示重排仍由 Chromium DPB 完成 |
+| 固件按显示顺序延迟返还 CAPTURE | Chrome 已输出 VA surface，但对应 CAPTURE 帧尚未产生 → 4K 卡顿、短暂旧帧/花屏 | qcom-iris 暴露标准 display-delay 控制并向 Gen1 固件请求 decode-order output；VA 驱动在会话启动前设置 delay=0 |
 
 排查工具：
 
@@ -394,6 +395,10 @@ LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=iris \
   ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i 流.h264 -f null -  # P2 ffmpeg
 # 安装到系统供 Chrome 使用：
 sudo ./install-system.sh
+# decode-order 修复还需要安装同一源码树编译的 qcom-iris 模块，关闭 Chrome 后：
+sudo install -m 0644 ../nabu-linux/linux/out-iris1/drivers/media/platform/qcom/iris/qcom-iris.ko \
+  /lib/modules/$(uname -r)/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko
+sudo depmod -a && sudo modprobe -r qcom_iris && sudo modprobe qcom_iris
 # Chrome（GPU 进程需继承 LIBVA_DRIVER_NAME）：
 export LIBVA_DRIVER_NAME=iris
 google-chrome --enable-logging=stderr --v=1 file:///path/to/video.html
