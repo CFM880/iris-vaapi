@@ -1046,10 +1046,18 @@ iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
 		   unsigned int *width, unsigned int *height)
 {
 	struct iris_surface *s = find_surface(ctx, id);
+	int exported_fd;
 
 	if (!s)
 		return -1;
-	*fd = s->bfd;
+	/* vaExportSurfaceHandle transfers ownership of every returned object fd
+	 * to the caller.  Keep the driver's backing fd private: Chrome closes the
+	 * exported fd after importing it, and returning s->bfd directly therefore
+	 * caused a later double-close/FD-reuse crash in the GPU process. */
+	exported_fd = fcntl(s->bfd, F_DUPFD_CLOEXEC, 0);
+	if (exported_fd < 0)
+		return -1;
+	*fd = exported_fd;
 	*pitch = ALIGN_TO(ctx->width, 128);
 	*size = s->bsize;
 	*width = ctx->width;

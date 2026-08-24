@@ -319,12 +319,17 @@ int main(int argc, char **argv)
 				if (st) { fprintf(stderr, "export %d: %s\n", exi[k], vaErrorStr(st)); continue; }
 				mp = mmap(NULL, dsc.objects[0].size, PROT_READ, MAP_SHARED,
 					  dsc.objects[0].fd, 0);
-				if (mp == MAP_FAILED) { perror("mmap"); continue; }
+				if (mp == MAP_FAILED) {
+					perror("mmap");
+					close(dsc.objects[0].fd);
+					continue;
+				}
 				snprintf(path, sizeof(path), "/tmp/va-s%d.nv12", exi[k]);
 				out = fopen(path, "wb");
 				if (out) { fwrite(mp, 1, dsc.objects[0].size, out); fclose(out); }
 				else perror("fopen");
 				munmap(mp, dsc.objects[0].size);
+				close(dsc.objects[0].fd);
 			}
 		}
 	}

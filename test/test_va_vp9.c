@@ -125,13 +125,18 @@ int main(int argc, char **argv)
 			if (st) { fprintf(stderr, "export: %s\n", vaErrorStr(st)); return 1; }
 			mp = mmap(NULL, dsc.objects[0].size, PROT_READ, MAP_SHARED,
 				  dsc.objects[0].fd, 0);
-			if (mp == MAP_FAILED) { perror("mmap"); return 1; }
+			if (mp == MAP_FAILED) {
+				perror("mmap");
+				close(dsc.objects[0].fd);
+				return 1;
+			}
 			snprintf(outpath, sizeof(outpath), "/tmp/va-vp9-%d.nv12", sync_idx);
 			out = fopen(outpath, "wb");
 			if (out) { fwrite(mp, 1, dsc.objects[0].size, out); fclose(out); }
 			else perror("fopen");
 			printf("wrote %s (%u bytes)\n", outpath, dsc.objects[0].size);
 			munmap(mp, dsc.objects[0].size);
+			close(dsc.objects[0].fd);
 		}
 	}
 
