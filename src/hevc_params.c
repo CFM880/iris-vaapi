@@ -58,6 +58,38 @@ static void bs_trailing(struct bs *b)
 		bs_put(b, 0, 1);
 }
 
+/* Convert the byte-aligned RBSP held by b into a NAL unit.  The two-byte
+ * header is not escaped; emulation-prevention bytes apply to the RBSP only. */
+static int hevc_escape_nal(uint8_t *out, size_t out_size, const struct bs *b)
+{
+	size_t raw_len = (size_t)b->bits >> 3;
+	size_t in, out_len = 0;
+	int zero_count = 0;
+
+	if (raw_len < 2 || out_size < 2)
+		return -1;
+	out[out_len++] = b->buf[0];
+	out[out_len++] = b->buf[1];
+	for (in = 2; in < raw_len; in++) {
+		uint8_t v = b->buf[in];
+
+		if (zero_count >= 2 && v <= 3) {
+			if (out_len >= out_size)
+				return -1;
+			out[out_len++] = 3;
+			zero_count = 0;
+		}
+		if (out_len >= out_size)
+			return -1;
+		out[out_len++] = v;
+		if (v == 0)
+			zero_count++;
+		else
+			zero_count = 0;
+	}
+	return (int)out_len;
+}
+
 /* profile_tier_level( profilePresentFlag, maxNumSubLayersMinus1 ).
  * Emits the general-level fields only (this stream has no sub-layers).
  * Both VPS and SPS carry progressive=1 frame_only=1 level=120 (per ffmpeg
@@ -70,14 +102,13 @@ hevc_profile_tier_level(struct bs *b, int profile_present, int max_sublayers,
 		bs_put(b, 0, 2);	/* general_profile_space */
 		bs_put(b, 0, 1);	/* general_tier_flag */
 		bs_put(b, 1, 5);	/* general_profile_idc = 1 (Main) */
-		bs_put(b, 0x60000090, 32); /* compatibility flags (x265) */
+	bs_put(b, level >= 150 ? 0x40000000 : 0x60000090, 32);
 		bs_put(b, progressive, 1);
 		bs_put(b, 0, 1);	/* general_interlaced_source_flag */
 		bs_put(b, 0, 1);	/* general_non_packed_constraint_flag */
-		bs_put(b, frame_only, 1);
-		bs_put(b, 0x78a003, 44); /* reserved_zero_44bits (x265 writes
-				    * constraint flags here; firmware needs
-				    * the exact bits, not in VA-API) */
+	bs_put(b, frame_only, 1);
+		bs_put(b, 0, 44);	/* general_reserved_zero_44bits (all zero per
+				 * ffmpeg parse of the x265 stream) */
 		bs_put(b, level, 8);
 	}
 	for (int i = 0; i < max_sublayers; i++) {
@@ -101,15 +132,33 @@ hevc_profile_tier_level(struct bs *b, int profile_present, int max_sublayers,
 	}
 }
 
+static int
+hevc_level_for_size(const VAPictureParameterBufferHEVC *pic)
+{
+	uint64_t samples = (uint64_t)pic->pic_width_in_luma_samples *
+			   pic->pic_height_in_luma_samples;
+
+	if (samples <= 921600)
+		return 93;
+	if (samples <= 2073600)
+		return 120;
+	if (samples <= 4177920)
+		return 153;
+	if (samples <= 8355840)
+		return 156;
+	return 186;
+}
+
 int
 hevc_build_vps(uint8_t *out, size_t out_size,
 	       const VAPictureParameterBufferHEVC *pic)
 {
 	struct bs b;
+	uint8_t rbsp[512];
 
-	memset(out, 0, out_size);
-	b.buf = out;
-	b.size = out_size;
+	memset(rbsp, 0, sizeof(rbsp));
+	b.buf = rbsp;
+	b.size = sizeof(rbsp);
 	b.bits = 0;
 
 	bs_put(&b, 0x40, 8);	/* NAL header byte 1: type=32 (VPS) */
@@ -121,18 +170,20 @@ hevc_build_vps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 3);	/* vps_max_sub_layers_minus1 */
 	bs_put(&b, 1, 1);	/* vps_temporal_id_nesting_flag */
 	bs_put(&b, 0xffff, 16);	/* vps_reserved_0xffff_16bits */
-	hevc_profile_tier_level(&b, 1, 0, 1, 1, 120);
+	hevc_profile_tier_level(&b, 1, 0, 1,
+			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
+			       hevc_level_for_size(pic));
 	bs_put(&b, 1, 1);	/* vps_sub_layer_ordering_info_present */
 	bs_ue(&b, pic->sps_max_dec_pic_buffering_minus1);
-	bs_ue(&b, 0);		/* vps_max_num_reorder_pics */
-	bs_ue(&b, 1);		/* vps_max_latency_increase_plus1 */
+	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 3 : 2);
+	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 0 : 5);
 	bs_put(&b, 0, 6);	/* vps_max_layer_id */
 	bs_ue(&b, 0);		/* vps_num_layer_sets_minus1 */
 	bs_put(&b, 0, 1);	/* vps_timing_info_present_flag */
 	bs_put(&b, 0, 1);	/* vps_extension_flag */
 
 	bs_trailing(&b);
-	return b.bits >> 3;
+	return hevc_escape_nal(out, out_size, &b);
 }
 
 int
@@ -140,11 +191,12 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	       const VAPictureParameterBufferHEVC *pic)
 {
 	struct bs b;
+	uint8_t rbsp[512];
 	unsigned int cfi = pic->pic_fields.bits.chroma_format_idc;
 
-	memset(out, 0, out_size);
-	b.buf = out;
-	b.size = out_size;
+	memset(rbsp, 0, sizeof(rbsp));
+	b.buf = rbsp;
+	b.size = sizeof(rbsp);
 	b.bits = 0;
 
 	bs_put(&b, 0x42, 8);	/* NAL header byte 1: type=33 (SPS) */
@@ -152,7 +204,9 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 4);	/* sps_video_parameter_set_id */
 	bs_put(&b, 0, 3);	/* sps_max_sub_layers_minus1 */
 	bs_put(&b, 1, 1);	/* sps_temporal_id_nesting_flag */
-	hevc_profile_tier_level(&b, 1, 0, 1, 1, 120);
+	hevc_profile_tier_level(&b, 1, 0, 1,
+			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
+			       hevc_level_for_size(pic));
 	bs_ue(&b, 0);		/* sps_seq_parameter_set_id */
 	bs_ue(&b, cfi);
 	if (cfi == 3)
@@ -169,8 +223,8 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	 * firmware uses them to size the DPB). */
 	bs_put(&b, 1, 1);
 	bs_ue(&b, pic->sps_max_dec_pic_buffering_minus1);
-	bs_ue(&b, 2);		/* sps_max_num_reorder_pics */
-	bs_ue(&b, 5);		/* sps_max_latency_increase_plus1 */
+	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 3 : 2);
+	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 0 : 5);
 	bs_ue(&b, pic->log2_min_luma_coding_block_size_minus3);
 	bs_ue(&b, pic->log2_diff_max_min_luma_coding_block_size);
 	bs_ue(&b, pic->log2_min_transform_block_size_minus2);
@@ -189,8 +243,11 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 		bs_ue(&b, pic->log2_diff_max_min_pcm_luma_coding_block_size);
 		bs_put(&b, pic->pic_fields.bits.pcm_loop_filter_disabled_flag, 1);
 	}
-	bs_ue(&b, pic->num_short_term_ref_pic_sets);
-	/* st_ref_pic_set for each set: this stream has 0, so nothing */
+	/* VA short-slice mode carries the short-term RPS in each slice header;
+	 * the picture buffer only reports how many sets the original long-form
+	 * SPS had, not their syntax.  Advertising those unavailable sets here
+	 * would emit an SPS with missing st_ref_pic_set() payloads. */
+	bs_ue(&b, 0);
 	bs_put(&b, pic->slice_parsing_fields.bits.long_term_ref_pics_present_flag,
 	       1);
 	if (pic->slice_parsing_fields.bits.long_term_ref_pics_present_flag)
@@ -226,7 +283,7 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 1);	/* sps_extension_present_flag */
 
 	bs_trailing(&b);
-	return b.bits >> 3;
+	return hevc_escape_nal(out, out_size, &b);
 }
 
 int
@@ -234,10 +291,11 @@ hevc_build_pps(uint8_t *out, size_t out_size,
 	       const VAPictureParameterBufferHEVC *pic)
 {
 	struct bs b;
+	uint8_t rbsp[512];
 
-	memset(out, 0, out_size);
-	b.buf = out;
-	b.size = out_size;
+	memset(rbsp, 0, sizeof(rbsp));
+	b.buf = rbsp;
+	b.size = sizeof(rbsp);
 	b.bits = 0;
 
 	bs_put(&b, 0x44, 8);	/* NAL header byte 1: type=34 (PPS) */
@@ -272,16 +330,20 @@ hevc_build_pps(uint8_t *out, size_t out_size,
 		bs_put(&b, pic->pic_fields.bits.loop_filter_across_tiles_enabled_flag,
 		       1);
 	}
-	bs_put(&b, 1, 1);	/* pps_loop_filter_across_slices_enabled_flag */
-	/* deblocking_filter_control_present_flag: 1, with override/disable and
-	 * beta/tc offsets.  The original stream carries these (its PPS is 8
-	 * bytes / 48 payload bits with beta=1 tc=1); emitting them is required
-	 * for the firmware and ffmpeg to parse the PPS correctly. */
-	bs_put(&b, 1, 1);
-	bs_put(&b, 0, 1);	/* deblocking_filter_override_enabled_flag */
-	bs_put(&b, 0, 1);	/* pps_deblocking_filter_disabled_flag */
-	bs_se(&b, 1);		/* pps_beta_offset_div2 */
-	bs_se(&b, 1);		/* pps_tc_offset_div2 */
+	bs_put(&b, pic->pic_fields.bits.entropy_coding_sync_enabled_flag, 1);
+	bs_put(&b, pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag, 1);
+	bs_put(&b, pic->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag ||
+		       pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag,
+	       1);
+	if (pic->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag ||
+	    pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag) {
+		bs_put(&b, pic->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag, 1);
+		bs_put(&b, pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag, 1);
+		if (!pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag) {
+			bs_se(&b, pic->pps_beta_offset_div2);
+			bs_se(&b, pic->pps_tc_offset_div2);
+		}
+	}
 	bs_put(&b, 0, 1);	/* pps_scaling_list_data_present_flag */
 	bs_put(&b, pic->slice_parsing_fields.bits.lists_modification_present_flag, 1);
 	bs_ue(&b, pic->log2_parallel_merge_level_minus2);
@@ -290,5 +352,5 @@ hevc_build_pps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 1);	/* pps_extension_present_flag */
 
 	bs_trailing(&b);
-	return b.bits >> 3;
+	return hevc_escape_nal(out, out_size, &b);
 }

@@ -20,9 +20,21 @@
 
 #include "v4l2_dec.h"
 
-#define OUT_SIZEIMAGE	(16U * 1024 * 1024)	/* room for a 4K access unit */
 #define OUT_BUFFERS	16
 #define CAP_BUFFERS	20
+
+static unsigned int
+out_sizeimage(unsigned int width, unsigned int height)
+{
+	uint64_t pixels = (uint64_t)width * height;
+	uint64_t size = pixels * 2; /* generous compressed-frame working size */
+
+	if (size < 1U * 1024 * 1024)
+		size = 1U * 1024 * 1024;
+	if (size > UINT32_MAX)
+		size = UINT32_MAX;
+	return (unsigned int)size;
+}
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -123,6 +135,11 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 		return -errno;
 	}
 	d->cap_fmt = fmt;
+	/* Keep the negotiated capture geometry, not merely the requested one.
+	 * This matters after a V4L2 source-change event and for codecs whose
+	 * coded dimensions are aligned differently at different resolutions. */
+	d->width = fmt.fmt.pix_mp.width;
+	d->height = fmt.fmt.pix_mp.height;
 
 	memset(&req, 0, sizeof(req));
 	req.count = CAP_BUFFERS;
@@ -220,7 +237,8 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	d->out_fmt.fmt.pix_mp.pixelformat = pixelformat;
 	d->out_fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	d->out_fmt.fmt.pix_mp.num_planes = 1;
-	d->out_fmt.fmt.pix_mp.plane_fmt[0].sizeimage = OUT_SIZEIMAGE;
+	d->out_fmt.fmt.pix_mp.plane_fmt[0].sizeimage =
+		out_sizeimage(width, height);
 	if (xioctl(d->fd, VIDIOC_S_FMT, &d->out_fmt) < 0) {
 		perror("S_FMT OUTPUT");
 		return -errno;
@@ -340,12 +358,14 @@ int v4l2_dec_handle_events(struct v4l2_dec *d, int *changed)
 			fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 			if (xioctl(d->fd, VIDIOC_G_FMT, &fmt) == 0 &&
 			    fmt.fmt.pix_mp.width ==
-				    d->cap_fmt.fmt.pix_mp.width &&
+					 d->cap_fmt.fmt.pix_mp.width &&
 			    fmt.fmt.pix_mp.height ==
 				    d->cap_fmt.fmt.pix_mp.height)
 				continue;
 
 			/* Re-read G_FMT inside and renegotiate CAPTURE. */
+			d->width = fmt.fmt.pix_mp.width;
+			d->height = fmt.fmt.pix_mp.height;
 			ret = v4l2_dec_setup_capture(d);
 			if (ret)
 				return ret;

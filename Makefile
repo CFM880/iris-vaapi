@@ -15,11 +15,12 @@ TEST_H264 = $(BUILD)/test_h264_params
 TEST_VADEC = $(BUILD)/test_va_decode
 TEST_VP9 = $(BUILD)/test_va_vp9
 TEST_HEVC = $(BUILD)/test_hevc_au
+TEST_HEVC_PARAMS = $(BUILD)/test_hevc_params
 
 .PHONY: all clean install
 
 all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
-	$(TEST_VP9) $(TEST_HEVC)
+	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS)
 
 DECODE_OBJ = $(BUILD)/decode.o
 
@@ -66,6 +67,10 @@ $(TEST_VP9): test/test_va_vp9.c
 $(TEST_HEVC): test/test_hevc_au.c $(V4L2_OBJ) src/v4l2_dec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(V4L2_OBJ)
+
+$(TEST_HEVC_PARAMS): test/test_hevc_params.c $(HEVC_OBJ) src/hevc_params.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(HEVC_OBJ)
 
 clean:
 	rm -rf $(BUILD)

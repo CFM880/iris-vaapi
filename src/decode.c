@@ -99,7 +99,20 @@ struct iris_decode_ctx {
 	int last_hevc_sps_len;
 	uint8_t last_hevc_pps[128];
 	int last_hevc_pps_len;
+	/* Original parameter NALs, when the VA client supplies them in the
+	 * slice-data buffer.  Stateful V4L2 needs these bytes verbatim. */
+	uint8_t raw_hevc_vps[1024];
+	uint8_t raw_hevc_sps[1024];
+	uint8_t raw_hevc_pps[1024];
+	int raw_hevc_vps_len;
+	int raw_hevc_sps_len;
+	int raw_hevc_pps_len;
 	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
+	struct {
+		uint32_t offset;
+		uint32_t size;
+	} hevc_ranges[128];
+	unsigned int hevc_range_count;
 
 	/* Map decode sequence numbers back to target surfaces so frame
 	 * matching does not depend on the (possibly non-contiguous) VASurfaceID
@@ -386,6 +399,7 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 	ctx->slice_len = 0;
 	ctx->refs_l0 = 0;
 	ctx->refs_l1 = 0;
+	ctx->hevc_range_count = 0;
 	return 0;
 }
 
@@ -426,6 +440,14 @@ iris_decode_hevc_slice_params(struct iris_decode_ctx *ctx,
 		ctx->refs_l0 = sp->num_ref_idx_l0_active_minus1;
 	if (sp->num_ref_idx_l1_active_minus1 > ctx->refs_l1)
 		ctx->refs_l1 = sp->num_ref_idx_l1_active_minus1;
+	/* VA-API may submit one parameter buffer containing many slice elements.
+	 * Keep every range; retaining only the last element corrupts multi-slice
+	 * 4K/8K pictures. */
+	if (ctx->hevc_range_count >= 128)
+		return -1;
+	ctx->hevc_ranges[ctx->hevc_range_count].size = sp->slice_data_size;
+	ctx->hevc_ranges[ctx->hevc_range_count].offset = sp->slice_data_offset;
+	ctx->hevc_range_count++;
 	return 0;
 }
 
@@ -439,11 +461,108 @@ has_start_code(const uint8_t *p, size_t len)
 	return 0;
 }
 
+static int
+hevc_cache_raw_parameter_sets(struct iris_decode_ctx *ctx)
+{
+	size_t i = 0;
+	int found = 0;
+
+	while (i + 3 < ctx->slice_len) {
+		int sc = has_start_code(ctx->slice_data + i, ctx->slice_len - i);
+		size_t start, end;
+		uint8_t type;
+
+		if (!sc) {
+			i++;
+			continue;
+		}
+		start = i + sc;
+		end = start;
+		while (end < ctx->slice_len &&
+		       !has_start_code(ctx->slice_data + end,
+				       ctx->slice_len - end))
+			end++;
+		if (end <= start + 1) {
+			i = end;
+			continue;
+		}
+		type = (ctx->slice_data[start] >> 1) & 0x3f;
+		if (type == 32 && end - start <= sizeof(ctx->raw_hevc_vps)) {
+			memcpy(ctx->raw_hevc_vps, ctx->slice_data + start, end - start);
+			ctx->raw_hevc_vps_len = end - start;
+			found |= 1;
+		} else if (type == 33 && end - start <= sizeof(ctx->raw_hevc_sps)) {
+			memcpy(ctx->raw_hevc_sps, ctx->slice_data + start, end - start);
+			ctx->raw_hevc_sps_len = end - start;
+			found |= 2;
+		} else if (type == 34 && end - start <= sizeof(ctx->raw_hevc_pps)) {
+			memcpy(ctx->raw_hevc_pps, ctx->slice_data + start, end - start);
+			ctx->raw_hevc_pps_len = end - start;
+			found |= 4;
+		}
+		i = end;
+	}
+	return found;
+}
+
 int
 iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 {
 	const uint8_t *p = data;
 	size_t need = len + 4;
+
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC && ctx->hevc_range_count) {
+		unsigned int use = 0;
+		unsigned int i;
+
+		/* A single VA slice-data buffer normally contains all ranges.  If a
+		 * client uses one data buffer per slice, consume one range at a time. */
+		if (ctx->hevc_range_count > 1) {
+			int all_fit = 1;
+			for (i = 0; i < ctx->hevc_range_count; i++)
+				if ((uint64_t)ctx->hevc_ranges[i].offset +
+				    ctx->hevc_ranges[i].size > len) {
+					all_fit = 0;
+					break;
+				}
+			if (all_fit)
+				use = ctx->hevc_range_count;
+		}
+		if (!use)
+			use = 1;
+
+		for (i = 0; i < use; i++) {
+			uint32_t off = ctx->hevc_ranges[i].offset;
+			uint32_t size = ctx->hevc_ranges[i].size;
+
+			if ((uint64_t)off + size > len)
+				return -1;
+			p = (const uint8_t *)data + off;
+			len = size;
+			need = len + 4;
+			if (ctx->slice_len + need > ctx->slice_cap) {
+				size_t ncap = ctx->slice_cap ? ctx->slice_cap * 2 :
+								(size + (1 << 20));
+				void *n = realloc(ctx->slice_data, ncap);
+				if (!n)
+					return -1;
+				ctx->slice_data = n;
+				ctx->slice_cap = ncap;
+			}
+			if (!has_start_code(p, len) && ctx->out_pixfmt != V4L2_PIX_FMT_VP9) {
+				static const uint8_t sc4[4] = { 0, 0, 0, 1 };
+				memcpy(ctx->slice_data + ctx->slice_len, sc4, 4);
+				ctx->slice_len += 4;
+			}
+			memcpy(ctx->slice_data + ctx->slice_len, p, len);
+			ctx->slice_len += len;
+		}
+		if (use < ctx->hevc_range_count)
+			memmove(ctx->hevc_ranges, ctx->hevc_ranges + use,
+				(ctx->hevc_range_count - use) * sizeof(ctx->hevc_ranges[0]));
+		ctx->hevc_range_count -= use;
+		return 0;
+	}
 
 	if (ctx->slice_len + need > ctx->slice_cap) {
 		size_t ncap = ctx->slice_cap ? ctx->slice_cap * 2 :
@@ -485,6 +604,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
 	au_cap = ctx->slice_len + 256;
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC)
+		au_cap += sizeof(ctx->raw_hevc_vps) + sizeof(ctx->raw_hevc_sps) +
+			  sizeof(ctx->raw_hevc_pps) + 16;
 	au = malloc(au_cap);
 	if (!au)
 		return -1;
@@ -495,9 +617,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 	/* Assemble the access unit to feed the stateful firmware.
 	 *
-	 * H.264/HEVC: the client (Chrome/ffmpeg) sends picture/slice parameter
-	 * buffers but no parameter-set NALs, so re-serialize SPS/PPS (or
-	 * VPS/SPS/PPS) and prepend them, only when they change.
+	 * H.264: VA clients send picture/slice parameter buffers, so re-serialize
+	 * SPS/PPS.  HEVC prefers original VPS/SPS/PPS NALs when available and
+	 * only uses the serializer as a compatibility fallback.
 	 *
 	 * VP9: each frame is self-contained (its own uncompressed+compressed
 	 * header); the slice data is the whole frame, feed it verbatim. */
@@ -505,6 +627,33 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		au_len = ctx->slice_len;
 		memcpy(au, ctx->slice_data, au_len);
 	} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+		int raw_in_au = hevc_cache_raw_parameter_sets(ctx);
+		/* If the client provided complete parameter NALs, pass the original
+		 * Annex-B access unit through unchanged.  This is the native input
+		 * contract of the stateful Iris V4L2 decoder. */
+		if (raw_in_au == 7) {
+			au_len = ctx->slice_len;
+			memcpy(au, ctx->slice_data, au_len);
+			goto hevc_au_ready;
+		}
+		if (ctx->raw_hevc_vps_len && ctx->raw_hevc_sps_len &&
+		    ctx->raw_hevc_pps_len) {
+			memcpy(au + au_len, sc4, 4);
+			memcpy(au + au_len + 4, ctx->raw_hevc_vps,
+			       ctx->raw_hevc_vps_len);
+			au_len += 4 + ctx->raw_hevc_vps_len;
+			memcpy(au + au_len, sc4, 4);
+			memcpy(au + au_len + 4, ctx->raw_hevc_sps,
+			       ctx->raw_hevc_sps_len);
+			au_len += 4 + ctx->raw_hevc_sps_len;
+			memcpy(au + au_len, sc4, 4);
+			memcpy(au + au_len + 4, ctx->raw_hevc_pps,
+			       ctx->raw_hevc_pps_len);
+			au_len += 4 + ctx->raw_hevc_pps_len;
+			memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
+			au_len += ctx->slice_len;
+			goto hevc_au_ready;
+		}
 		/* Re-serialize VPS/SPS/PPS from the picture params and prepend
 		 * only when they change (per-picture repetition resets the
 		 * firmware DPB).  ffmpeg/Chrome send bare slice NALs. */
@@ -541,6 +690,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		}
 		memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
 		au_len += ctx->slice_len;
+	hevc_au_ready:
+		;
 	} else {
 	/* Only re-emit SPS/PPS when they change; a per-picture repetition
 	 * resets the firmware DPB and breaks P-frame references. */

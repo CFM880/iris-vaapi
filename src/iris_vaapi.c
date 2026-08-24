@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,6 +55,7 @@ struct iris_drv_data {
 	unsigned int buf_ids[256];
 	VABufferType buf_types[256];
 	unsigned int buf_sizes[256];
+	unsigned int buf_num_elements[256];
 	void *buf_data[256];
 
 	/* Derived images (vaDeriveImage) map a VABufferID to a CAPTURE buffer. */
@@ -341,12 +343,16 @@ iris_vaCreateBuffer(VADriverContextP ctx, VAContextID context_id,
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 
 	dd->buf_types[dd->n_bufs] = type;
-	dd->buf_sizes[dd->n_bufs] = size;
-	dd->buf_data[dd->n_bufs] = calloc(1, size ? size : 1);
+	dd->buf_num_elements[dd->n_bufs] = num_elements ? num_elements : 1;
+	if (size > UINT_MAX / dd->buf_num_elements[dd->n_bufs])
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	dd->buf_sizes[dd->n_bufs] = size * dd->buf_num_elements[dd->n_bufs];
+	dd->buf_data[dd->n_bufs] = calloc(1, dd->buf_sizes[dd->n_bufs] ?
+						 dd->buf_sizes[dd->n_bufs] : 1);
 	if (!dd->buf_data[dd->n_bufs])
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (data && size)
-		memcpy(dd->buf_data[dd->n_bufs], data, size);
+	if (data && dd->buf_sizes[dd->n_bufs])
+		memcpy(dd->buf_data[dd->n_bufs], data, dd->buf_sizes[dd->n_bufs]);
 	dd->buf_ids[dd->n_bufs] = ++dd->buffer_id;
 	*buf_id = dd->buf_ids[dd->n_bufs];
 	dd->n_bufs++;
@@ -423,6 +429,7 @@ iris_vaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
 	dd->buf_ids[i] = dd->buf_ids[dd->n_bufs - 1];
 	dd->buf_types[i] = dd->buf_types[dd->n_bufs - 1];
 	dd->buf_sizes[i] = dd->buf_sizes[dd->n_bufs - 1];
+	dd->buf_num_elements[i] = dd->buf_num_elements[dd->n_bufs - 1];
 	dd->buf_data[i] = dd->buf_data[dd->n_bufs - 1];
 	dd->n_bufs--;
 	return VA_STATUS_SUCCESS;
@@ -492,14 +499,20 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 			if (dd->profile == VAProfileHEVCMain ||
 			    dd->profile == VAProfileHEVCMain10) {
 				if (dd->buf_sizes[idx] <
-				    sizeof(VASliceParameterBufferHEVC))
+				    sizeof(VASliceParameterBufferHEVC) *
+				    dd->buf_num_elements[idx])
 					return VA_STATUS_ERROR_INVALID_BUFFER;
-				iris_decode_hevc_slice_params(dd->dec, data);
+				for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
+					iris_decode_hevc_slice_params(dd->dec,
+						(const VASliceParameterBufferHEVC *)data + j);
 				break;
 			}
-			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264))
+			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264) *
+			    dd->buf_num_elements[idx])
 				return VA_STATUS_ERROR_INVALID_BUFFER;
-			iris_decode_slice_params(dd->dec, data);
+			for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
+				iris_decode_slice_params(dd->dec,
+					(const VASliceParameterBufferH264 *)data + j);
 			break;
 		case VASliceDataBufferType:
 			iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]);
@@ -694,7 +707,7 @@ iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 	image->pitches[0] = pitch;
 	image->pitches[1] = pitch;
 	image->offsets[0] = 0;
-	image->offsets[1] = pitch * h;
+	image->offsets[1] = pitch * ALIGN(h, 32);
 	image->buf = bid;
 	return VA_STATUS_SUCCESS;
 }
@@ -873,7 +886,7 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	d->layers[1].drm_format = DRM_FORMAT_GR88;
 	d->layers[1].num_planes = 1;
 	d->layers[1].object_index[0] = 0;
-	d->layers[1].offset[0] = pitch * h;
+	d->layers[1].offset[0] = pitch * ALIGN(h, 32);
 	d->layers[1].pitch[0] = pitch;
 
 	(void)flags;

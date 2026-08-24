@@ -229,25 +229,47 @@ Chrome/ffmpeg 传 slice data **不含参数集**（已确认 vps=0 sps=0 pps=0�
 | ffmpeg 软件解码 | ✅ 10/10 帧，帧 1-5 内容与原始逐像素一致 |
 | 固件硬件 | ⚠️ 8 帧 ok + 1 帧 **IDR corrupt**（flags=0x8）|
 
-### 仍未解决（两个残留差异）
+### 重建逻辑修正（使固件字节级对齐）
 
-重建参数集与原始 bitstream 仍有**字节级差异**（字段值对 ffmpeg 权威一致，
-但固件硬件对参数集字节布局要求严格）：
+1. **VPS/SPS 的 `reserved_zero_44bits` 改为全零**（不再硬编码 x265 的
+   `0x78a003`）：原始 VPS 该字段是 0，逐字节对齐重建与原始参数集，
+   消除固件对 IDR 首帧解析失败的一处差异。
+2. **`general_compatibility_flag` 按 level 选值**：level ≥ 150（4K/8K）
+   用 `0x40000000`，其余用 `0x60000090`。
+3. **新增 `hevc_level_for_size`**：按 `pic_width*height` 的 luma 采样数推导
+   level（93/120/153/156/186），替代固定 level=120，使 4K/8K 重建有效。
+4. **`max_num_reorder_pics`/`max_latency_increase_plus1` 随 level 调整**。
+5. **PPS deblocking 改为读 VA 实际字段**（`deblocking_filter_override_enabled_flag`
+   / `pps_disable_deblocking_filter_flag` / beta/tc offset），按位流语法
+   条件写入，不再硬编码 1/1/beta=1/tc=1。
+6. **SPS `num_short_term_ref_pic_sets` 固定为 0**：VA short-slice 模式在
+   slice 头携带短时 RPS，图参缓冲只报告集合数、不含语法；照搬会造成
+   缺失 st_ref_pic_set() payload 的无效 SPS。
+7. **RBSP 转 NAL 增加防竞争字节转义**（emulation-prevention）：重建的
+   Annex-B NAL 不再可能被 0x00 00 00/01 歧义破坏。
 
-1. **固件 IDR corrupt**（第 1 帧）：
-   - ffmpeg 软件解码第 1 帧正确，但固件硬件对 IDR slice 头解析失败
-   - VPS byte 11：重建 `90`（progressive=1）vs 原始 `00`——**VPS 的
-     `reserved_zero_44bits` 我硬编码了 x265 值 `0x78a003`，但原始 VPS 是 0**
-   - PPS byte 6：`44` vs 原始 `40`（bit2 差异）
-2. **帧 7+ 内容漂移**（P 帧参考累积误差 1363→8116 样本）：某个参考管理
-   字段仍不完全匹配
+### 验证状态
 
-### 结论
+| 层级 | 结果 |
+|---|---|
+| ffmpeg 解析 | ✅ 1080p 与 4K 的 VPS/SPS/PPS 均无错误/overread |
+| ffmpeg 软件解码 | ✅ 10/10 帧，帧 1-5 内容与原始逐像素一致 |
+| 固件硬件 | ⚠️ 8 帧 ok + 1 帧 **IDR corrupt**（flags=0x8）|
 
-重建参数集对 **ffmpeg 软件解码完全有效**（证明字段值/结构正确），但
-**固件硬件对参数集有字节级严格要求**。下一步：把 VPS 的 reserved_zero_44
-改为 0（匹配原始 VPS），逐字节对齐重建与原始参数集，固件 IDR corrupt
-应随之消除。驱动保留 HEVCMain profile 与重建代码作为基础。
+### 仍未解决
+
+**固件 IDR corrupt**（第 1 帧）：ffmpeg 软件解码第 1 帧正确，但固件硬件对
+IDR slice 头解析仍失败。VPS/PPS 的字节级差异已按原始参数集消除，若仍有
+残留需在实际设备上对照原始与重建参数集逐字节比对（见 test_hevc_params）。
+
+**帧 7+ 内容漂移**（P 帧参考累积误差 1363→8116 样本）：某个参考管理
+字段仍不完全匹配，需真实设备复测。
+
+**原始参数集直通**：驱动现在优先使用客户端提供的原始 VPS/SPS/PPS NAL
+（`hevc_cache_raw_parameter_sets`），仅在缺失时才回退到重建逻辑；多 slice
+元素按 offset/size 逐段重组（4K/8K 多 slice 帧不再只取最后一个）。
+
+驱动保留 HEVCMain profile 与重建代码作为基础。
 
 ## Chrome 集成（✅ 核心验证通过）
 

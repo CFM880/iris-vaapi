@@ -69,18 +69,25 @@ static int constraint_flags(VAProfile profile)
 	return profile == VAProfileH264ConstrainedBaseline ? 0x40 : 0;
 }
 
-/* Pick a level from the coded height (conservative). */
-static int level_for_height(unsigned int height)
+/* Pick a level from the coded macroblock dimensions.  Height-only selection
+ * incorrectly labels wide 4K/8K streams and makes the generated SPS reject
+ * otherwise valid pictures. */
+static int level_for_size(unsigned int width, unsigned int height)
 {
-	if (height <= 480)
+	uint64_t mb = ((uint64_t)width + 15) / 16 *
+		      (((uint64_t)height + 15) / 16);
+
+	if (mb <= 1620)
 		return 30;
-	if (height <= 720)
+	if (mb <= 3600)
 		return 31;
-	if (height <= 1088)
+	if (mb <= 8192)
 		return 40;
-	if (height <= 2176)
+	if (mb <= 8704)
+		return 41;
+	if (mb <= 22080)
 		return 51;
-	return 60;
+	return 52;
 }
 
 int h264_build_sps(uint8_t *out, size_t out_size,
@@ -99,8 +106,8 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0x67, 8);	/* NAL header: forbidden=0, ref_idc=3, type=7 */
 	bs_put(&b, profile_idc(profile), 8);
 	bs_put(&b, constraint_flags(profile), 8);
-	bs_put(&b, level_for_height((pic->picture_height_in_mbs_minus1 + 1) *
-				    16), 8);
+	bs_put(&b, level_for_size((pic->picture_width_in_mbs_minus1 + 1) * 16,
+				  (pic->picture_height_in_mbs_minus1 + 1) * 16), 8);
 	bs_ue(&b, sps_id);
 	bs_ue(&b, cfi);
 	if (cfi == 3)
