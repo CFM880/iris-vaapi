@@ -30,7 +30,7 @@ int iris_decode_picture(struct iris_decode_ctx *ctx,
 /* Capture per-slice parameters (reference counts) for the PPS default. */
 int iris_decode_slice_params(struct iris_decode_ctx *ctx,
 			     const VASliceParameterBufferH264 *sp);
-/* HEVC: picture/slice params (used to re-serialize VPS/SPS/PPS). */
+/* HEVC: picture/slice params used to canonicalize parameter sets and RPS. */
 int iris_decode_hevc_picture(struct iris_decode_ctx *ctx,
 			     const VAPictureParameterBufferHEVC *pic);
 int iris_decode_hevc_slice_params(struct iris_decode_ctx *ctx,

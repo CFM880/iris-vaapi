@@ -134,7 +134,8 @@ surf3=8646c3c1=ref3(P)     surf5=d825880e=ref5(P)
 
 **EOS flush（✅ 已解决）**：stateful 固件 hold 最后一帧，之前 `vaSyncSurface`
 对最后一张画面必超时。现在 `iris_decode_sync` 检测到目标是最后入队画面时
-自动喂 EOS 标记（`v4l2_dec_flush`），固件返回 `V4L2_BUF_FLAG_LAST` 帧，
+通过 `VIDIOC_DECODER_CMD(V4L2_DEC_CMD_STOP)` 发起 drain（`v4l2_dec_flush`），
+固件返回空的 `V4L2_BUF_FLAG_LAST` 标记，
 释放最后一张。flush 后再解码（Chrome flush/reset、loop）会经 `ensure_decoder`
 自动重开会话。
 
@@ -189,87 +190,65 @@ frame= 422 全部解码
 引擎与 VA-API 层均按 profile 选择 V4L2 OUTPUT 像素格式
 （H264/HEVC/VP9），`V4L2_PIX_FMT_VP9` 直通喂帧。
 
-## HEVC（⚠️ 引擎级可用，VA-API 参数集重建对 ffmpeg 有效、固件 IDR 待解决）
+## HEVC（✅ Main 8-bit 参数重建与 B 帧已像素级验证）
 
-**引擎级已验证**：固件能解 HEVC（422 AU → 404 帧，像素级正确），
-但需**完整参数集**（VPS/SPS/PPS）。用原始参数集前置可稳定解码
-（`./build/test_hevc_au`）。
+Iris 的 stateful V4L2 接口需要完整 Annex-B VPS/SPS/PPS + slice，而 Chromium
+和 ffmpeg 的 VA-API HEVC 路径通常只提交 slice NAL 与已经解析好的 VA 参数。
+本驱动在 Chromium 外完成转换，因此不需要编译 Chromium，也能随发行版浏览器升级。
 
-### VA-API 参数集重建（`src/hevc_params.c`）
+### Chromium 字段调查与反推
 
-Chrome/ffmpeg 传 slice data **不含参数集**（已确认 vps=0 sps=0 pps=0），
-驱动从 `VAPictureParameterBufferHEVC` 重建 VPS/SPS/PPS。
+上游 Chromium `media` 源码给出了 VA 参数的准确语义：
 
-**逆向 ffmpeg 源码**（下载 `FFmpeg` tag `n8.0.1`）确认的关键映射
-（`libavcodec/vaapi_hevc.c:146-211`、`libavcodec/hevc/ps.c`）：
-- `pps_loop_filter_across_slices_enabled_flag` ← `pps->seq_loop_filter_across_slices_enabled_flag`
-  （`seq_` 前缀是 ffmpeg 对 bitstream `pps_loop_filter_across_slices_enabled_flag` 的命名，ps.c:2341）
-- `pps_beta_offset_div2 = pps->beta_offset / 2`，其中 `pps->beta_offset = 2 * beta_offset_div2`（ps.c:2362）
-- ffmpeg 的 VA 字段**正确反映 bitstream**（标准解析器），所以重建用 ffmpeg
-  填的值理论上应与原始一致
+- `gpu/vaapi/h265_vaapi_video_decoder_delegate.cc` 把 parser 的 slice header、
+  POC、参考图列表和 RPS flags 填进 libva buffer；`slice_data_byte_offset`
+  使用移除防竞争字节后的 header 长度。
+- `gpu/h265_decoder.h` 中当前短期参考集合就是
+  `StCurrBefore ∪ StCurrAfter`；其余有效短期 DPB 项是 `StFoll`。
+- `parsers/h265_parser.h/.cc` 保留了完整 slice 语法，但 VA picture buffer
+  对 SPS 中的 `st_ref_pic_set()` 只保留集合数量，并不保留原始集合内容。
 
-**修复的位级 bug**（逐条对照 ffmpeg `trace_headers` 权威输出定位）：
-1. `bs_put` 32→64 位 UB（`1u<<i` 对 i≥32）→ reserved_zero_44bits 写入损坏
-2. SPS 缺 **`conformance_window_flag`** → bit_depth 起错位
-3. `scaling_list_enabled_flag`/`amp_enabled_flag`/`max_transform_*` 字段顺序
-4. `pic_width/height_in_luma_samples` 不应 -1
-5. **PPS 缺 `deblocking_filter_control_present_flag`(=1) + beta/tc offset**：
-   PPS 从 7 字节变 8 字节（48 payload bit），缺了 slice 头解析依赖的
-   deblocking 字段
-6. **SPS 缺 VUI**：原始带 `vui_parameters_present_flag=1` + timing info，
-   且 `vui_num_units_in_tick`/`vui_time_scale` 是 **u(32)** 不是 ue(v)
-   —— 用 ue 写会导致 "Overread SPS by 8 bits"
-7. SPS/VPS 的 profile_tier_level：progressive=1、frame_only=1、level=120
-   （ffmpeg trace 权威，两者一致，非 0/0/192）
+因此仅“重建 SPS”不够：若把 canonical SPS 的
+`num_short_term_ref_pic_sets` 设为 0，而原 slice 仍通过索引引用原 SPS RPS，
+slice header 会从该位开始整体错位。
 
-### 验证状态
+### 当前转换方式
 
-| 层级 | 结果 |
+1. `src/hevc_params.c` 从 `VAPictureParameterBufferHEVC` 序列化 canonical
+   VPS/SPS/PPS，保留 slice 实际使用的 PPS id。
+2. `src/hevc_slice_rewrite.c` 解开 slice RBSP，解析到 short-term RPS，使用
+   `ReferenceFrames[].pic_order_cnt/flags` 重建等价的 inline RPS，再复制其余
+   slice header 和原始 CABAC payload，最后重新插入 emulation-prevention bytes。
+3. IDR、dependent slice，以及原本已经与 canonical SPS 兼容的 slice 直接复制；
+   多 slice 参数逐项与对应 data range 关联，不再只保留最后一项。
+4. Iris 的 HEVC CAPTURE timestamp 不足以回填 VA surface；驱动按 POC 对待输出
+   图片排序，并在 surface 复用时重置完成状态。EOS 使用标准
+   `VIDIOC_DECODER_CMD(V4L2_DEC_CMD_STOP)`，排出最后的重排帧。
+5. 客户端若提供完整且无需改写的原始 VPS/SPS/PPS，仍优先原样直通。
+
+### 验证结果
+
+用 x265 生成 320×240、30 帧、`1 I + 8 P + 21 B`、SPS-indexed RPS 的真实码流：
+
+| 检查 | 结果 |
 |---|---|
-| ffmpeg 软件解码 | ✅ 10/10 帧，帧 1-5 内容与原始逐像素一致 |
-| 固件硬件 | ⚠️ 8 帧 ok + 1 帧 **IDR corrupt**（flags=0x8）|
+| slice rewrite 单元测试 | ✅ PPS id、inline RPS、header suffix、CABAC payload 全部一致 |
+| 重建 Annex-B → ffmpeg 软件解码 | ✅ 30/30 帧，逐帧像素 MD5 与原码流一致 |
+| ffmpeg VA-API → Iris 硬件 → CPU readback | ✅ 30/30 帧，显示顺序和像素 MD5 全部一致 |
+| 1080p 原始/重建 AU 直接喂 V4L2 | ✅ 均输出 1 帧，0 corrupt |
 
-### 重建逻辑修正（使固件字节级对齐）
+可用 `IRIS_HEVC_DUMP=/tmp/rebuilt.h265` 保存驱动实际提交的重建码流，交给
+独立软件解码器复核。
 
-1. **VPS/SPS 的 `reserved_zero_44bits` 改为全零**（不再硬编码 x265 的
-   `0x78a003`）：原始 VPS 该字段是 0，逐字节对齐重建与原始参数集，
-   消除固件对 IDR 首帧解析失败的一处差异。
-2. **`general_compatibility_flag` 按 level 选值**：level ≥ 150（4K/8K）
-   用 `0x40000000`，其余用 `0x60000090`。
-3. **新增 `hevc_level_for_size`**：按 `pic_width*height` 的 luma 采样数推导
-   level（93/120/153/156/186），替代固定 level=120，使 4K/8K 重建有效。
-4. **`max_num_reorder_pics`/`max_latency_increase_plus1` 随 level 调整**。
-5. **PPS deblocking 改为读 VA 实际字段**（`deblocking_filter_override_enabled_flag`
-   / `pps_disable_deblocking_filter_flag` / beta/tc offset），按位流语法
-   条件写入，不再硬编码 1/1/beta=1/tc=1。
-6. **SPS `num_short_term_ref_pic_sets` 固定为 0**：VA short-slice 模式在
-   slice 头携带短时 RPS，图参缓冲只报告集合数、不含语法；照搬会造成
-   缺失 st_ref_pic_set() payload 的无效 SPS。
-7. **RBSP 转 NAL 增加防竞争字节转义**（emulation-prevention）：重建的
-   Annex-B NAL 不再可能被 0x00 00 00/01 歧义破坏。
+### 当前边界
 
-### 验证状态
-
-| 层级 | 结果 |
-|---|---|
-| ffmpeg 解析 | ✅ 1080p 与 4K 的 VPS/SPS/PPS 均无错误/overread |
-| ffmpeg 软件解码 | ✅ 10/10 帧，帧 1-5 内容与原始逐像素一致 |
-| 固件硬件 | ⚠️ 8 帧 ok + 1 帧 **IDR corrupt**（flags=0x8）|
-
-### 仍未解决
-
-**固件 IDR corrupt**（第 1 帧）：ffmpeg 软件解码第 1 帧正确，但固件硬件对
-IDR slice 头解析仍失败。VPS/PPS 的字节级差异已按原始参数集消除，若仍有
-残留需在实际设备上对照原始与重建参数集逐字节比对（见 test_hevc_params）。
-
-**帧 7+ 内容漂移**（P 帧参考累积误差 1363→8116 样本）：某个参考管理
-字段仍不完全匹配，需真实设备复测。
-
-**原始参数集直通**：驱动现在优先使用客户端提供的原始 VPS/SPS/PPS NAL
-（`hevc_cache_raw_parameter_sets`），仅在缺失时才回退到重建逻辑；多 slice
-元素按 offset/size 逐段重组（4K/8K 多 slice 帧不再只取最后一个）。
-
-驱动保留 HEVCMain profile 与重建代码作为基础。
+- 已验证的是 HEVC Main 8-bit/NV12；Main10/P010 尚未实现完整 surface 路径。
+- 原 SPS 含 long-term reference table（`num_long_term_ref_pic_sps > 0`）时，
+  因 VA buffer 不含该表内容，当前明确返回不支持，不生成可能错位的码流。
+- 自定义 scaling list 通过独立 `VAIQMatrixBufferHEVC` 提交；当前 canonical SPS
+  使用默认矩阵，尚未序列化自定义矩阵。
+- canonical VUI 只提供保守 timing 值；它不影响已验证的解码像素，但尚未覆盖
+  HDR/色彩描述等完整元数据重建。
 
 ## Chrome 集成（✅ 核心验证通过）
 

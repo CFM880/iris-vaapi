@@ -9,11 +9,48 @@
 #include <va/va.h>
 #include "hevc_params.h"
 
+static int check_nal(const char *name, const uint8_t *got, int got_len,
+		     const uint8_t *want, size_t want_len)
+{
+	if (got_len == (int)want_len && !memcmp(got, want, want_len))
+		return 0;
+
+	fprintf(stderr, "%s mismatch\n  got (%d): ", name, got_len);
+	for (int i = 0; i < got_len; i++)
+		fprintf(stderr, "%02x", got[i]);
+	fprintf(stderr, "\n  want(%zu): ", want_len);
+	for (size_t i = 0; i < want_len; i++)
+		fprintf(stderr, "%02x", want[i]);
+	fputc('\n', stderr);
+	return 1;
+}
+
 int main(void)
 {
+	/* Parameter NALs extracted from the matching x265 1080p fixture. */
+	static const uint8_t expected_vps[] = {
+		0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60,
+		0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+		0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09,
+	};
+	static const uint8_t expected_sps[] = {
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
+		0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+		0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5,
+		0x96, 0x56, 0x69, 0x24, 0xca, 0xe6, 0x80, 0x80,
+		0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0c,
+		0x84,
+	};
+	static const uint8_t expected_pps[] = {
+		0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40,
+	};
+	static const uint8_t expected_conditional_pps[] = {
+		0x44, 0x01, 0xc7, 0x72, 0xbc, 0xda, 0x0a, 0x0a,
+		0x0f, 0xf1, 0x48, 0x48,
+	};
 	VAPictureParameterBufferHEVC pic;
 	uint8_t out[512];
-	int n;
+	int n, failed = 0;
 
 	memset(&pic, 0, sizeof(pic));
 	pic.pic_width_in_luma_samples = 1920;
@@ -47,19 +84,47 @@ int main(void)
 	pic.pps_cr_qp_offset = 0;
 
 	n = hevc_build_vps(out, sizeof(out), &pic);
-	if (n != 23) return 1;
-	printf("VPS (%d): ", n);
-	for (int i = 0; i < n; i++) printf("%02x", out[i]);
-	printf("\n");
+	failed |= check_nal("VPS", out, n, expected_vps,
+			    sizeof(expected_vps));
 	n = hevc_build_sps(out, sizeof(out), &pic);
-	if (n != 42) return 1;
-	printf("SPS (%d): ", n);
-	for (int i = 0; i < n; i++) printf("%02x", out[i]);
-	printf("\n");
+	failed |= check_nal("SPS", out, n, expected_sps,
+			    sizeof(expected_sps));
 	n = hevc_build_pps(out, sizeof(out), &pic);
-	if (n != 7) return 1;
-	printf("PPS (%d): ", n);
-	for (int i = 0; i < n; i++) printf("%02x", out[i]);
-	printf("\n");
-	return 0;
+	failed |= check_nal("PPS", out, n, expected_pps,
+			    sizeof(expected_pps));
+
+	/* Exercise conditional PPS syntax: extra header bits, chroma offsets,
+	 * explicit tiles, entropy sync and deblocking offsets. */
+	pic.num_extra_slice_header_bits = 3;
+	pic.slice_parsing_fields.bits.pps_slice_chroma_qp_offsets_present_flag = 1;
+	pic.pic_fields.bits.tiles_enabled_flag = 1;
+	pic.num_tile_columns_minus1 = 2;
+	pic.num_tile_rows_minus1 = 1;
+	pic.column_width_minus1[0] = 9;
+	pic.column_width_minus1[1] = 19;
+	pic.row_height_minus1[0] = 14;
+	pic.pic_fields.bits.loop_filter_across_tiles_enabled_flag = 1;
+	pic.slice_parsing_fields.bits.deblocking_filter_override_enabled_flag = 1;
+	pic.pps_beta_offset_div2 = -2;
+	pic.pps_tc_offset_div2 = 2;
+	n = hevc_build_pps(out, sizeof(out), &pic);
+	failed |= check_nal("conditional PPS", out, n, expected_conditional_pps,
+			    sizeof(expected_conditional_pps));
+
+	/* All builders must reject an output buffer that cannot hold the NAL. */
+	if (hevc_build_vps(out, 2, &pic) >= 0 ||
+	    hevc_build_sps(out, 2, &pic) >= 0 ||
+	    hevc_build_pps(out, 2, &pic) >= 0 ||
+	    hevc_build_vps(NULL, sizeof(out), &pic) >= 0 ||
+	    hevc_build_sps(out, sizeof(out), NULL) >= 0) {
+		fprintf(stderr, "invalid builder input was not rejected\n");
+		failed = 1;
+	}
+	pic.num_tile_columns_minus1 = 20;
+	if (hevc_build_pps(out, sizeof(out), &pic) >= 0) {
+		fprintf(stderr, "invalid tile count was not rejected\n");
+		failed = 1;
+	}
+
+	return failed;
 }

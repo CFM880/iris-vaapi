@@ -474,27 +474,11 @@ int v4l2_dec_dqout(struct v4l2_dec *d)
 
 int v4l2_dec_flush(struct v4l2_dec *d)
 {
-	struct v4l2_buffer b;
-	unsigned int idx;
+	struct v4l2_decoder_cmd cmd;
 
-	if (d->free_out_n <= 0)
-		return -EAGAIN;
-	idx = d->free_out[--d->free_out_n];
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-	b.memory = V4L2_MEMORY_MMAP;
-	b.length = 1;
-	b.index = idx;
-	b.m.planes = calloc(1, sizeof(struct v4l2_plane));
-	b.m.planes[0].bytesused = 0;
-	if (xioctl(d->fd, VIDIOC_QBUF, &b) < 0) {
-		free(b.m.planes);
-		d->free_out[d->free_out_n++] = idx;
-		return -errno;
-	}
-	free(b.m.planes);
-	return 0;
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.cmd = V4L2_DEC_CMD_STOP;
+	return xioctl(d->fd, VIDIOC_DECODER_CMD, &cmd) < 0 ? -errno : 0;
 }
 
 int v4l2_dec_stop(struct v4l2_dec *d)

@@ -14,6 +14,7 @@
 #include "decode.h"
 #include "h264_params.h"
 #include "hevc_params.h"
+#include "hevc_slice_rewrite.h"
 #include "v4l2_dec.h"
 
 #define IRIS_MAX_SURFACES	64
@@ -109,10 +110,12 @@ struct iris_decode_ctx {
 	int raw_hevc_pps_len;
 	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
 	struct {
-		uint32_t offset;
-		uint32_t size;
-	} hevc_ranges[128];
-	unsigned int hevc_range_count;
+		VASliceParameterBufferHEVC param;
+	} hevc_slices[128];
+	unsigned int hevc_slice_count;
+	unsigned int hevc_slice_next;
+	int hevc_pps_id;
+	int hevc_rewritten;
 
 	/* Map decode sequence numbers back to target surfaces so frame
 	 * matching does not depend on the (possibly non-contiguous) VASurfaceID
@@ -121,10 +124,15 @@ struct iris_decode_ctx {
 	VASurfaceID target_of[512];
 	VASurfaceID last_target;	/* most recently queued picture */
 	int eos_sent;			/* EOS (v4l2_dec_flush) queued */
-	/* HEVC firmware does not propagate per-frame timestamps; all dequeued
-	 * frames carry the same value.  Match frames to surfaces by output
-	 * order instead. */
-	uint64_t next_out_seq;
+	/* HEVC firmware does not propagate usable per-frame timestamps.  Iris
+	 * emits CAPTURE frames in display order, so retain POC-to-surface state. */
+	struct {
+		int valid;
+		unsigned int generation;
+		int32_t poc;
+		VASurfaceID target;
+	} hevc_pending[512];
+	unsigned int hevc_generation;
 };
 
 static struct iris_surface *
@@ -194,7 +202,11 @@ iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id)
 	 * Prefer a real DMA-heap buffer so the exported fd can be imported by
 	 * GPU clients (Chrome/EGL); fall back to a plain memfd when the heap
 	 * node is root-only, which keeps local tests and CPU readback working. */
-	size = ALIGN_TO(ctx->width, 16) * ALIGN_TO(ctx->height, 32) * 3 / 2;
+	/* Iris exposes linear NV12 CAPTURE with a 128-byte luma stride. Allocate
+	 * the stable VA surface backing with the same pitch; using only 16-byte
+	 * alignment made small resolutions (for example 320 -> 384) too small and
+	 * silently skipped the decoded-frame copy. */
+	size = ALIGN_TO(ctx->width, 128) * ALIGN_TO(ctx->height, 32) * 3 / 2;
 	fprintf(stderr, "[surf] id=%u size=%u w=%u h=%u\n", id, size,
 		ctx->width, ctx->height);
 	heap = open("/dev/dma_heap/system", O_RDWR);
@@ -260,6 +272,16 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 			ctx->dec_open = 0;
 			ctx->dec_started = 0;
 			ctx->eos_sent = 0;
+			ctx->last_sps_len = 0;
+			ctx->last_pps_len = 0;
+			ctx->last_hevc_vps_len = 0;
+			ctx->last_hevc_sps_len = 0;
+			ctx->last_hevc_pps_len = 0;
+			ctx->raw_hevc_vps_len = 0;
+			ctx->raw_hevc_sps_len = 0;
+			ctx->raw_hevc_pps_len = 0;
+			memset(ctx->hevc_pending, 0, sizeof(ctx->hevc_pending));
+			ctx->hevc_generation++;
 		} else {
 			return 0;
 		}
@@ -272,11 +294,53 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 	return 0;
 }
 
+static int
+hevc_pending_add(struct iris_decode_ctx *ctx, int32_t poc, VASurfaceID target)
+{
+	unsigned int i;
 
-/* Assign one dequeued frame to its surface.  For H.264/VP9 the firmware
- * propagates the timestamp we encoded with the surface id; for HEVC it
- * stamps every frame with the same value, so fall back to output-order
- * matching.  Returns the surface id, or -1 if unknown. */
+	if (ctx->hevc_pic.slice_parsing_fields.bits.IdrPicFlag && ctx->seq)
+		ctx->hevc_generation++;
+	for (i = 0; i < 512; i++) {
+		if (ctx->hevc_pending[i].valid)
+			continue;
+		ctx->hevc_pending[i].valid = 1;
+		ctx->hevc_pending[i].generation = ctx->hevc_generation;
+		ctx->hevc_pending[i].poc = poc;
+		ctx->hevc_pending[i].target = target;
+		return 0;
+	}
+	return -1;
+}
+
+static int
+hevc_pending_take(struct iris_decode_ctx *ctx, VASurfaceID *target)
+{
+	unsigned int i, best = 512;
+
+	for (i = 0; i < 512; i++) {
+		if (!ctx->hevc_pending[i].valid)
+			continue;
+		if (best == 512 ||
+		    ctx->hevc_pending[i].generation <
+			ctx->hevc_pending[best].generation ||
+		    (ctx->hevc_pending[i].generation ==
+			 ctx->hevc_pending[best].generation &&
+		     ctx->hevc_pending[i].poc < ctx->hevc_pending[best].poc))
+			best = i;
+	}
+	if (best == 512)
+		return -1;
+	*target = ctx->hevc_pending[best].target;
+	ctx->hevc_pending[best].valid = 0;
+	return 0;
+}
+
+
+/* Assign one dequeued frame to its surface.  H.264/VP9 use the timestamp
+ * propagated by the firmware.  Iris does not preserve usable HEVC timestamps,
+ * so HEVC matches display-order CAPTURE frames against pending picture POCs.
+ * Returns the surface id, or -1 if unknown. */
 static int
 assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 {
@@ -285,15 +349,16 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	struct iris_surface *s;
 
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
-		seq = ctx->next_out_seq++;
-		if (seq >= 512)
+		if (hevc_pending_take(ctx, &id)) {
+			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 			return -1;
+		}
 	} else {
 		seq = (frame->timestamp / 1000000000ULL) - 1000;
 		if (seq >= 512)
 			return -1;
+		id = ctx->target_of[seq];
 	}
-	id = ctx->target_of[seq];
 	s = find_surface(ctx, id);
 
 	if (!s) {
@@ -310,6 +375,8 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	s->queued = 1;
 	return id;
 }
+
+static int drain_available(struct iris_decode_ctx *ctx);
 
 /* Force the firmware to release the picture it is holding.  The stateful
  * decoder keeps the most recent picture until the next access unit (or an
@@ -329,10 +396,8 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 		return ret;
 	ctx->eos_sent = 1;
 
-	/* Drain until the EOS frame (V4L2_BUF_FLAG_LAST) is dequeued.  Its
-	 * timestamp is the last AU's timestamp, so it maps to the right
-	 * surface; if the firmware reports the empty flush buffer's zero
-	 * timestamp instead, fall back to the last queued target. */
+	/* Drain decoded pictures until the empty V4L2_BUF_FLAG_LAST marker is
+	 * dequeued.  Pictures preceding that marker are assigned normally. */
 	while (deadline-- > 0) {
 		int changed;
 
@@ -349,14 +414,14 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 			continue;
 		fprintf(stderr, "[flush] got ts=%llu flags=0x%x\n",
 			(unsigned long long)frame.timestamp, frame.flags);
-		if (assign_frame(ctx, &frame) < 0 && ctx->last_target) {
+		if (frame.bytesused &&
+		    assign_frame(ctx, &frame) < 0 && ctx->last_target) {
 			struct iris_surface *s = find_surface(ctx,
 							       ctx->last_target);
 			if (s) {
 				if (frame.bytesused <= s->bsize)
 					memcpy(s->bmap, frame.mem,
 					       frame.bytesused);
-				v4l2_dec_qcap_idx(&ctx->dec, frame.index);
 				s->decoded = 1;
 			}
 		}
@@ -370,6 +435,9 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 static int
 drain_available(struct iris_decode_ctx *ctx)
 {
+	if (ctx->eos_sent)
+		return 0;
+
 	for (;;) {
 		struct v4l2_dec_frame frame;
 		int changed, ret;
@@ -393,13 +461,26 @@ drain_available(struct iris_decode_ctx *ctx)
 int
 iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 {
+	struct iris_surface *s = find_surface(ctx, target);
+
 	fprintf(stderr, "[begin] target=%u\n", target);
 	ctx->current_target = target;
+	/* VA clients reuse render targets.  A surface that held an earlier
+	 * picture must become pending again, otherwise vaSyncSurface can return
+	 * the stale backing before the newly decoded picture is copied into it. */
+	if (s) {
+		s->decoded = 0;
+		s->queued = 0;
+	}
 	ctx->have_pic = 0;
+	ctx->have_hevc_pic = 0;
 	ctx->slice_len = 0;
 	ctx->refs_l0 = 0;
 	ctx->refs_l1 = 0;
-	ctx->hevc_range_count = 0;
+	ctx->hevc_slice_count = 0;
+	ctx->hevc_slice_next = 0;
+	ctx->hevc_pps_id = -1;
+	ctx->hevc_rewritten = 0;
 	return 0;
 }
 
@@ -443,11 +524,10 @@ iris_decode_hevc_slice_params(struct iris_decode_ctx *ctx,
 	/* VA-API may submit one parameter buffer containing many slice elements.
 	 * Keep every range; retaining only the last element corrupts multi-slice
 	 * 4K/8K pictures. */
-	if (ctx->hevc_range_count >= 128)
+	if (ctx->hevc_slice_count >= 128)
 		return -1;
-	ctx->hevc_ranges[ctx->hevc_range_count].size = sp->slice_data_size;
-	ctx->hevc_ranges[ctx->hevc_range_count].offset = sp->slice_data_offset;
-	ctx->hevc_range_count++;
+	memcpy(&ctx->hevc_slices[ctx->hevc_slice_count].param, sp, sizeof(*sp));
+	ctx->hevc_slice_count++;
 	return 0;
 }
 
@@ -511,56 +591,103 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 	const uint8_t *p = data;
 	size_t need = len + 4;
 
-	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC && ctx->hevc_range_count) {
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC &&
+	    ctx->hevc_slice_next < ctx->hevc_slice_count) {
 		unsigned int use = 0;
 		unsigned int i;
+		size_t data_len = len;
+		unsigned int remaining = ctx->hevc_slice_count - ctx->hevc_slice_next;
 
 		/* A single VA slice-data buffer normally contains all ranges.  If a
 		 * client uses one data buffer per slice, consume one range at a time. */
-		if (ctx->hevc_range_count > 1) {
+		if (remaining > 1) {
 			int all_fit = 1;
-			for (i = 0; i < ctx->hevc_range_count; i++)
-				if ((uint64_t)ctx->hevc_ranges[i].offset +
-				    ctx->hevc_ranges[i].size > len) {
+			for (i = 0; i < remaining; i++) {
+				const VASliceParameterBufferHEVC *sp =
+					&ctx->hevc_slices[ctx->hevc_slice_next + i].param;
+
+				if ((uint64_t)sp->slice_data_offset +
+				    sp->slice_data_size > data_len) {
 					all_fit = 0;
 					break;
 				}
+			}
 			if (all_fit)
-				use = ctx->hevc_range_count;
+				use = remaining;
 		}
 		if (!use)
 			use = 1;
 
 		for (i = 0; i < use; i++) {
-			uint32_t off = ctx->hevc_ranges[i].offset;
-			uint32_t size = ctx->hevc_ranges[i].size;
+			const VASliceParameterBufferHEVC *sp =
+				&ctx->hevc_slices[ctx->hevc_slice_next + i].param;
+			uint32_t off = sp->slice_data_offset;
+			uint32_t size = sp->slice_data_size;
+			uint8_t *rewritten;
+			size_t rewritten_cap, nal_len;
+			unsigned int pps_id;
+			int sc, rewritten_len;
 
-			if ((uint64_t)off + size > len)
+			if ((uint64_t)off + size > data_len || !ctx->have_hevc_pic)
 				return -1;
 			p = (const uint8_t *)data + off;
-			len = size;
-			need = len + 4;
+			sc = has_start_code(p, size);
+			nal_len = size - sc;
+			if (nal_len > (SIZE_MAX - 1024) / 2)
+				return -1;
+			rewritten_cap = nal_len * 2 + 1024;
+			rewritten = malloc(rewritten_cap);
+			if (!rewritten)
+				return -1;
+			rewritten_len = hevc_rewrite_slice(rewritten, rewritten_cap,
+							 p + sc, nal_len,
+							 &ctx->hevc_pic, sp,
+							 &pps_id);
+			if (rewritten_len < 0) {
+				fprintf(stderr, "HEVC slice rewrite failed: %d\n",
+					rewritten_len);
+				free(rewritten);
+				return rewritten_len;
+			}
+			if (ctx->hevc_pps_id < 0)
+				ctx->hevc_pps_id = (int)pps_id;
+			else if (ctx->hevc_pps_id != (int)pps_id) {
+				free(rewritten);
+				return -1;
+			}
+			if ((size_t)rewritten_len != nal_len ||
+			    memcmp(rewritten, p + sc, nal_len))
+				ctx->hevc_rewritten = 1;
+			need = (size_t)rewritten_len + 4;
 			if (ctx->slice_len + need > ctx->slice_cap) {
-				size_t ncap = ctx->slice_cap ? ctx->slice_cap * 2 :
-								(size + (1 << 20));
+				size_t ncap = ctx->slice_cap ? ctx->slice_cap : (1 << 20);
+
+				while (ncap < ctx->slice_len + need) {
+					if (ncap > SIZE_MAX / 2) {
+						free(rewritten);
+						return -1;
+					}
+					ncap *= 2;
+				}
 				void *n = realloc(ctx->slice_data, ncap);
-				if (!n)
+				if (!n) {
+					free(rewritten);
 					return -1;
+				}
 				ctx->slice_data = n;
 				ctx->slice_cap = ncap;
 			}
-			if (!has_start_code(p, len) && ctx->out_pixfmt != V4L2_PIX_FMT_VP9) {
+			{
 				static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 				memcpy(ctx->slice_data + ctx->slice_len, sc4, 4);
 				ctx->slice_len += 4;
 			}
-			memcpy(ctx->slice_data + ctx->slice_len, p, len);
-			ctx->slice_len += len;
+			memcpy(ctx->slice_data + ctx->slice_len, rewritten,
+			       rewritten_len);
+			ctx->slice_len += rewritten_len;
+			free(rewritten);
 		}
-		if (use < ctx->hevc_range_count)
-			memmove(ctx->hevc_ranges, ctx->hevc_ranges + use,
-				(ctx->hevc_range_count - use) * sizeof(ctx->hevc_ranges[0]));
-		ctx->hevc_range_count -= use;
+		ctx->hevc_slice_next += use;
 		return 0;
 	}
 
@@ -601,6 +728,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	if (!ctx->have_pic && ctx->out_pixfmt != V4L2_PIX_FMT_VP9 &&
 	    !ctx->have_hevc_pic)
 		return -1;
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC &&
+	    ctx->hevc_slice_next != ctx->hevc_slice_count)
+		return -1;
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
 	au_cap = ctx->slice_len + 256;
@@ -612,6 +742,7 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		return -1;
 	ret = ensure_decoder(ctx);
 	if (ret) {
+		free(au);
 		return ret;
 	}
 
@@ -631,13 +762,13 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		/* If the client provided complete parameter NALs, pass the original
 		 * Annex-B access unit through unchanged.  This is the native input
 		 * contract of the stateful Iris V4L2 decoder. */
-		if (raw_in_au == 7) {
+		if (raw_in_au == 7 && !ctx->hevc_rewritten) {
 			au_len = ctx->slice_len;
 			memcpy(au, ctx->slice_data, au_len);
 			goto hevc_au_ready;
 		}
-		if (ctx->raw_hevc_vps_len && ctx->raw_hevc_sps_len &&
-		    ctx->raw_hevc_pps_len) {
+		if (!ctx->hevc_rewritten && ctx->raw_hevc_vps_len &&
+		    ctx->raw_hevc_sps_len && ctx->raw_hevc_pps_len) {
 			memcpy(au + au_len, sc4, 4);
 			memcpy(au + au_len + 4, ctx->raw_hevc_vps,
 			       ctx->raw_hevc_vps_len);
@@ -659,6 +790,10 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		 * firmware DPB).  ffmpeg/Chrome send bare slice NALs. */
 		n = hevc_build_vps(au + 4, au_cap - 4 - ctx->slice_len,
 				   &ctx->hevc_pic);
+		if (n <= 0) {
+			free(au);
+			return -1;
+		}
 		if (n > 0 && (n != ctx->last_hevc_vps_len ||
 			      memcmp(au + 4, ctx->last_hevc_vps, n) != 0)) {
 			memcpy(au, sc4, 4);
@@ -668,6 +803,10 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		}
 		n = hevc_build_sps(au + au_len + 4, au_cap - au_len - 4 -
 				   ctx->slice_len, &ctx->hevc_pic);
+		if (n <= 0) {
+			free(au);
+			return -1;
+		}
 		if (n > 0 && (n != ctx->last_hevc_sps_len ||
 			      memcmp(au + au_len + 4, ctx->last_hevc_sps, n) != 0)) {
 			memcpy(au + au_len, sc4, 4);
@@ -675,8 +814,14 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			ctx->last_hevc_sps_len = n;
 			au_len += 4 + n;
 		}
-		n = hevc_build_pps(au + au_len + 4, au_cap - au_len - 4 -
-				   ctx->slice_len, &ctx->hevc_pic);
+		n = hevc_build_pps_id(au + au_len + 4, au_cap - au_len - 4 -
+				      ctx->slice_len, &ctx->hevc_pic,
+				      ctx->hevc_pps_id < 0 ? 0 :
+				      (unsigned int)ctx->hevc_pps_id);
+		if (n <= 0) {
+			free(au);
+			return -1;
+		}
 		if (n > 0 && (n != ctx->last_hevc_pps_len ||
 			      memcmp(au + au_len + 4, ctx->last_hevc_pps, n) != 0)) {
 			memcpy(au + au_len, sc4, 4);
@@ -731,6 +876,21 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	au_len += ctx->slice_len;
 	}
 
+	/* Opt-in bitstream capture for validating the VA-to-stateful translation
+	 * with an independent software decoder. */
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+		const char *dump_path = getenv("IRIS_HEVC_DUMP");
+
+		if (dump_path && *dump_path) {
+			FILE *dump = fopen(dump_path, "ab");
+
+			if (dump) {
+				fwrite(au, 1, au_len, dump);
+				fclose(dump);
+			}
+		}
+	}
+
 	{
 		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;
 
@@ -743,7 +903,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		}
 		if (ctx->seq < 512)
 			ctx->target_of[ctx->seq] = ctx->current_target;
-		ctx->seq++;
 
 		if (!ctx->dec_started) {
 			/* Mirror FFmpeg: queue the first access unit before
@@ -778,6 +937,13 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 				return ret;
 			}
 		}
+		if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC &&
+		    hevc_pending_add(ctx, ctx->hevc_pic.CurrPic.pic_order_cnt,
+				     ctx->current_target)) {
+			free(au);
+			return -1;
+		}
+		ctx->seq++;
 	}
 	free(au);
 
@@ -867,7 +1033,7 @@ iris_decode_surface_buffer(struct iris_decode_ctx *ctx, VASurfaceID id,
 		return -1;
 	*cap_index = 0;
 	*mem = s->bmap;
-	*pitch = ALIGN_TO(ctx->width, 16);
+	*pitch = ALIGN_TO(ctx->width, 128);
 	*size = s->bsize;
 	*width = ctx->width;
 	*height = ctx->height;
@@ -884,7 +1050,7 @@ iris_decode_export(struct iris_decode_ctx *ctx, VASurfaceID id, int *fd,
 	if (!s)
 		return -1;
 	*fd = s->bfd;
-	*pitch = ALIGN_TO(ctx->width, 16);
+	*pitch = ALIGN_TO(ctx->width, 128);
 	*size = s->bsize;
 	*width = ctx->width;
 	*height = ctx->height;

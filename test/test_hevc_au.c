@@ -78,7 +78,7 @@ int main(int argc, char **argv)
 	struct v4l2_dec_frame frame;
 	FILE *fp;
 	long size;
-	unsigned int n_aus, fed = 0, recycled = 0, frames = 0;
+	unsigned int n_aus, fed = 0, recycled = 0, frames = 0, corrupt = 0;
 	struct timespec t0, t1;
 	int ret, changed;
 
@@ -115,7 +115,16 @@ int main(int argc, char **argv)
 			ret = v4l2_dec_dqcap(&dec, &frame);
 			if (ret == -EAGAIN) break;
 			if (ret < 0) { fprintf(stderr, "dqcap %d\n", ret); goto done; }
-			frames++; v4l2_dec_qcap(&dec, &frame);
+			if (frame.bytesused &&
+			    frame.flags & V4L2_BUF_FLAG_ERROR) {
+				fprintf(stderr, "frame %u corrupt (flags=0x%x)\n",
+					frames, frame.flags);
+				corrupt++;
+			}
+			if (frame.bytesused) {
+				frames++;
+				v4l2_dec_qcap(&dec, &frame);
+			}
 			if (ret == 1) goto done;
 		}
 	}
@@ -128,7 +137,15 @@ int main(int argc, char **argv)
 		ret = v4l2_dec_dqcap(&dec, &frame);
 		if (ret == -EAGAIN) continue;
 		if (ret < 0) break;
-		frames++; v4l2_dec_qcap(&dec, &frame);
+		if (frame.bytesused && frame.flags & V4L2_BUF_FLAG_ERROR) {
+			fprintf(stderr, "frame %u corrupt (flags=0x%x)\n",
+				frames, frame.flags);
+			corrupt++;
+		}
+		if (frame.bytesused) {
+			frames++;
+			v4l2_dec_qcap(&dec, &frame);
+		}
 		if (ret == 1) break;
 	}
 done:
@@ -136,9 +153,10 @@ done:
 	{
 		double sec = t1.tv_sec - t0.tv_sec +
 			(t1.tv_nsec - t0.tv_nsec) / 1e9;
-		printf("decoded %u frames, %.1f fps\n", frames,
+		printf("decoded %u frames (%u corrupt), %.1f fps\n", frames,
+		       corrupt,
 		       sec > 0 ? frames / sec : 0);
 	}
 	v4l2_dec_close(&dec); free(aus); free(stream);
-	return frames ? 0 : 1;
+	return frames && !corrupt ? 0 : 1;
 }

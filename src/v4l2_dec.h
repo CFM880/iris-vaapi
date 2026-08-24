@@ -76,7 +76,7 @@ int v4l2_dec_export(struct v4l2_dec *d, unsigned int cap_index, int *fd,
 void v4l2_dec_size(struct v4l2_dec *d, unsigned int *w, unsigned int *h);
 /* Dequeue + requeue a finished OUTPUT buffer. -EAGAIN if none ready. */
 int v4l2_dec_dqout(struct v4l2_dec *d);
-/* Signal EOS (queue an empty LAST buffer). */
+/* Signal EOS through the stateful-decoder drain command. */
 int v4l2_dec_flush(struct v4l2_dec *d);
 int v4l2_dec_stop(struct v4l2_dec *d);
 void v4l2_dec_close(struct v4l2_dec *d);

@@ -19,4 +19,10 @@ int hevc_build_sps(uint8_t *out, size_t out_size,
 int hevc_build_pps(uint8_t *out, size_t out_size,
 		   const VAPictureParameterBufferHEVC *pic);
 
+/* Preserve the PPS id parsed from the original slice while linking it to the
+ * canonical SPS id zero. */
+int hevc_build_pps_id(uint8_t *out, size_t out_size,
+		      const VAPictureParameterBufferHEVC *pic,
+		      unsigned int pps_id);
+
 #endif

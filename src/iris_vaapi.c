@@ -482,7 +482,8 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 				if (dd->buf_sizes[idx] <
 				    sizeof(VAPictureParameterBufferHEVC))
 					return VA_STATUS_ERROR_INVALID_BUFFER;
-				iris_decode_hevc_picture(dd->dec, data);
+				if (iris_decode_hevc_picture(dd->dec, data))
+					return VA_STATUS_ERROR_INVALID_BUFFER;
 				break;
 			}
 			if (dd->buf_sizes[idx] <
@@ -503,8 +504,9 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 				    dd->buf_num_elements[idx])
 					return VA_STATUS_ERROR_INVALID_BUFFER;
 				for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
-					iris_decode_hevc_slice_params(dd->dec,
-						(const VASliceParameterBufferHEVC *)data + j);
+					if (iris_decode_hevc_slice_params(dd->dec,
+						(const VASliceParameterBufferHEVC *)data + j))
+						return VA_STATUS_ERROR_INVALID_BUFFER;
 				break;
 			}
 			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264) *
@@ -515,7 +517,8 @@ iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 					(const VASliceParameterBufferH264 *)data + j);
 			break;
 		case VASliceDataBufferType:
-			iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]);
+			if (iris_decode_slice(dd->dec, data, dd->buf_sizes[idx]))
+				return VA_STATUS_ERROR_DECODING_ERROR;
 			break;
 		default:
 			/* IQ matrix and friends are not needed. */
@@ -649,7 +652,8 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 	if (dd->img_n >= 64)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 
-	pitch = ALIGN(width, 16);
+	/* Match the stable surface/CAPTURE layout used by the Iris backend. */
+	pitch = ALIGN(width, 128);
 	size = (unsigned int)pitch * ALIGN(height, 32) * 3 / 2;
 	dd->img_data[dd->img_n] = calloc(1, size);
 	if (!dd->img_data[dd->img_n])
