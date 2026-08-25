@@ -1,5 +1,7 @@
 # 让 Video Decode 工作起来
 
+[English version](video-decode-setup.en.md)
+
 本文说明如何在 Xiaomi Pad 5（`nabu`、SM8150、ARM64 Ubuntu）上打通完整的
 硬件视频解码链路：
 

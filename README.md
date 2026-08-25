@@ -115,7 +115,7 @@ make check
 [`docs/chromium-integration.md`](docs/chromium-integration.md)。
 
 从全新系统打通内核、固件、VA-API、FFmpeg 和 Chrome 的完整步骤见
-[`docs/video-decode-setup.md`](docs/video-decode-setup.md)。
+[`中文`](docs/video-decode-setup.md) / [`English`](docs/video-decode-setup.en.md)。
 
 ## 已知限制
 
