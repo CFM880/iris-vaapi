@@ -22,5 +22,5 @@ udevadm control --reload-rules 2>/dev/null || true
 echo "installed $rule (dma_heap/system now writable)"
 
 install -m 0644 "$(dirname "$0")/tools/99-iris-vaapi.conf" "$modprobe_conf"
-echo "installed $modprobe_conf (cacheable H.264 CAPTURE enabled on next module load)"
+echo "installed $modprobe_conf (cacheable H.264/HEVC CAPTURE enabled on next module load)"
 echo "test: LIBVA_DRIVER_NAME=iris vainfo"
