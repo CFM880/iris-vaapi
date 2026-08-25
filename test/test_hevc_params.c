@@ -93,6 +93,23 @@ int main(void)
 	failed |= check_nal("PPS", out, n, expected_pps,
 			    sizeof(expected_pps));
 
+	/* Main10 must be signalled in both profile_tier_level structures.  The
+	 * profile_idc byte is immediately followed by compatibility flag 2. */
+	pic.bit_depth_luma_minus8 = 2;
+	pic.bit_depth_chroma_minus8 = 2;
+	n = hevc_build_vps(out, sizeof(out), &pic);
+	if (n < 8 || out[6] != 0x02 || out[7] != 0x20) {
+		fprintf(stderr, "VPS did not signal Main10 profile\n");
+		failed = 1;
+	}
+	n = hevc_build_sps(out, sizeof(out), &pic);
+	if (n < 5 || out[3] != 0x02 || out[4] != 0x20) {
+		fprintf(stderr, "SPS did not signal Main10 profile\n");
+		failed = 1;
+	}
+	pic.bit_depth_luma_minus8 = 0;
+	pic.bit_depth_chroma_minus8 = 0;
+
 	/* Exercise conditional PPS syntax: extra header bits, chroma offsets,
 	 * explicit tiles, entropy sync and deblocking offsets. */
 	pic.num_extra_slice_header_bits = 3;

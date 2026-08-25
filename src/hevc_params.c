@@ -99,17 +99,20 @@ static int hevc_escape_nal(uint8_t *out, size_t out_size, const struct bs *b)
  * authoritative parse of the x265 stream). */
 static void
 hevc_profile_tier_level(struct bs *b, int profile_present, int max_sublayers,
-			int progressive, int frame_only, int level)
+			int profile_idc, int progressive, int frame_only, int level)
 {
 	if (profile_present) {
+		uint32_t compatibility = profile_idc == 2 ?
+			0x20000000U : 0x60000000U;
+
 		bs_put(b, 0, 2);	/* general_profile_space */
 		bs_put(b, 0, 1);	/* general_tier_flag */
-		bs_put(b, 1, 5);	/* general_profile_idc = 1 (Main) */
+		bs_put(b, profile_idc, 5); /* Main=1, Main10=2 */
 		/* general_profile_compatibility_flag[32].  Real x265 writes
 		 * 0x60000000 for Main profile at every level (verified
 		 * 1080p/4K/8K); the following 0x90 belongs to the constraint
 		 * flags, not to this field. */
-		bs_put(b, 0x60000000, 32);
+		bs_put(b, compatibility, 32);
 		bs_put(b, progressive, 1);
 		bs_put(b, 0, 1);	/* general_interlaced_source_flag */
 		bs_put(b, 0, 1);	/* general_non_packed_constraint_flag */
@@ -181,7 +184,8 @@ hevc_build_vps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 3);	/* vps_max_sub_layers_minus1 */
 	bs_put(&b, 1, 1);	/* vps_temporal_id_nesting_flag */
 	bs_put(&b, 0xffff, 16);	/* vps_reserved_0xffff_16bits */
-	hevc_profile_tier_level(&b, 1, 0, 1,
+	hevc_profile_tier_level(&b, 1, 0,
+			       pic->bit_depth_luma_minus8 ? 2 : 1, 1,
 			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
 			       hevc_level_for_size(pic));
 	bs_put(&b, 1, 1);	/* vps_sub_layer_ordering_info_present */
@@ -220,7 +224,8 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0, 4);	/* sps_video_parameter_set_id */
 	bs_put(&b, 0, 3);	/* sps_max_sub_layers_minus1 */
 	bs_put(&b, 1, 1);	/* sps_temporal_id_nesting_flag */
-	hevc_profile_tier_level(&b, 1, 0, 1,
+	hevc_profile_tier_level(&b, 1, 0,
+			       pic->bit_depth_luma_minus8 ? 2 : 1, 1,
 			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
 			       hevc_level_for_size(pic));
 	bs_ue(&b, 0);		/* sps_seq_parameter_set_id */

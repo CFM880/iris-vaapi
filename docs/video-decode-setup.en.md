@@ -21,7 +21,8 @@ A working installation satisfies all of the following conditions:
 - `/dev/video0` identifies itself as `Iris Decoder`;
 - `/dev/dri/renderD128` and `/dev/dma_heap/system` are accessible;
 - both `cached_capture` and `allow_fw_boot` are `Y`;
-- `vainfo` loads `iris-vaapi 0.1.0` and lists H.264, HEVC Main, and VP9 Profile 0;
+- `vainfo` loads `iris-vaapi 0.1.0` and lists H.264, HEVC Main/Main10, and VP9
+  Profile 0/Profile 2;
 - FFmpeg or Chrome actually selects VA-API instead of a software decoder.
 
 > This is an experimental driver. The initial installation requires a custom kernel and
@@ -36,9 +37,9 @@ A working installation satisfies all of the following conditions:
 | Architecture | ARM64 / `aarch64` |
 | SoC / VPU | Qualcomm SM8150 / Iris1 |
 | H.264 | Constrained Baseline, Main, High; NV12 output |
-| HEVC | Main 8-bit; NV12 output |
-| VP9 | Profile 0; NV12 output |
-| Not supported yet | AV1, HEVC Main10/P010 |
+| HEVC | Main 8-bit/NV12; experimental Main10/P010 |
+| VP9 | Profile 0/NV12; experimental Profile 2/P010 |
+| Not supported yet | AV1 |
 
 The kernel and userspace driver must be used together:
 
@@ -233,7 +234,9 @@ VAProfileH264ConstrainedBaseline: VAEntrypointVLD
 VAProfileH264Main:                VAEntrypointVLD
 VAProfileH264High:                VAEntrypointVLD
 VAProfileHEVCMain:                VAEntrypointVLD
+VAProfileHEVCMain10:              VAEntrypointVLD
 VAProfileVP9Profile0:             VAEntrypointVLD
+VAProfileVP9Profile2:             VAEntrypointVLD
 ```
 
 Install it system-wide:

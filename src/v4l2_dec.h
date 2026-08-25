@@ -18,7 +18,7 @@ struct v4l2_dec_frame {
 	unsigned int index;		/* CAPTURE buffer index */
 	unsigned int bytesused;
 	unsigned int width, height;
-	void *mem;			/* mmap base, single NV12 plane */
+	void *mem;			/* mmap base, single semiplanar image */
 	__u32 flags;			/* V4L2_BUF_FLAG_* */
 	__u64 timestamp;
 };
@@ -26,6 +26,7 @@ struct v4l2_dec_frame {
 struct v4l2_dec {
 	int fd;
 	unsigned int width, height;	/* stream dimensions */
+	unsigned int cap_pixfmt;		/* V4L2 CAPTURE format: NV12 or P010 */
 
 	struct v4l2_format out_fmt;
 	struct v4l2_format cap_fmt;
@@ -53,10 +54,11 @@ struct v4l2_dec {
 };
 
 /* Open /dev/video0 (or @dev) for decode of a @width x @height stream using
- * the given bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...). */
+ * the given bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...) and
+ * uncompressed CAPTURE format (V4L2_PIX_FMT_NV12/P010). */
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		  unsigned int width, unsigned int height,
-		  unsigned int pixelformat);
+		  unsigned int pixelformat, unsigned int cap_pixelformat);
 /* Configure CAPTURE to import a fixed ring of caller-owned DMA-BUFs.  Must be
  * called after open and before start; the fds remain owned by the caller. */
 int v4l2_dec_set_capture_dmabufs(struct v4l2_dec *d, const int *fds,
@@ -74,7 +76,7 @@ int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len,
 		  uint64_t timestamp);
 /* Handle pending events; builds/rebuilds CAPTURE after a resolution change. */
 int v4l2_dec_handle_events(struct v4l2_dec *d, int *changed);
-/* Dequeue a decoded NV12 frame. Returns 0, 1 at EOS, -EAGAIN if none ready. */
+/* Dequeue a decoded frame. Returns 0, 1 at EOS, -EAGAIN if none ready. */
 int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame);
 /* Requeue a consumed CAPTURE buffer. */
 int v4l2_dec_qcap(struct v4l2_dec *d, const struct v4l2_dec_frame *frame);

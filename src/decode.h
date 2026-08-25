@@ -25,7 +25,8 @@ struct iris_surfs;
 struct iris_surfs *iris_surfs_create(void);
 void iris_surfs_destroy(struct iris_surfs *t);
 int iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
-		     unsigned int width, unsigned int height);
+		     unsigned int width, unsigned int height,
+		     unsigned int fourcc);
 void iris_surfs_free(struct iris_surfs *t, VASurfaceID id);
 /* Sync routing: drains the owning engine until @id is ready.  Unknown,
  * never-queued, already-decoded surfaces and surfaces whose engine is gone
@@ -37,11 +38,13 @@ int iris_surfs_ready(struct iris_surfs *t, VASurfaceID id);
 /* Export the backing of @id as a fresh DRM PRIME fd (caller owns it). */
 int iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
 		      unsigned int *pitch, unsigned int *size,
-		      unsigned int *width, unsigned int *height);
+		      unsigned int *width, unsigned int *height,
+		      unsigned int *fourcc);
 /* Backing memory layout of @id (for vaDeriveImage/vaGetImage). */
 int iris_surfs_buffer(struct iris_surfs *t, VASurfaceID id, void **mem,
 		      unsigned int *pitch, unsigned int *size,
-		      unsigned int *width, unsigned int *height);
+		      unsigned int *width, unsigned int *height,
+		      unsigned int *fourcc);
 
 /* ---- Per-context decode engines ---- */
 struct iris_decode_ctx *iris_decode_create(void);

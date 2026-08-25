@@ -245,7 +245,8 @@ slice header 会从该位开始整体错位。
 
 ### 当前边界
 
-- 已验证的是 HEVC Main 8-bit/NV12；Main10/P010 尚未实现完整 surface 路径。
+- HEVC Main10/P010 已接通内核 HFI Gen1、V4L2 CAPTURE、VA surface 与 DRM PRIME
+  导出路径，目前仍属于实验支持，需继续做 HDR 显示和长时间播放回归。
 - 原 SPS 含 long-term reference table（`num_long_term_ref_pic_sps > 0`）时，
   因 VA buffer 不含该表内容，当前明确返回不支持，不生成可能错位的码流。
 - 自定义 scaling list 通过独立 `VAIQMatrixBufferHEVC` 提交；当前 canonical SPS

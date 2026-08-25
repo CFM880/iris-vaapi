@@ -109,6 +109,7 @@ struct iris_surface {
 	void *bmap;		/* mmap of the backing */
 	unsigned int bsize;
 	unsigned int sw, sh;	/* coded size the backing was created for */
+	unsigned int fourcc;	/* VA/V4L2 layout: NV12 or P010 */
 	int decoded;		/* a frame has been copied into the backing */
 	int queued;		/* some picture was decoded into this surface */
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
@@ -181,6 +182,7 @@ struct iris_decode_ctx {
 	unsigned int width, height;
 	VAProfile profile;
 	unsigned int out_pixfmt;	/* V4L2 OUTPUT pixel format */
+	unsigned int cap_pixfmt;	/* V4L2 CAPTURE pixel format */
 	int direct_capture;
 	int direct_error;
 	unsigned int direct_count;
@@ -450,6 +452,9 @@ iris_decode_setup(struct iris_decode_ctx *ctx, unsigned int width,
 	ctx->width = width;
 	ctx->height = height;
 	ctx->profile = profile;
+	ctx->cap_pixfmt = profile == VAProfileHEVCMain10 ||
+		profile == VAProfileVP9Profile2 ? V4L2_PIX_FMT_P010 :
+		V4L2_PIX_FMT_NV12;
 	switch (profile) {
 	case VAProfileHEVCMain:
 	case VAProfileHEVCMain10:
@@ -558,7 +563,8 @@ iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id)
 	 * registry the engine is attached to. */
 	if (!ctx || !ctx->surfs)
 		return -1;
-	return iris_surfs_alloc(ctx->surfs, id, ctx->width, ctx->height);
+	return iris_surfs_alloc(ctx->surfs, id, ctx->width, ctx->height,
+				 ctx->cap_pixfmt);
 }
 
 void
@@ -626,7 +632,7 @@ iris_surfs_destroy(struct iris_surfs *t)
 
 int
 iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
-		 unsigned int width, unsigned int height)
+		 unsigned int width, unsigned int height, unsigned int fourcc)
 {
 	struct iris_surface *s;
 	unsigned int size;
@@ -640,10 +646,12 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	 * Prefer a real DMA-heap buffer so the exported fd can be imported by
 	 * GPU clients (Chrome/EGL); fall back to a plain memfd when the heap
 	 * node is root-only, which keeps local tests and CPU readback working.
-	 * Size with the layout Iris produces for linear NV12 (128-byte luma
-	 * stride, 32-aligned height). */
-	size = ALIGN_TO(width, 128) * ALIGN_TO(height, 32) * 3 / 2;
-	DBG("[surf] id=%u size=%u w=%u h=%u\n", id, size, width, height);
+	 * Size with the layout Iris produces for linear NV12/P010 (128-byte
+	 * stride, 32-aligned luma height). */
+	size = ALIGN_TO(width * (fourcc == V4L2_PIX_FMT_P010 ? 2 : 1), 128) *
+		ALIGN_TO(height, 32) * 3 / 2;
+	DBG("[surf] id=%u size=%u w=%u h=%u fourcc=%#x\n",
+	    id, size, width, height, fourcc);
 	heap = open("/dev/dma_heap/system", O_RDWR);
 	if (heap >= 0) {
 		bfd = dma_heap_alloc(heap, size);
@@ -672,6 +680,7 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	s->bsize = size;
 	s->sw = width;
 	s->sh = height;
+	s->fourcc = fourcc;
 	s->decoded = 0;
 	s->queued = 0;
 	s->write_started = 0;
@@ -712,7 +721,8 @@ static void
 surface_layout(const struct iris_surface *s, unsigned int *pitch,
 	       unsigned int *width, unsigned int *height)
 {
-	unsigned int p = ALIGN_TO(s->sw, 128);
+	unsigned int p = ALIGN_TO(s->sw *
+		(s->fourcc == V4L2_PIX_FMT_P010 ? 2 : 1), 128);
 	unsigned int w = s->sw;
 	unsigned int h = ALIGN_TO(s->sh, 32);
 
@@ -763,7 +773,8 @@ iris_surfs_ready(struct iris_surfs *t, VASurfaceID id)
 int
 iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
 		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height)
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc)
 {
 	struct iris_surface *s = surfs_find(t, id);
 	int exported_fd;
@@ -784,13 +795,15 @@ iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
 	*size = s->bsize;
 	*width = w;
 	*height = h;
+	*fourcc = s->fourcc;
 	return 0;
 }
 
 int
 iris_surfs_buffer(struct iris_surfs *t, VASurfaceID id, void **mem,
 		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height)
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc)
 {
 	struct iris_surface *s = surfs_find(t, id);
 	unsigned int p, w, h;
@@ -803,6 +816,7 @@ iris_surfs_buffer(struct iris_surfs *t, VASurfaceID id, void **mem,
 	*size = s->bsize;
 	*width = w;
 	*height = h;
+	*fourcc = s->fourcc;
 	return 0;
 }
 
@@ -825,7 +839,7 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 		}
 	}
 	ret = v4l2_dec_open(&ctx->dec, "/dev/video0", ctx->width,
-			    ctx->height, ctx->out_pixfmt);
+			    ctx->height, ctx->out_pixfmt, ctx->cap_pixfmt);
 	if (ret)
 		return ret;
 	if (ctx->direct_capture) {

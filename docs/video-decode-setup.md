@@ -21,7 +21,8 @@ SM8150 Iris1 / Venus 固件
 - `/dev/video0` 是 `Iris Decoder`；
 - `/dev/dri/renderD128` 和 `/dev/dma_heap/system` 可访问；
 - `cached_capture` 与 `allow_fw_boot` 均为 `Y`；
-- `vainfo` 加载 `iris-vaapi 0.1.0`，列出 H.264、HEVC Main 和 VP9 Profile 0；
+- `vainfo` 加载 `iris-vaapi 0.1.0`，列出 H.264、HEVC Main/Main10 和 VP9
+  Profile 0/Profile 2；
 - FFmpeg 或 Chrome 实际选择 VA-API，而不是软件解码器。
 
 > 这是实验性驱动。首次安装需要构建并启动自定义内核和 DTB，请先准备可用的
@@ -35,9 +36,9 @@ SM8150 Iris1 / Venus 固件
 | 架构 | ARM64 / `aarch64` |
 | SoC / VPU | Qualcomm SM8150 / Iris1 |
 | H.264 | Constrained Baseline、Main、High，NV12 |
-| HEVC | Main 8-bit，NV12 |
-| VP9 | Profile 0，NV12 |
-| 暂不支持 | AV1、HEVC Main10/P010 |
+| HEVC | Main 8-bit/NV12；Main10/P010（实验） |
+| VP9 | Profile 0/NV12；Profile 2/P010（实验） |
+| 暂不支持 | AV1 |
 
 内核和用户态驱动必须配套：
 
@@ -227,7 +228,9 @@ VAProfileH264ConstrainedBaseline: VAEntrypointVLD
 VAProfileH264Main:                VAEntrypointVLD
 VAProfileH264High:                VAEntrypointVLD
 VAProfileHEVCMain:                VAEntrypointVLD
+VAProfileHEVCMain10:              VAEntrypointVLD
 VAProfileVP9Profile0:             VAEntrypointVLD
+VAProfileVP9Profile2:             VAEntrypointVLD
 ```
 
 安装到系统：

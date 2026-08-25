@@ -182,7 +182,7 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	fmt.fmt.pix_mp.width = d->width;
 	fmt.fmt.pix_mp.height = d->height;
-	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+	fmt.fmt.pix_mp.pixelformat = d->cap_pixfmt;
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(d->fd, VIDIOC_S_FMT, &fmt) < 0) {
@@ -190,6 +190,7 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 		return -errno;
 	}
 	d->cap_fmt = fmt;
+	d->cap_pixfmt = fmt.fmt.pix_mp.pixelformat;
 	/* Keep the negotiated capture geometry, not merely the requested one.
 	 * This matters after a V4L2 source-change event and for codecs whose
 	 * coded dimensions are aligned differently at different resolutions. */
@@ -273,9 +274,10 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		  unsigned int width, unsigned int height,
-		  unsigned int pixelformat)
+		  unsigned int pixelformat, unsigned int cap_pixelformat)
 {
 	struct v4l2_capability cap;
+	struct v4l2_format cap_fmt;
 	struct v4l2_requestbuffers req;
 	struct v4l2_event_subscription sub;
 	unsigned int i;
@@ -307,6 +309,7 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 
 	d->width = width;
 	d->height = height;
+	d->cap_pixfmt = cap_pixelformat;
 
 	/* ---- OUTPUT (bitstream) ---- */
 	memset(&d->out_fmt, 0, sizeof(d->out_fmt));
@@ -321,6 +324,27 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	if (xioctl(d->fd, VIDIOC_S_FMT, &d->out_fmt) < 0) {
 		perror("S_FMT OUTPUT");
 		return -errno;
+	}
+
+	/* Select the raw output before OUTPUT STREAMON.  HFI Gen1 applies the
+	 * NV12/P010 and internal UBWC format pair while starting the compressed
+	 * queue; changing CAPTURE only after the first bit-depth event is too
+	 * late for 10-bit streams. */
+	memset(&cap_fmt, 0, sizeof(cap_fmt));
+	cap_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	cap_fmt.fmt.pix_mp.width = width;
+	cap_fmt.fmt.pix_mp.height = height;
+	cap_fmt.fmt.pix_mp.pixelformat = cap_pixelformat;
+	cap_fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+	cap_fmt.fmt.pix_mp.num_planes = 1;
+	if (xioctl(d->fd, VIDIOC_S_FMT, &cap_fmt) < 0) {
+		perror("S_FMT CAPTURE preconfigure");
+		return -errno;
+	}
+	if (cap_fmt.fmt.pix_mp.pixelformat != cap_pixelformat) {
+		fprintf(stderr, "CAPTURE format %#x rejected (got %#x)\n",
+			cap_pixelformat, cap_fmt.fmt.pix_mp.pixelformat);
+		return -ENOTSUP;
 	}
 
 	/* Chrome can release a VA surface for presentation before a stateful

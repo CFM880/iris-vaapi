@@ -32,6 +32,12 @@
 #ifndef DRM_FORMAT_GR88
 #define DRM_FORMAT_GR88		0x38385247	/* 'GR88' */
 #endif
+#ifndef DRM_FORMAT_R16
+#define DRM_FORMAT_R16		0x20363152	/* 'R16 ' */
+#endif
+#ifndef DRM_FORMAT_GR1616
+#define DRM_FORMAT_GR1616	0x32335247	/* 'GR32' */
+#endif
 
 #include "decode.h" 
 
@@ -84,6 +90,7 @@ struct iris_drv_data {
 	unsigned int direct_spare_count;
 	unsigned int direct_spare_width;
 	unsigned int direct_spare_height;
+	unsigned int direct_spare_fourcc;
 	int direct_pool_initialized;
 
 	/* Derived images (vaDeriveImage) map a VABufferID to a CAPTURE buffer. */
@@ -96,6 +103,7 @@ struct iris_drv_data {
 	unsigned int img_sizes[64];
 	unsigned int img_ws[64];
 	unsigned int img_hs[64];
+	unsigned int img_fourcc[64];
 	void *img_data[64];
 	int img_n;
 };
@@ -105,7 +113,9 @@ static const VAProfile iris_profiles[] = {
 	VAProfileH264Main,
 	VAProfileH264High,
 	VAProfileHEVCMain,
+	VAProfileHEVCMain10,
 	VAProfileVP9Profile0,
+	VAProfileVP9Profile2,
 };
 #define NUM_IRIS_PROFILES (sizeof(iris_profiles) / sizeof(iris_profiles[0]))
 
@@ -113,6 +123,26 @@ static const VAEntrypoint iris_entrypoints[] = {
 	VAEntrypointVLD,
 };
 #define NUM_IRIS_ENTRYPOINTS (sizeof(iris_entrypoints) / sizeof(iris_entrypoints[0]))
+
+static int
+iris_profile_is_10bit(VAProfile profile)
+{
+	return profile == VAProfileHEVCMain10 ||
+	       profile == VAProfileVP9Profile2;
+}
+
+static unsigned int
+iris_profile_fourcc(VAProfile profile)
+{
+	return iris_profile_is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+}
+
+static unsigned int
+iris_profile_rt_format(VAProfile profile)
+{
+	return iris_profile_is_10bit(profile) ?
+		VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+}
 
 static struct iris_drv_data *
 iris_drv_data(VADriverContextP ctx)
@@ -211,7 +241,7 @@ iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 	for (i = 0; i < num_attribs; i++) {
 		switch (attrib_list[i].type) {
 		case VAConfigAttribRTFormat:
-			attrib_list[i].value = VA_RT_FORMAT_YUV420;
+			attrib_list[i].value = iris_profile_rt_format(profile);
 			break;
 		case VAConfigAttribDecProcessing:
 			attrib_list[i].value = 0;
@@ -277,13 +307,16 @@ iris_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 			     VAProfile *profile, VAEntrypoint *entrypoint,
 			     VAConfigAttrib *attrib_list, int *num_attribs)
 {
-	*profile = VAProfileH264High;
+	struct iris_drv_data *dd = iris_drv_data(ctx);
+
+	*profile = dd ? dd->profile : VAProfileNone;
 	*entrypoint = VAEntrypointVLD;
 	if (attrib_list && num_attribs) {
 		/* num_attribs is an output here (clients pass uninitialized
 		 * garbage); always report one supported RT format. */
 		attrib_list[0].type = VAConfigAttribRTFormat;
-		attrib_list[0].value = VA_RT_FORMAT_YUV420;
+		attrib_list[0].value = dd ? iris_profile_rt_format(dd->profile) :
+			VA_RT_FORMAT_YUV420;
 		*num_attribs = 1;
 	} else if (num_attribs) {
 		*num_attribs = 1;
@@ -363,6 +396,7 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 {
 	struct iris_drv_data *dd;
 	struct iris_surfs *t;
+	unsigned int fourcc;
 	int i = 0;
 
 	dd = iris_drv_data(ctx);
@@ -371,10 +405,13 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	t = iris_ensure_surfs(dd);
 	if (!t)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	fourcc = (format & VA_RT_FORMAT_YUV420_10) ? VA_FOURCC_P010 :
+		iris_profile_fourcc(dd->profile);
 
 	while (i < num_surfaces && dd->direct_spare_count &&
 	       dd->direct_spare_width == (unsigned int)width &&
-	       dd->direct_spare_height == (unsigned int)height) {
+	       dd->direct_spare_height == (unsigned int)height &&
+	       dd->direct_spare_fourcc == fourcc) {
 		surfaces[i++] = dd->direct_spares[0];
 		memmove(dd->direct_spares, dd->direct_spares + 1,
 			(--dd->direct_spare_count) * sizeof(dd->direct_spares[0]));
@@ -401,10 +438,11 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 		dd->direct_pool_initialized = 1;
 		dd->direct_spare_width = width;
 		dd->direct_spare_height = height;
+		dd->direct_spare_fourcc = fourcc;
 		for (j = 0; j < allocate; j++) {
 			VASurfaceID id = ++dd->surface_id;
 
-			if (iris_surfs_alloc(t, id, width, height))
+			if (iris_surfs_alloc(t, id, width, height, fourcc))
 				return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 			if (j < requested)
 				surfaces[i++] = id;
@@ -417,7 +455,7 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	for (; i < num_surfaces; i++) {
 		VASurfaceID id = ++dd->surface_id;
 
-		if (iris_surfs_alloc(t, id, width, height))
+		if (iris_surfs_alloc(t, id, width, height, fourcc))
 			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 		surfaces[i] = id;
 	}
@@ -445,6 +483,13 @@ iris_vaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
 		       VASurfaceID *surfaces, unsigned int num_surfaces,
 		       VASurfaceAttrib *attrib_list, unsigned int num_attribs)
 {
+	unsigned int i;
+
+	for (i = 0; i < num_attribs; i++)
+		if (attrib_list[i].type == VASurfaceAttribPixelFormat &&
+		    attrib_list[i].value.type == VAGenericValueTypeInteger &&
+		    attrib_list[i].value.value.i == VA_FOURCC_P010)
+			format = VA_RT_FORMAT_YUV420_10;
 	return iris_vaCreateSurfaces(ctx, width, height, format, num_surfaces,
 				     surfaces);
 }
@@ -711,16 +756,19 @@ iris_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
 		.byte_order = VA_LSB_FIRST,
 		.bits_per_pixel = 12,
 	};
+	static const VAImageFormat p010 = {
+		.fourcc = VA_FOURCC_P010,
+		.byte_order = VA_LSB_FIRST,
+		.bits_per_pixel = 24,
+	};
 
 	if (!num_formats)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	if (format_list && *num_formats >= 1)
+	if (format_list) {
 		format_list[0] = nv12;
-	else if (!format_list)
-		*num_formats = 1;
-	else if (*num_formats < 1)
-		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-	*num_formats = 1;
+		format_list[1] = p010;
+	}
+	*num_formats = 2;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -746,9 +794,12 @@ iris_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
 			      VASurfaceAttrib *attrib_list,
 			      unsigned int *num_attribs)
 {
-	static const VASurfaceAttrib attrs[] = {
+	struct iris_drv_data *dd = iris_drv_data(dpy);
+	VASurfaceAttrib attrs[] = {
 		{ .type = VASurfaceAttribPixelFormat,
-		  .value.value.i = VA_FOURCC_NV12 },
+		  .value.type = VAGenericValueTypeInteger,
+		  .value.value.i = dd ? iris_profile_fourcc(dd->profile) :
+			VA_FOURCC_NV12 },
 		{ .type = VASurfaceAttribMinWidth, .value.value.i = 16 },
 		{ .type = VASurfaceAttribMaxWidth, .value.value.i = 4096 },
 		{ .type = VASurfaceAttribMinHeight, .value.value.i = 16 },
@@ -782,16 +833,20 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 		   int height, VAImage *image)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
-	unsigned int pitch, size;
+	unsigned int pitch, size, bytes_per_sample;
 	VABufferID bid;
 
-	if (!dd || !image)
+	if (!dd || !format || !image)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	if (dd->img_n >= 64)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+	if (format->fourcc != VA_FOURCC_NV12 &&
+	    format->fourcc != VA_FOURCC_P010)
+		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
 	/* Match the stable surface/CAPTURE layout used by the Iris backend. */
-	pitch = ALIGN(width, 128);
+	bytes_per_sample = format->fourcc == VA_FOURCC_P010 ? 2 : 1;
+	pitch = ALIGN(width * bytes_per_sample, 128);
 	size = (unsigned int)pitch * ALIGN(height, 32) * 3 / 2;
 	dd->img_data[dd->img_n] = calloc(1, size);
 	if (!dd->img_data[dd->img_n])
@@ -801,6 +856,7 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 	dd->img_sizes[dd->img_n] = size;
 	dd->img_ws[dd->img_n] = width;
 	dd->img_hs[dd->img_n] = height;
+	dd->img_fourcc[dd->img_n] = format->fourcc;
 
 	memset(image, 0, sizeof(*image));
 	image->image_id = bid;
@@ -822,14 +878,14 @@ static VAStatus
 iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
-	unsigned int pitch, size, w, h;
+	unsigned int pitch, size, w, h, fourcc;
 	void *mem;
 	VABufferID bid;
 
 	if (!dd || !image)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
-			      &w, &h))
+			      &w, &h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	if (dd->derived_n >= 256)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
@@ -843,9 +899,9 @@ iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 	image->image_id = bid;
 	image->width = w;
 	image->height = h;
-	image->format.fourcc = VA_FOURCC_NV12;
+	image->format.fourcc = fourcc;
 	image->format.byte_order = VA_LSB_FIRST;
-	image->format.bits_per_pixel = 12;
+	image->format.bits_per_pixel = fourcc == VA_FOURCC_P010 ? 24 : 12;
 	image->data_size = size;
 	image->num_planes = 2;
 	image->pitches[0] = pitch;
@@ -871,6 +927,9 @@ iris_vaDestroyImage(VADriverContextP ctx, VAImageID image)
 		dd->img_ids[i] = dd->img_ids[dd->img_n - 1];
 		dd->img_data[i] = dd->img_data[dd->img_n - 1];
 		dd->img_sizes[i] = dd->img_sizes[dd->img_n - 1];
+		dd->img_ws[i] = dd->img_ws[dd->img_n - 1];
+		dd->img_hs[i] = dd->img_hs[dd->img_n - 1];
+		dd->img_fourcc[i] = dd->img_fourcc[dd->img_n - 1];
 		dd->img_n--;
 		break;
 	}
@@ -889,7 +948,7 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 		unsigned int width, unsigned int height, VAImageID image)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
-	unsigned int pitch, size, cap_w, cap_h;
+	unsigned int pitch, size, cap_w, cap_h, fourcc;
 	int img_i = -1;
 	void *mem, *dst = NULL;
 	int i;
@@ -897,7 +956,7 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
-			      &cap_w, &cap_h))
+			      &cap_w, &cap_h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	for (i = 0; i < dd->img_n; i++)
 		if (dd->img_ids[i] == image) {
@@ -907,6 +966,8 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 		}
 	if (!dst)
 		return VA_STATUS_ERROR_INVALID_IMAGE;
+	if (dd->img_fourcc[img_i] != fourcc)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* The image was created with the aligned coded layout; the buffer may
 	 * carry the CAPTURE-negotiated one.  Copy row-wise between them so
@@ -914,7 +975,8 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 	{
 		unsigned int img_w = dd->img_ws[img_i];
 		unsigned int img_h = dd->img_hs[img_i];
-		unsigned int img_pitch = ALIGN(img_w, 128);
+		unsigned int img_pitch = ALIGN(img_w *
+			(fourcc == VA_FOURCC_P010 ? 2 : 1), 128);
 		unsigned int img_chroma = img_pitch * ALIGN(img_h, 32);
 		unsigned int rows = img_h < cap_h ? img_h : cap_h;
 		unsigned int row_bytes = pitch < img_pitch ? pitch : img_pitch;
@@ -1020,7 +1082,7 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
 	VADRMPRIMESurfaceDescriptor *d = descriptor;
-	unsigned int w, h, pitch, size;
+	unsigned int w, h, pitch, size, fourcc;
 	int fd;
 
 	if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
@@ -1031,11 +1093,11 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	DBG("[export] surf=%u type=%u flags=0x%x\n", surface_id,
 	    mem_type, flags);
 	if (iris_surfs_export(dd->surfs, surface_id, &fd, &pitch, &size,
-			      &w, &h))
+			      &w, &h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
 	memset(d, 0, sizeof(*d));
-	d->fourcc = VA_FOURCC_NV12;
+	d->fourcc = fourcc;
 	d->width = w;
 	d->height = h;
 	d->num_objects = 1;
@@ -1043,15 +1105,17 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	d->objects[0].size = size;
 	d->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 	/* Chrome requests VA_EXPORT_SURFACE_SEPARATE_LAYERS and DCHECKs that
-	 * each layer carries exactly one plane, so describe NV12 as two
+	 * each layer carries exactly one plane, so describe NV12/P010 as two
 	 * single-plane layers sharing the one backing object. */
 	d->num_layers = 2;
-	d->layers[0].drm_format = DRM_FORMAT_R8;
+	d->layers[0].drm_format = fourcc == VA_FOURCC_P010 ?
+		DRM_FORMAT_R16 : DRM_FORMAT_R8;
 	d->layers[0].num_planes = 1;
 	d->layers[0].object_index[0] = 0;
 	d->layers[0].offset[0] = 0;
 	d->layers[0].pitch[0] = pitch;
-	d->layers[1].drm_format = DRM_FORMAT_GR88;
+	d->layers[1].drm_format = fourcc == VA_FOURCC_P010 ?
+		DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
 	d->layers[1].num_planes = 1;
 	d->layers[1].object_index[0] = 0;
 	/* surfs_export returned the CAPTURE-negotiated layout height in @h,
@@ -1133,7 +1197,7 @@ __vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
 	ctx->max_profiles = NUM_IRIS_PROFILES;
 	ctx->max_entrypoints = NUM_IRIS_ENTRYPOINTS;
 	ctx->max_attributes = 1;
-	ctx->max_image_formats = 1;
+	ctx->max_image_formats = 2;
 	ctx->max_subpic_formats = 1;
 	ctx->max_display_attributes = 0;
 	ctx->str_vendor = IRIS_VAAPI_VENDOR IRIS_VAAPI_VERSION;

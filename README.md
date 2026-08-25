@@ -13,8 +13,8 @@ stateful V4L2 解码器。
 | 格式 | VA-API profile | 输出 | 状态 |
 |---|---|---|---|
 | H.264 | Constrained Baseline / Main / High | NV12 | 已验证 |
-| HEVC | Main 8-bit | NV12 | 已验证 |
-| VP9 | Profile 0 | NV12 | 已验证 |
+| HEVC | Main / Main10 | NV12 / P010 | 8-bit 已验证；10-bit 实验支持 |
+| VP9 | Profile 0 / Profile 2 | NV12 / P010 | 8-bit 已验证；10-bit 实验支持 |
 
 H.264 与 HEVC 支持 Chrome 所需的稳定 DMA-BUF surface、异步 fence、解码顺序
 输出和片尾帧释放。实验性的 V4L2 CAPTURE 直连可通过
@@ -50,7 +50,8 @@ make -j"$(nproc)"
 LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 ```
 
-预期能看到 H.264、HEVC Main 和 VP9 Profile 0 的 `VAEntrypointVLD`。
+预期能看到 H.264、HEVC Main/Main10 和 VP9 Profile 0/Profile 2 的
+`VAEntrypointVLD`。
 
 无需安装即可让 FFmpeg 使用当前构建：
 
@@ -119,7 +120,8 @@ make check
 
 ## 已知限制
 
-- 仅验证 SM8150 Iris1 和 NV12 8-bit；HEVC Main10/P010 尚未完成；
+- 10-bit P010 路径需要配套的 `nabu-iris` 内核模块，仍需更多 Chrome/HDR
+  显示链路回归；
 - stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；
 - `IRIS_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
 - 非正常终止旧内核会话可能使固件超时，需要重载 `qcom_iris`；
