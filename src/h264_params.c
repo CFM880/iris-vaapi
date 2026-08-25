@@ -54,11 +54,9 @@ static int profile_idc(VAProfile profile)
 		return 66;
 	case VAProfileH264Main:
 		return 77;
-	case VAProfileH264High:
-	case VAProfileH264High10:
-	case VAProfileH264High422:
-		return 100;
 	default:
+		/* High and any newer H.264 profile use the High syntax here.
+		 * Keep this independent of enum values added by newer libva. */
 		return 100;
 	}
 }
