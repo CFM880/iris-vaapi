@@ -83,10 +83,31 @@ static size_t unescape(uint8_t *out, const uint8_t *in, size_t len)
 	return n;
 }
 
+static size_t escape(uint8_t *out, const uint8_t *in, size_t len)
+{
+	size_t i, n = 0;
+	unsigned int zeros = 0;
+
+	out[n++] = in[0];
+	out[n++] = in[1];
+	for (i = 2; i < len; i++) {
+		if (zeros >= 2 && in[i] <= 3) {
+			out[n++] = 3;
+			zeros = 0;
+		}
+		out[n++] = in[i];
+		if (in[i] == 0)
+			zeros++;
+		else
+			zeros = 0;
+	}
+	return n;
+}
+
 static size_t make_sps_index_slice(uint8_t *nal, size_t *header_size)
 {
 	struct bits b = {0};
-	static const uint8_t payload[] = { 0xa5, 0x5a, 0x7e };
+	static const uint8_t payload[] = { 0x00, 0x00, 0x01, 0x03, 0xa5, 0x7e };
 
 	put_bits(&b, 0x02, 8); /* TRAIL_R */
 	put_bits(&b, 0x01, 8);
@@ -102,8 +123,7 @@ static size_t make_sps_index_slice(uint8_t *nal, size_t *header_size)
 		put_bit(&b, 0);
 	*header_size = b.bit >> 3;
 	memcpy(b.data + *header_size, payload, sizeof(payload));
-	memcpy(nal, b.data, *header_size + sizeof(payload));
-	return *header_size + sizeof(payload);
+	return escape(nal, b.data, *header_size + sizeof(payload));
 }
 
 static void init_picture(VAPictureParameterBufferHEVC *pic)
@@ -179,8 +199,8 @@ int main(void)
 	failed |= get_bit(rbsp, &bit) != 1;     /* new alignment bit */
 	while (bit & 7)
 		failed |= get_bit(rbsp, &bit) != 0;
-	if (rbsp_size - (bit >> 3) != 3 ||
-	    memcmp(rbsp + (bit >> 3), "\xa5\x5a\x7e", 3)) {
+	if (rbsp_size - (bit >> 3) != 6 ||
+	    memcmp(rbsp + (bit >> 3), "\x00\x00\x01\x03\xa5\x7e", 6)) {
 		fprintf(stderr, "CABAC payload changed\n");
 		failed = 1;
 	}

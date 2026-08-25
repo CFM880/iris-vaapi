@@ -116,17 +116,18 @@ static unsigned int ceil_log2(unsigned int value)
 	return bits;
 }
 
-static int unescape_nal(uint8_t *out, size_t out_size,
-			const uint8_t *in, size_t in_size)
+static int unescape_nal_prefix(uint8_t *out, size_t out_size,
+			       const uint8_t *in, size_t in_size,
+			       size_t prefix_size, size_t *in_used)
 {
 	size_t i, n = 0;
 	unsigned int zeros = 0;
 
-	if (in_size < 2 || out_size < in_size)
+	if (in_size < 2 || prefix_size < 2 || out_size < prefix_size)
 		return -EINVAL;
 	out[n++] = in[0];
 	out[n++] = in[1];
-	for (i = 2; i < in_size; i++) {
+	for (i = 2; i < in_size && n < prefix_size; i++) {
 		uint8_t v = in[i];
 
 		if (zeros >= 2 && v == 3 && i + 1 < in_size && in[i + 1] <= 3) {
@@ -141,7 +142,10 @@ static int unescape_nal(uint8_t *out, size_t out_size,
 		else
 			zeros = 0;
 	}
-	return (int)n;
+	if (n != prefix_size)
+		return -EINVAL;
+	*in_used = i;
+	return 0;
 }
 
 static int escape_nal(uint8_t *out, size_t out_size,
@@ -271,28 +275,35 @@ int hevc_rewrite_slice(uint8_t *out, size_t out_size,
 	struct bit_writer w;
 	struct short_ref refs[15];
 	uint8_t *rbsp = NULL, *new_rbsp = NULL;
-	size_t header_bytes, syntax_end, rps_start, old_rps_end, i;
+	size_t header_bytes, ebsp_header_bytes, new_rbsp_cap;
+	size_t syntax_end, rps_start, old_rps_end, i;
 	unsigned int value, first, dependent = 0, negative, positive;
 	unsigned int nal_type, ctb_log2, width_ctbs, height_ctbs;
 	unsigned int address_bits, old_flag;
-	int rbsp_size, ref_count, ret = -EINVAL;
+	int ref_count, ret = -EINVAL;
 
 	if (!out || !nal || !pic || !slice || !pps_id || nal_size < 3)
 		return -EINVAL;
 
-	rbsp = malloc(nal_size);
-	new_rbsp = calloc(1, out_size);
+	header_bytes = slice->slice_data_byte_offset;
+	if (header_bytes < 3 || header_bytes > nal_size ||
+	    header_bytes > SIZE_MAX - 256)
+		return -EINVAL;
+	new_rbsp_cap = header_bytes + 256;
+	if (new_rbsp_cap > out_size)
+		new_rbsp_cap = out_size;
+	rbsp = malloc(header_bytes);
+	new_rbsp = calloc(1, new_rbsp_cap);
 	if (!rbsp || !new_rbsp) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	rbsp_size = unescape_nal(rbsp, nal_size, nal, nal_size);
-	if (rbsp_size < 0) {
-		ret = rbsp_size;
+	ret = unescape_nal_prefix(rbsp, header_bytes, nal, nal_size,
+				  header_bytes, &ebsp_header_bytes);
+	if (ret < 0)
 		goto out;
-	}
 	r.data = rbsp;
-	r.size_bits = (size_t)rbsp_size * 8;
+	r.size_bits = header_bytes * 8;
 	r.bit = 16;
 	nal_type = (nal[0] >> 1) & 0x3f;
 
@@ -367,9 +378,7 @@ int hevc_rewrite_slice(uint8_t *out, size_t out_size,
 		goto out;
 	}
 
-	header_bytes = slice->slice_data_byte_offset;
-	if (header_bytes < 3 || header_bytes > (size_t)rbsp_size ||
-	    rbsp[header_bytes - 1] == 0)
+	if (rbsp[header_bytes - 1] == 0)
 		goto out;
 	syntax_end = header_bytes * 8 -
 		((unsigned int)__builtin_ctz((unsigned int)rbsp[header_bytes - 1]) + 1);
@@ -383,7 +392,7 @@ int hevc_rewrite_slice(uint8_t *out, size_t out_size,
 	}
 
 	w.data = new_rbsp;
-	w.size = out_size;
+	w.size = new_rbsp_cap;
 	w.bit = 0;
 	w.error = 0;
 	for (i = 0; i < rps_start; i++)
@@ -395,13 +404,29 @@ int hevc_rewrite_slice(uint8_t *out, size_t out_size,
 	bw_bit(&w, 1);
 	while (w.bit & 7)
 		bw_bit(&w, 0);
-	for (i = header_bytes; i < (size_t)rbsp_size; i++)
-		bw_bits(&w, rbsp[i], 8);
 	if (w.error) {
 		ret = w.error;
 		goto out;
 	}
+	/* Both the old and new slice headers end with a non-zero alignment byte,
+	 * so emulation-prevention state is reset at this boundary.  Escape only
+	 * the rewritten header and append the original EBSP CABAC payload. */
 	ret = escape_nal(out, out_size, new_rbsp, w.bit >> 3);
+	if (ret >= 0) {
+		size_t payload_size = nal_size - ebsp_header_bytes;
+
+		if ((size_t)ret > out_size ||
+		    payload_size > out_size - (size_t)ret) {
+			ret = -ENOSPC;
+			goto out;
+		}
+		if (payload_size > (size_t)(INT_MAX - ret)) {
+			ret = -EOVERFLOW;
+			goto out;
+		}
+		memcpy(out + ret, nal + ebsp_header_bytes, payload_size);
+		ret += (int)payload_size;
+	}
 
 out:
 	free(new_rbsp);

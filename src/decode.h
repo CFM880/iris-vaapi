@@ -53,6 +53,10 @@ void iris_decode_setup(struct iris_decode_ctx *ctx, unsigned int width,
 /* Attach the display-level registry this engine reads/writes surfaces in. */
 void iris_decode_set_surfaces(struct iris_decode_ctx *ctx,
 			      struct iris_surfs *t);
+/* Bind context render targets for the opt-in direct CAPTURE DMA-BUF ring. */
+int iris_decode_set_render_targets(struct iris_decode_ctx *ctx,
+				   const VASurfaceID *targets,
+				   unsigned int count);
 /* Legacy shims: allocate/free a surface in the attached registry. */
 int iris_decode_create_surface(struct iris_decode_ctx *ctx, VASurfaceID id);
 void iris_decode_destroy_surface(struct iris_decode_ctx *ctx, VASurfaceID id);

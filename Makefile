@@ -31,11 +31,11 @@ DECODE_OBJ = $(BUILD)/decode.o
 
 $(DRIVER): src/iris_vaapi.c $(BUILD)/decode.o $(BUILD)/v4l2_dec.o $(BUILD)/h264_params.o $(BUILD)/hevc_params.o $(HEVC_REWRITE_OBJ)
 	@mkdir -p $(BUILD)
-	$(CC) -O0 -g -Wall -Wextra -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(LDFLAGS)
 
 $(DECODE_OBJ): src/decode.c src/decode.h src/v4l2_dec.h src/h264_params.h src/hevc_params.h src/hevc_slice_rewrite.h
 	@mkdir -p $(BUILD)
-	$(CC) -O0 -g $(CFLAGS) $(CPPFLAGS) -Isrc -c -o $@ src/decode.c
+	$(CC) $(CFLAGS) -g $(CPPFLAGS) -Isrc -c -o $@ src/decode.c
 
 $(HEVC_OBJ): src/hevc_params.c src/hevc_params.h
 	@mkdir -p $(BUILD)

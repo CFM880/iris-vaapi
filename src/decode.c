@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
@@ -48,6 +49,15 @@ static int dbg_enabled(void)
 }
 
 #define DBG(...)	do { if (dbg_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
+
+static uint64_t
+monotonic_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static int
 dma_heap_alloc(int heap_fd, unsigned int size)
@@ -147,32 +157,14 @@ surface_begin_write(struct v4l2_dec *dec, struct iris_surface *s,
 	}
 }
 
-static int
-surface_copy(struct v4l2_dec *dec, struct iris_surface *s,
-	     const void *src, size_t size)
+static void
+surface_begin_device_write(struct v4l2_dec *dec, struct iris_surface *s,
+			   uint64_t token)
 {
-	int sync_started = s->write_started;
-
-	if (size > s->bsize)
-		return -E2BIG;
-	/* The backing is imported by Chrome's GPU process while this process
-	 * updates it through an mmap.  DMA_BUF_IOCTL_SYNC supplies the required
-	 * ownership/cache transition on non-coherent ARM systems; without it,
-	 * 4K frames can be sampled with stale cache lines and appear torn or
-	 * partially corrupted.  memfd fallback buffers do not support this
-	 * ioctl and remain ordinary coherent CPU mappings. */
-	if (!sync_started && dma_buf_cpu_sync(s->bfd,
-				    DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
-		sync_started = 1;
-	} else if (!sync_started && errno != ENOTTY && errno != EINVAL) {
-		return -errno;
-	}
-
-	memcpy(s->bmap, src, size);
-
-	if (sync_started)
-		return surface_finish_write(dec, s);
-	return 0;
+	if (s->write_started || s->fence_token)
+		surface_finish_write(dec, s);
+	if (!v4l2_dec_attach_surface_fence(dec, s->bfd, token))
+		s->fence_token = token;
 }
 
 /* Display-level registry: surfaces may outlive the engine that decodes into
@@ -189,6 +181,15 @@ struct iris_decode_ctx {
 	unsigned int width, height;
 	VAProfile profile;
 	unsigned int out_pixfmt;	/* V4L2 OUTPUT pixel format */
+	int direct_capture;
+	int direct_error;
+	unsigned int direct_count;
+	unsigned int direct_requested_count;
+	struct {
+		VASurfaceID id;
+		int fd;
+		size_t size;
+	} direct[IRIS_MAX_SURFACES];
 
 	struct iris_surfs *surfs;	/* not owned */
 
@@ -199,6 +200,8 @@ struct iris_decode_ctx {
 	uint8_t *slice_data;
 	size_t slice_len;
 	size_t slice_cap;
+	uint8_t *au_data;
+	size_t au_cap;
 	VASurfaceID current_target;
 	uint64_t current_generation;
 
@@ -256,7 +259,59 @@ struct iris_decode_ctx {
 		uint64_t generation;
 	} hevc_ring[IRIS_HEVC_RING];
 	unsigned int hevc_ring_head, hevc_ring_len;
+
+	int stats_enabled;
+	uint64_t stats_copy_ns;
+	uint64_t stats_copy_bytes;
+	uint64_t stats_copy_frames;
+	uint64_t stats_sync_ns;
+	uint64_t stats_rewrite_ns;
+	uint64_t stats_rewrite_bytes;
+	uint64_t stats_rewrites;
+	uint64_t stats_end_ns;
+	uint64_t stats_ends;
+	uint64_t stats_direct_frames;
 };
+
+static int
+surface_copy(struct iris_decode_ctx *ctx, struct iris_surface *s,
+	     const void *src, size_t size)
+{
+	int sync_started = s->write_started;
+	int ret = 0;
+	uint64_t start;
+
+	if (size > s->bsize)
+		return -E2BIG;
+	/* The backing is imported by Chrome's GPU process while this process
+	 * updates it through an mmap.  DMA_BUF_IOCTL_SYNC supplies the required
+	 * ownership/cache transition on non-coherent ARM systems; without it,
+	 * 4K frames can be sampled with stale cache lines and appear torn or
+	 * partially corrupted.  memfd fallback buffers do not support this
+	 * ioctl and remain ordinary coherent CPU mappings. */
+	if (!sync_started && dma_buf_cpu_sync(s->bfd,
+				    DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
+		sync_started = 1;
+	} else if (!sync_started && errno != ENOTTY && errno != EINVAL) {
+		return -errno;
+	}
+
+	start = ctx->stats_enabled ? monotonic_ns() : 0;
+	memcpy(s->bmap, src, size);
+	if (ctx->stats_enabled) {
+		ctx->stats_copy_ns += monotonic_ns() - start;
+		ctx->stats_copy_bytes += size;
+		ctx->stats_copy_frames++;
+	}
+
+	if (sync_started) {
+		start = ctx->stats_enabled ? monotonic_ns() : 0;
+		ret = surface_finish_write(&ctx->dec, s);
+		if (ctx->stats_enabled)
+			ctx->stats_sync_ns += monotonic_ns() - start;
+	}
+	return ret;
+}
 
 static void
 finish_pending_writes(struct iris_decode_ctx *ctx)
@@ -341,6 +396,7 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 	ctx->raw_hevc_pps_len = 0;
 	ctx->hevc_ring_head = 0;
 	ctx->hevc_ring_len = 0;
+	ctx->direct_error = 0;
 	target_ring_reset(ctx);
 	ctx->seq = 0;
 }
@@ -348,7 +404,11 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 struct iris_decode_ctx *
 iris_decode_create(void)
 {
-	return calloc(1, sizeof(struct iris_decode_ctx));
+	struct iris_decode_ctx *ctx = calloc(1, sizeof(*ctx));
+
+	if (ctx)
+		ctx->stats_enabled = getenv("IRIS_VAAPI_STATS") != NULL;
+	return ctx;
 }
 
 void
@@ -360,8 +420,26 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 		finish_pending_writes(ctx);
 		v4l2_dec_close(&ctx->dec);
 	}
+	if (ctx->stats_enabled) {
+		double copy_sec = ctx->stats_copy_ns / 1e9;
+
+		fprintf(stderr,
+			"[iris-stats] frames=%llu direct=%llu copy=%.3fs %.1fGiB/s sync=%.3fs rewrite=%llu/%.1fMiB %.3fs end=%llu %.3fs\n",
+			(unsigned long long)ctx->stats_copy_frames,
+			(unsigned long long)ctx->stats_direct_frames,
+			copy_sec,
+			copy_sec > 0 ? ctx->stats_copy_bytes / copy_sec /
+				(1024.0 * 1024.0 * 1024.0) : 0.0,
+			ctx->stats_sync_ns / 1e9,
+			(unsigned long long)ctx->stats_rewrites,
+			ctx->stats_rewrite_bytes / (1024.0 * 1024.0),
+			ctx->stats_rewrite_ns / 1e9,
+			(unsigned long long)ctx->stats_ends,
+			ctx->stats_end_ns / 1e9);
+	}
 	detach_owned_surfaces(ctx);
 	free(ctx->slice_data);
+	free(ctx->au_data);
 	free(ctx);
 }
 
@@ -393,6 +471,84 @@ void
 iris_decode_set_surfaces(struct iris_decode_ctx *ctx, struct iris_surfs *t)
 {
 	ctx->surfs = t;
+}
+
+static unsigned int
+direct_collect_surfaces(struct iris_decode_ctx *ctx)
+{
+	unsigned int i, count = 0;
+
+	for (i = 0; i < (unsigned int)ctx->surfs->n &&
+	     count < ARRAY_SIZE(ctx->direct); i++) {
+		struct iris_surface *s = &ctx->surfs->s[i];
+
+		if (s->sw != ctx->width || s->sh != ctx->height ||
+		    s->bfd < 0 || (s->owner && s->owner != ctx))
+			continue;
+		ctx->direct[count].id = s->id;
+		ctx->direct[count].fd = s->bfd;
+		ctx->direct[count].size = s->bsize;
+		count++;
+	}
+	ctx->direct_count = count;
+	return count;
+}
+
+int
+iris_decode_set_render_targets(struct iris_decode_ctx *ctx,
+			       const VASurfaceID *targets, unsigned int count)
+{
+	const char *slots_env;
+	unsigned int i, direct_count = 0;
+
+	if (!getenv("IRIS_DIRECT_CAPTURE") ||
+	    ctx->out_pixfmt != V4L2_PIX_FMT_HEVC)
+		return 0;
+	if (targets && count >= 4) {
+		if (count > ARRAY_SIZE(ctx->direct))
+			return -EINVAL;
+		for (i = 0; i < count; i++) {
+			struct iris_surface *s = find_surface(ctx, targets[i]);
+
+			if (!s || s->bfd < 0)
+				return -EINVAL;
+			ctx->direct[i].id = targets[i];
+			ctx->direct[i].fd = s->bfd;
+			ctx->direct[i].size = s->bsize;
+		}
+		direct_count = count;
+		ctx->direct_requested_count = count;
+	} else {
+		direct_count = direct_collect_surfaces(ctx);
+		/* A dynamic libva pool exposes only one new target at a time.  Its
+		 * eventual cycle length cannot be inferred from that first request,
+		 * while a stateful decoder needs the complete CAPTURE queue ordering
+		 * up front.  Keep the experiment deterministic by requiring its ring
+		 * size; fixed-pool clients already supply all render targets above. */
+		slots_env = getenv("IRIS_DIRECT_CAPTURE_SLOTS");
+		if (slots_env && *slots_env) {
+			char *end;
+			unsigned long slots = strtoul(slots_env, &end, 10);
+
+			if (*end || slots < 4 ||
+			    slots > ARRAY_SIZE(ctx->direct))
+				return -EINVAL;
+			ctx->direct_requested_count = (unsigned int)slots;
+			if (direct_count > slots)
+				direct_count = (unsigned int)slots;
+		} else {
+			fprintf(stderr,
+				"iris-vaapi: direct CAPTURE needs a fixed render-target pool; dynamic clients must set IRIS_DIRECT_CAPTURE_SLOTS\n");
+			return -ENOTSUP;
+		}
+	}
+	ctx->direct_count = direct_count;
+	ctx->direct_capture = 1;
+	fprintf(stderr,
+		"iris-vaapi: experimental direct CAPTURE ring: %s%u/%u surfaces\n",
+		direct_count < ctx->direct_requested_count ? "deferred " : "",
+		direct_count, ctx->direct_requested_count);
+	return 0;
 }
 
 int
@@ -672,8 +828,41 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 			    ctx->height, ctx->out_pixfmt);
 	if (ret)
 		return ret;
+	if (ctx->direct_capture) {
+		int fds[IRIS_MAX_SURFACES];
+		size_t sizes[IRIS_MAX_SURFACES];
+		unsigned int i;
+
+		direct_collect_surfaces(ctx);
+		if (ctx->direct_count < ctx->direct_requested_count) {
+			v4l2_dec_close(&ctx->dec);
+			return -EINVAL;
+		}
+		ctx->direct_count = ctx->direct_requested_count;
+		for (i = 0; i < ctx->direct_count; i++) {
+			fds[i] = ctx->direct[i].fd;
+			sizes[i] = ctx->direct[i].size;
+		}
+		ret = v4l2_dec_set_capture_dmabufs(&ctx->dec, fds, sizes,
+						     ctx->direct_count);
+		if (ret) {
+			v4l2_dec_close(&ctx->dec);
+			return ret;
+		}
+	}
 	ctx->dec_open = 1;
 	return 0;
+}
+
+static int
+direct_surface_index(struct iris_decode_ctx *ctx, VASurfaceID id)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->direct_count; i++)
+		if (ctx->direct[i].id == id)
+			return (int)i;
+	return -1;
 }
 
 static void
@@ -770,6 +959,28 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	}
+	if (ctx->direct_capture) {
+		VASurfaceID actual;
+
+		if (frame->index >= ctx->direct_count) {
+			ctx->direct_error = -ERANGE;
+			return -1;
+		}
+		actual = ctx->direct[frame->index].id;
+		if (actual != id) {
+			fprintf(stderr,
+				"direct CAPTURE order mismatch: slot=%u surface=%u expected=%u\n",
+				frame->index, actual, id);
+			ctx->direct_error = -EIO;
+			return -1;
+		}
+		surface_finish_write(&ctx->dec, s);
+		s->decoded = 1;
+		s->queued = 1;
+		s->owner = ctx;
+		ctx->stats_direct_frames++;
+		return id;
+	}
 	/* Copy the decoded frame into the surface's stable DMA-heap backing so
 	 * buffers exported before decoding stay valid, then recycle the
 	 * firmware buffer. */
@@ -782,7 +993,7 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	} else if (frame->bytesused) {
-		int copy_ret = surface_copy(&ctx->dec, s, frame->mem,
+		int copy_ret = surface_copy(ctx, s, frame->mem,
 					    frame->bytesused);
 
 		if (copy_ret < 0) {
@@ -910,6 +1121,8 @@ drain_available(struct iris_decode_ctx *ctx)
 		if (ret < 0)
 			break;
 		assign_frame(ctx, &frame);
+		if (ctx->direct_error)
+			return ctx->direct_error;
 	}
 	return 0;
 }
@@ -918,6 +1131,29 @@ int
 iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 {
 	struct iris_surface *s = find_surface(ctx, target);
+	int direct_index = ctx->direct_capture ?
+		direct_surface_index(ctx, target) : -1;
+
+	if (ctx->direct_error)
+		return ctx->direct_error;
+	/* Chrome creates its VAContext before it asks for the first surface.  The
+	 * opt-in pool preallocation has happened by the first BeginPicture, so bind
+	 * the deferred fixed ring here, before V4L2 is opened. */
+	if (ctx->direct_capture && direct_index < 0 && !ctx->dec_open) {
+		direct_collect_surfaces(ctx);
+		if (ctx->direct_count >= ctx->direct_requested_count)
+			ctx->direct_count = ctx->direct_requested_count;
+		direct_index = direct_surface_index(ctx, target);
+	}
+	if (ctx->direct_capture && direct_index < 0)
+		return -EINVAL;
+	if (ctx->direct_capture && ctx->dec_started &&
+	    !ctx->dec.cap_queued[direct_index]) {
+		int ret = v4l2_dec_qcap_idx(&ctx->dec, direct_index);
+
+		if (ret)
+			return ret;
+	}
 
 	DBG("[begin] target=%u decoded=%d queued=%d generation=%llu\n",
 	    target, s ? s->decoded : -1, s ? s->queued : -1,
@@ -1089,6 +1325,7 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 			size_t rewritten_cap, nal_len;
 			unsigned int pps_id;
 			int sc, rewritten_len;
+			uint64_t rewrite_start;
 
 			if ((uint64_t)off + size > data_len || !ctx->have_hevc_pic)
 				return -1;
@@ -1098,9 +1335,27 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 			if (nal_len > (SIZE_MAX - 1024) / 2)
 				return -1;
 			rewritten_cap = nal_len * 2 + 1024;
-			rewritten = malloc(rewritten_cap);
-			if (!rewritten)
+			rewrite_start = ctx->stats_enabled ? monotonic_ns() : 0;
+			if (ctx->slice_len > SIZE_MAX - 4 ||
+			    rewritten_cap > SIZE_MAX - ctx->slice_len - 4)
 				return -1;
+			need = 4 + rewritten_cap;
+			if (ctx->slice_len + need > ctx->slice_cap) {
+				size_t ncap = ctx->slice_cap ? ctx->slice_cap : (1 << 20);
+
+				while (ncap < ctx->slice_len + need) {
+					if (ncap > SIZE_MAX / 2)
+						return -1;
+					ncap *= 2;
+				}
+				void *n = realloc(ctx->slice_data, ncap);
+
+				if (!n)
+					return -1;
+				ctx->slice_data = n;
+				ctx->slice_cap = ncap;
+			}
+			rewritten = ctx->slice_data + ctx->slice_len + 4;
 			rewritten_len = hevc_rewrite_slice(rewritten, rewritten_cap,
 							 p + sc, nal_len,
 							 &ctx->hevc_pic, sp,
@@ -1108,46 +1363,27 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 			if (rewritten_len < 0) {
 				fprintf(stderr, "HEVC slice rewrite failed: %d\n",
 					rewritten_len);
-				free(rewritten);
 				return rewritten_len;
 			}
 			if (ctx->hevc_pps_id < 0)
 				ctx->hevc_pps_id = (int)pps_id;
 			else if (ctx->hevc_pps_id != (int)pps_id) {
-				free(rewritten);
 				return -1;
 			}
 			if ((size_t)rewritten_len != nal_len ||
 			    memcmp(rewritten, p + sc, nal_len))
 				ctx->hevc_rewritten = 1;
-			need = (size_t)rewritten_len + 4;
-			if (ctx->slice_len + need > ctx->slice_cap) {
-				size_t ncap = ctx->slice_cap ? ctx->slice_cap : (1 << 20);
-
-				while (ncap < ctx->slice_len + need) {
-					if (ncap > SIZE_MAX / 2) {
-						free(rewritten);
-						return -1;
-					}
-					ncap *= 2;
-				}
-				void *n = realloc(ctx->slice_data, ncap);
-				if (!n) {
-					free(rewritten);
-					return -1;
-				}
-				ctx->slice_data = n;
-				ctx->slice_cap = ncap;
-			}
 			{
 				static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 				memcpy(ctx->slice_data + ctx->slice_len, sc4, 4);
 				ctx->slice_len += 4;
 			}
-			memcpy(ctx->slice_data + ctx->slice_len, rewritten,
-			       rewritten_len);
 			ctx->slice_len += rewritten_len;
-			free(rewritten);
+			if (ctx->stats_enabled) {
+				ctx->stats_rewrite_ns += monotonic_ns() - rewrite_start;
+				ctx->stats_rewrite_bytes += nal_len;
+				ctx->stats_rewrites++;
+			}
 		}
 		ctx->hevc_slice_next += use;
 		return 0;
@@ -1179,6 +1415,7 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 {
 	uint8_t *au;
 	int rv;
+	uint64_t end_start = ctx->stats_enabled ? monotonic_ns() : 0;
 
 	DBG("[end] target=%u slice_len=%zu refs=%d/%d started=%d\n",
 	    ctx->current_target, ctx->slice_len, ctx->refs_l0, ctx->refs_l1,
@@ -1199,14 +1436,18 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC)
 		au_cap += sizeof(ctx->raw_hevc_vps) + sizeof(ctx->raw_hevc_sps) +
 			  sizeof(ctx->raw_hevc_pps) + 16;
-	au = malloc(au_cap);
-	if (!au)
-		return -1;
-	ret = ensure_decoder(ctx);
-	if (ret) {
-		free(au);
-		return ret;
+	if (ctx->au_cap < au_cap) {
+		void *n = realloc(ctx->au_data, au_cap);
+
+		if (!n)
+			return -1;
+		ctx->au_data = n;
+		ctx->au_cap = au_cap;
 	}
+	au = ctx->au_data;
+	ret = ensure_decoder(ctx);
+	if (ret)
+		return ret;
 
 	/* Assemble the access unit to feed the stateful firmware.
 	 *
@@ -1220,7 +1461,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		au_len = ctx->slice_len;
 		memcpy(au, ctx->slice_data, au_len);
 	} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
-		int raw_in_au = hevc_cache_raw_parameter_sets(ctx);
+		int raw_in_au = ctx->hevc_rewritten ? 0 :
+			hevc_cache_raw_parameter_sets(ctx);
 		/* If the client provided complete parameter NALs, pass the original
 		 * Annex-B access unit through unchanged.  This is the native input
 		 * contract of the stateful Iris V4L2 decoder. */
@@ -1253,7 +1495,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		n = hevc_build_vps(au + 4, au_cap - 4 - ctx->slice_len,
 				   &ctx->hevc_pic);
 		if (n <= 0) {
-			free(au);
 			return -1;
 		}
 		if (n > 0 && (n != ctx->last_hevc_vps_len ||
@@ -1266,7 +1507,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		n = hevc_build_sps(au + au_len + 4, au_cap - au_len - 4 -
 				   ctx->slice_len, &ctx->hevc_pic);
 		if (n <= 0) {
-			free(au);
 			return -1;
 		}
 		if (n > 0 && (n != ctx->last_hevc_sps_len ||
@@ -1281,7 +1521,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 				      ctx->hevc_pps_id < 0 ? 0 :
 				      (unsigned int)ctx->hevc_pps_id);
 		if (n <= 0) {
-			free(au);
 			return -1;
 		}
 		if (n > 0 && (n != ctx->last_hevc_pps_len ||
@@ -1292,7 +1531,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			au_len += 4 + n;
 		}
 		if (au_len + ctx->slice_len > au_cap) {
-			free(au);
 			return -1;
 		}
 		memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
@@ -1305,7 +1543,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	n = h264_build_sps(au + 4, au_cap - 4 - ctx->slice_len, &ctx->pic,
 			   ctx->profile);
 	if (n <= 0) {
-		free(au);
 		return -1;
 	}
 	if (n != ctx->last_sps_len ||
@@ -1319,7 +1556,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
 			   ctx->slice_len, &ctx->pic, ctx->refs_l0, ctx->refs_l1);
 	if (n <= 0) {
-		free(au);
 		return -1;
 	}
 	if (n != ctx->last_pps_len ||
@@ -1331,7 +1567,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	}
 
 	if (au_len + ctx->slice_len > au_cap) {
-		free(au);
 		return -1;
 	}
 	memcpy(au + au_len, ctx->slice_data, ctx->slice_len);
@@ -1349,7 +1584,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		static const uint8_t aud[] = { 0, 0, 0, 1, 0x09, 0xf0 };
 
 		if (au_len + sizeof(aud) > au_cap) {
-			free(au);
 			return -1;
 		}
 		memcpy(au + au_len, aud, sizeof(aud));
@@ -1361,7 +1595,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		};
 
 		if (au_len + sizeof(aud) > au_cap) {
-			free(au);
 			return -1;
 		}
 		memcpy(au + au_len, aud, sizeof(aud));
@@ -1407,7 +1640,10 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 				qt->queued = 1;
 				qt->owner = ctx;
-				surface_begin_write(&ctx->dec, qt, token);
+				if (ctx->direct_capture)
+					surface_begin_device_write(&ctx->dec, qt, token);
+				else
+					surface_begin_write(&ctx->dec, qt, token);
 			}
 		}
 		/* Ring mapping: only a handful of frames (bounded by the
@@ -1432,13 +1668,11 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			ret = v4l2_dec_feed(&ctx->dec, au, au_len, ts);
 			if (ret) {
 				finish_pending_writes(ctx);
-				free(au);
 				return ret;
 			}
 			ret = v4l2_dec_start(&ctx->dec);
 			if (ret) {
 				finish_pending_writes(ctx);
-				free(au);
 				return ret;
 			}
 			ctx->dec_started = 1;
@@ -1457,7 +1691,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			}
 			if (ret) {
 				finish_pending_writes(ctx);
-				free(au);
 				return ret;
 			}
 		}
@@ -1468,8 +1701,6 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 					 ctx->current_generation);
 		ctx->seq++;
 	}
-	free(au);
-
 	/* The stateful firmware holds each frame until the next access unit
 	 * arrives.  Draining right after this feed makes the *previous*
 	 * picture's frame available so a client that syncs one picture at a
@@ -1494,6 +1725,10 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	ctx->slice_len = 0;
 	ctx->have_pic = 0;
 	rv = 0;
+	if (ctx->stats_enabled) {
+		ctx->stats_end_ns += monotonic_ns() - end_start;
+		ctx->stats_ends++;
+	}
 	DBG("[end] done rv=%d\n", rv);
 	return rv;
 }

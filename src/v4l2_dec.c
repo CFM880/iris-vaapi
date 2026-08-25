@@ -117,7 +117,8 @@ static int v4l2_dec_mmap(struct v4l2_dec *d, enum v4l2_buf_type type)
 	}
 
 	*mem = calloc(count, sizeof(void *));
-	*size = calloc(count, sizeof(size_t));
+	if (!*size)
+		*size = calloc(count, sizeof(size_t));
 	if (!*mem || !*size)
 		return -ENOMEM;
 
@@ -143,6 +144,8 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 {
 	struct v4l2_format fmt;
 	struct v4l2_requestbuffers req;
+	enum v4l2_memory memory = d->cap_dmabuf_count ?
+		V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
 	unsigned int i;
 
 	/* Drop any previous CAPTURE buffers. */
@@ -160,16 +163,18 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 		}
 		free(d->cap_mem);
 		free(d->cap_size);
+		free(d->cap_queued);
 		free(d->cap_meta);
 		d->cap_mem = NULL;
 		d->cap_size = NULL;
+		d->cap_queued = NULL;
 		d->cap_meta = NULL;
 		d->cap_count = 0;
 
 		memset(&req, 0, sizeof(req));
 		req.count = 0;
 		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		req.memory = V4L2_MEMORY_MMAP;
+		req.memory = d->cap_memory;
 		xioctl(d->fd, VIDIOC_REQBUFS, &req);
 	}
 
@@ -192,30 +197,46 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 	d->height = fmt.fmt.pix_mp.height;
 
 	memset(&req, 0, sizeof(req));
-	req.count = CAP_BUFFERS;
+	req.count = d->cap_dmabuf_count ? d->cap_dmabuf_count : CAP_BUFFERS;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	req.memory = V4L2_MEMORY_MMAP;
+	req.memory = memory;
 	if (xioctl(d->fd, VIDIOC_REQBUFS, &req) < 0) {
 		perror("REQBUFS CAPTURE");
 		return -errno;
 	}
+	/* Slot N is permanently associated with direct surface N.  Accepting a
+	 * smaller queue would leave valid VA targets without a V4L2 slot. */
+	if (memory == V4L2_MEMORY_DMABUF && req.count != d->cap_dmabuf_count)
+		return -EINVAL;
 	d->cap_count = req.count;
+	d->cap_memory = memory;
 	d->cap_meta = calloc(d->cap_count, sizeof(*d->cap_meta));
-	if (!d->cap_meta)
+	d->cap_size = calloc(d->cap_count, sizeof(*d->cap_size));
+	d->cap_queued = calloc(d->cap_count, sizeof(*d->cap_queued));
+	if (!d->cap_meta || !d->cap_size || !d->cap_queued)
 		return -ENOMEM;
 	for (i = 0; i < d->cap_count; i++) {
 		memset(&d->cap_meta[i], 0, sizeof(d->cap_meta[i]));
 		d->cap_meta[i].type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		d->cap_meta[i].memory = V4L2_MEMORY_MMAP;
+		d->cap_meta[i].memory = memory;
 		d->cap_meta[i].index = i;
 		d->cap_meta[i].m.planes = calloc(1, sizeof(struct v4l2_plane));
 		d->cap_meta[i].length = 1;
-		if (xioctl(d->fd, VIDIOC_QUERYBUF, &d->cap_meta[i]) < 0) {
+		if (memory == V4L2_MEMORY_DMABUF) {
+			d->cap_meta[i].m.planes[0].m.fd = d->cap_dmabuf_fds[i];
+			d->cap_meta[i].m.planes[0].length =
+				d->cap_dmabuf_sizes[i];
+			d->cap_size[i] = d->cap_dmabuf_sizes[i];
+		} else if (xioctl(d->fd, VIDIOC_QUERYBUF,
+				  &d->cap_meta[i]) < 0) {
 			perror("QUERYBUF CAPTURE");
 			return -errno;
+		} else {
+			d->cap_size[i] = d->cap_meta[i].m.planes[0].length;
 		}
 	}
-	if (v4l2_dec_mmap(d, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) < 0) {
+	if (memory == V4L2_MEMORY_MMAP &&
+	    v4l2_dec_mmap(d, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) < 0) {
 		perror("mmap CAPTURE");
 		return -ENOMEM;
 	}
@@ -224,10 +245,16 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 		memset(&d->cap_meta[i].m.planes[0], 0,
 		       sizeof(d->cap_meta[i].m.planes[0]));
 		d->cap_meta[i].m.planes[0].bytesused = 0;
+		if (memory == V4L2_MEMORY_DMABUF) {
+			d->cap_meta[i].m.planes[0].m.fd = d->cap_dmabuf_fds[i];
+			d->cap_meta[i].m.planes[0].length =
+				d->cap_dmabuf_sizes[i];
+		}
 		if (xioctl(d->fd, VIDIOC_QBUF, &d->cap_meta[i]) < 0) {
 			perror("QBUF CAPTURE");
 			return -errno;
 		}
+		d->cap_queued[i] = 1;
 	}
 
 	{
@@ -238,8 +265,9 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 		d->streaming_cap = 1;
 	}
 
-	printf("v4l2-dec: CAPTURE %ux%u sizeimage=%u bufs=%u\n", d->width,
-	       d->height, fmt.fmt.pix_mp.plane_fmt[0].sizeimage, d->cap_count);
+	printf("v4l2-dec: CAPTURE %ux%u sizeimage=%u bufs=%u memory=%s\n",
+	       d->width, d->height, fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
+	       d->cap_count, memory == V4L2_MEMORY_DMABUF ? "DMABUF" : "MMAP");
 	return 0;
 }
 
@@ -253,6 +281,7 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	unsigned int i;
 
 	memset(d, 0, sizeof(*d));
+	d->cap_memory = V4L2_MEMORY_MMAP;
 	d->fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
 	if (d->fd < 0) {
 		perror("open /dev/video0");
@@ -331,6 +360,21 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	if (v4l2_dec_mmap(d, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) < 0)
 		return -ENOMEM;
 
+	return 0;
+}
+
+int v4l2_dec_set_capture_dmabufs(struct v4l2_dec *d, const int *fds,
+				 const size_t *sizes, unsigned int count)
+{
+	if (!d || !fds || !sizes || count < 4 || d->streaming || d->cap_meta)
+		return -EINVAL;
+	d->cap_dmabuf_fds = malloc(count * sizeof(*d->cap_dmabuf_fds));
+	d->cap_dmabuf_sizes = malloc(count * sizeof(*d->cap_dmabuf_sizes));
+	if (!d->cap_dmabuf_fds || !d->cap_dmabuf_sizes)
+		return -ENOMEM;
+	memcpy(d->cap_dmabuf_fds, fds, count * sizeof(*fds));
+	memcpy(d->cap_dmabuf_sizes, sizes, count * sizeof(*sizes));
+	d->cap_dmabuf_count = count;
 	return 0;
 }
 
@@ -456,19 +500,18 @@ int v4l2_dec_handle_events(struct v4l2_dec *d, int *changed)
 int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame)
 {
 	struct v4l2_buffer b;
+	struct v4l2_plane plane;
 
 	memset(&b, 0, sizeof(b));
+	memset(&plane, 0, sizeof(plane));
 	b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	b.memory = V4L2_MEMORY_MMAP;
+	b.memory = d->cap_memory;
 	b.length = 1;
-	b.m.planes = calloc(1, sizeof(struct v4l2_plane));
+	b.m.planes = &plane;
 	if (xioctl(d->fd, VIDIOC_DQBUF, &b) < 0) {
-		if (errno == EAGAIN) {
-			free(b.m.planes);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 		perror("DQBUF CAPTURE");
-		free(b.m.planes);
 		return -errno;
 	}
 
@@ -476,12 +519,12 @@ int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame)
 	frame->bytesused = b.m.planes[0].bytesused;
 	frame->width = d->width;
 	frame->height = d->height;
-	frame->mem = d->cap_mem[b.index];
+	frame->mem = d->cap_memory == V4L2_MEMORY_MMAP ?
+		d->cap_mem[b.index] : NULL;
 	frame->flags = b.flags;
 	frame->timestamp = b.timestamp.tv_sec * 1000000000ULL +
 			   b.timestamp.tv_usec * 1000ULL;
-	free(b.m.planes);
-
+	d->cap_queued[b.index] = 0;
 	if (b.flags & V4L2_BUF_FLAG_LAST)
 		d->eos = 1;
 
@@ -490,10 +533,23 @@ int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame)
 
 int v4l2_dec_qcap_idx(struct v4l2_dec *d, unsigned int index)
 {
+	int ret;
+
+	if (index >= d->cap_count)
+		return -EINVAL;
+	if (d->cap_queued[index])
+		return 0;
 	memset(&d->cap_meta[index].m.planes[0], 0,
 	       sizeof(d->cap_meta[index].m.planes[0]));
-	return xioctl(d->fd, VIDIOC_QBUF, &d->cap_meta[index]) < 0 ?
-		-errno : 0;
+	if (d->cap_memory == V4L2_MEMORY_DMABUF) {
+		d->cap_meta[index].m.planes[0].m.fd = d->cap_dmabuf_fds[index];
+		d->cap_meta[index].m.planes[0].length = d->cap_dmabuf_sizes[index];
+	}
+	ret = xioctl(d->fd, VIDIOC_QBUF, &d->cap_meta[index]);
+	if (ret < 0)
+		return -errno;
+	d->cap_queued[index] = 1;
+	return 0;
 }
 
 int v4l2_dec_qcap(struct v4l2_dec *d, const struct v4l2_dec_frame *frame)
@@ -508,6 +564,14 @@ int v4l2_dec_export(struct v4l2_dec *d, unsigned int cap_index, int *fd,
 	struct v4l2_plane *pl = &d->cap_meta[cap_index].m.planes[0];
 
 	memset(&exp, 0, sizeof(exp));
+	if (d->cap_memory == V4L2_MEMORY_DMABUF) {
+		*fd = fcntl(d->cap_dmabuf_fds[cap_index], F_DUPFD_CLOEXEC, 0);
+		if (*fd < 0)
+			return -errno;
+		*pitch = d->cap_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+		*size = d->cap_dmabuf_sizes[cap_index];
+		return 0;
+	}
 	exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	exp.index = cap_index;
 	if (xioctl(d->fd, VIDIOC_EXPBUF, &exp) < 0)
@@ -530,21 +594,19 @@ void v4l2_dec_size(struct v4l2_dec *d, unsigned int *w, unsigned int *h)
 int v4l2_dec_dqout(struct v4l2_dec *d)
 {
 	struct v4l2_buffer b;
+	struct v4l2_plane plane;
 
 	memset(&b, 0, sizeof(b));
+	memset(&plane, 0, sizeof(plane));
 	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	b.memory = V4L2_MEMORY_MMAP;
 	b.length = 1;
-	b.m.planes = calloc(1, sizeof(struct v4l2_plane));
+	b.m.planes = &plane;
 	if (xioctl(d->fd, VIDIOC_DQBUF, &b) < 0) {
-		if (errno == EAGAIN) {
-			free(b.m.planes);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
-		free(b.m.planes);
 		return -errno;
 	}
-	free(b.m.planes);
 	d->free_out[d->free_out_n++] = b.index;
 	return 0;
 }
@@ -625,6 +687,7 @@ void v4l2_dec_close(struct v4l2_dec *d)
 		}
 		free(d->cap_mem);
 		free(d->cap_size);
+		free(d->cap_queued);
 		free(d->cap_meta);
 	}
 	if (d->out_meta) {
@@ -638,6 +701,8 @@ void v4l2_dec_close(struct v4l2_dec *d)
 		free(d->out_meta);
 		free(d->free_out);
 	}
+	free(d->cap_dmabuf_fds);
+	free(d->cap_dmabuf_sizes);
 	if (d->fd >= 0)
 		close(d->fd);
 }

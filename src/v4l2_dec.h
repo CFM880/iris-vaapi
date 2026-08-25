@@ -36,6 +36,11 @@ struct v4l2_dec {
 	void **cap_mem;
 	size_t *out_size;
 	size_t *cap_size;
+	int *cap_dmabuf_fds;
+	size_t *cap_dmabuf_sizes;
+	unsigned char *cap_queued;
+	unsigned int cap_dmabuf_count;
+	enum v4l2_memory cap_memory;
 	unsigned int out_count;
 	unsigned int cap_count;
 	unsigned int *free_out;		/* free OUTPUT buffer indices */
@@ -52,6 +57,10 @@ struct v4l2_dec {
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		  unsigned int width, unsigned int height,
 		  unsigned int pixelformat);
+/* Configure CAPTURE to import a fixed ring of caller-owned DMA-BUFs.  Must be
+ * called after open and before start; the fds remain owned by the caller. */
+int v4l2_dec_set_capture_dmabufs(struct v4l2_dec *d, const int *fds,
+				 const size_t *sizes, unsigned int count);
 /* STREAMON the OUTPUT queue (CAPTURE comes up after the first DRC event). */
 int v4l2_dec_start(struct v4l2_dec *d);
 /* poll the device fd. Returns poll() result. */

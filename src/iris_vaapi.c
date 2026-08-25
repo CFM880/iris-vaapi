@@ -84,6 +84,11 @@ struct iris_drv_data {
 	unsigned int buf_sizes[256];
 	unsigned int buf_num_elements[256];
 	void *buf_data[256];
+	VASurfaceID direct_spares[32];
+	unsigned int direct_spare_count;
+	unsigned int direct_spare_width;
+	unsigned int direct_spare_height;
+	int direct_pool_initialized;
 
 	/* Derived images (vaDeriveImage) map a VABufferID to a CAPTURE buffer. */
 	VABufferID derived_ids[256];
@@ -319,6 +324,11 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	iris_decode_setup(eng, picture_width, picture_height, dd->profile);
 	iris_decode_set_surfaces(eng, t);
+	if (iris_decode_set_render_targets(eng, render_targets,
+					   num_render_targets) < 0) {
+		iris_decode_destroy(eng);
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
 
 	dd->width = picture_width;
 	dd->height = picture_height;
@@ -357,7 +367,7 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 {
 	struct iris_drv_data *dd;
 	struct iris_surfs *t;
-	int i;
+	int i = 0;
 
 	dd = iris_drv_data(ctx);
 	if (!dd)
@@ -366,7 +376,49 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	if (!t)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	for (i = 0; i < num_surfaces; i++) {
+	while (i < num_surfaces && dd->direct_spare_count &&
+	       dd->direct_spare_width == (unsigned int)width &&
+	       dd->direct_spare_height == (unsigned int)height) {
+		surfaces[i++] = dd->direct_spares[0];
+		memmove(dd->direct_spares, dd->direct_spares + 1,
+			(--dd->direct_spare_count) * sizeof(dd->direct_spares[0]));
+	}
+
+	if (i < num_surfaces && getenv("IRIS_DIRECT_CAPTURE") &&
+	    (dd->profile == VAProfileHEVCMain ||
+	     dd->profile == VAProfileHEVCMain10) &&
+	    !dd->direct_pool_initialized) {
+		const char *slots_env = getenv("IRIS_DIRECT_CAPTURE_SLOTS");
+		int requested = num_surfaces - i;
+		int allocate = requested < 20 ? 20 : requested;
+		int j;
+
+		if (slots_env && *slots_env) {
+			char *end;
+			unsigned long slots = strtoul(slots_env, &end, 10);
+
+			if (!*end && slots > (unsigned int)allocate &&
+			    slots <= ARRAY_SIZE(dd->direct_spares))
+				allocate = (int)slots;
+		}
+
+		dd->direct_pool_initialized = 1;
+		dd->direct_spare_width = width;
+		dd->direct_spare_height = height;
+		for (j = 0; j < allocate; j++) {
+			VASurfaceID id = ++dd->surface_id;
+
+			if (iris_surfs_alloc(t, id, width, height))
+				return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+			if (j < requested)
+				surfaces[i++] = id;
+			else if (dd->direct_spare_count <
+				 ARRAY_SIZE(dd->direct_spares))
+				dd->direct_spares[dd->direct_spare_count++] = id;
+		}
+	}
+
+	for (; i < num_surfaces; i++) {
 		VASurfaceID id = ++dd->surface_id;
 
 		if (iris_surfs_alloc(t, id, width, height))
@@ -519,8 +571,8 @@ iris_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
 	eng = iris_context_engine(dd, context_id);
 	if (!eng)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	iris_decode_begin(eng, render_target);
-	return VA_STATUS_SUCCESS;
+	return iris_decode_begin(eng, render_target) ?
+		VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
 
 static VAStatus
