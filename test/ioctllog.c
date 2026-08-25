@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* LD_PRELOAD ioctl logger for /dev/video0 — observe the exact V4L2 sequence
  * mpv uses so the iris-vaapi engine can replicate it. */
 #define _GNU_SOURCE

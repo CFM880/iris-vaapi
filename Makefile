@@ -1,6 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -O2
-CFLAGS += -Wall -Wextra
+# VA driver callbacks intentionally leave some ABI parameters unused.
+CFLAGS += -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS += $(shell pkg-config --cflags libva 2>/dev/null)
 LDFLAGS += -lva -ldl
 
@@ -21,7 +22,10 @@ TEST_HEVC_REWRITE = $(BUILD)/test_hevc_slice_rewrite
 TEST_VA_STRESS = $(BUILD)/test_va_stress
 TEST_SURFACE_FENCE = $(BUILD)/test_surface_fence
 
-.PHONY: all clean install
+.PHONY: all check clean install uninstall
+
+DRIVERDIR ?= $(shell pkg-config --variable=driverdir libva 2>/dev/null)
+DESTDIR ?=
 
 all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
 	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) \
@@ -95,3 +99,16 @@ $(TEST_SURFACE_FENCE): test/test_surface_fence.c src/iris_surface_fence.h
 
 clean:
 	rm -rf $(BUILD)
+
+check: $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE)
+	./$(TEST_HEVC_PARAMS)
+	./$(TEST_HEVC_REWRITE)
+
+install: $(DRIVER)
+	test -n "$(DRIVERDIR)"
+	install -d "$(DESTDIR)$(DRIVERDIR)"
+	install -m 0755 $(DRIVER) "$(DESTDIR)$(DRIVERDIR)/iris_drv_video.so"
+
+uninstall:
+	test -n "$(DRIVERDIR)"
+	rm -f "$(DESTDIR)$(DRIVERDIR)/iris_drv_video.so"

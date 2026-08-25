@@ -167,7 +167,7 @@ static int g_nrl0, g_nrl1;
 
 int main(int argc, char **argv)
 {
-	const char *path = argc > 1 ? argv[1] : "/home/cfm880/qcom/test-1080p-3s.h264";
+	const char *path;
 	uint8_t *data;
 	long fsize;
 	FILE *fp;
@@ -185,6 +185,12 @@ int main(int argc, char **argv)
 	int major = 0, minor = 0;
 	int fd;
 
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s input.h264\n", argv[0]);
+		return 2;
+	}
+	path = argv[1];
+
 	fp = fopen(path, "rb");
 	if (!fp) { perror(path); return 1; }
 	fseek(fp, 0, SEEK_END);
@@ -199,7 +205,7 @@ int main(int argc, char **argv)
 	while (pos >= 0 && (sps_len < 0 || pps_len < 0 || n_slices < 10)) {
 		long next = find_start(data, fsize, pos + 1);
 		int t = data[pos] & 0x1f;
-		size_t end = next < 0 ? fsize : (size_t)next;
+		size_t end = next < 0 ? (size_t)fsize : (size_t)next;
 		size_t nalsz = end - (size_t)pos;
 
 		if (t == 7 && sps_len < 0) {

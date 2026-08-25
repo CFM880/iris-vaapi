@@ -62,7 +62,7 @@ static long find_start(const unsigned char *buf, size_t size, size_t from)
 	return -1;
 }
 
-static int nal_type(const unsigned char *p, size_t size, size_t nalo)
+static int nal_type(const unsigned char *p, size_t nalo)
 {
 	return p[nalo] & 0x1f;
 }
@@ -91,7 +91,7 @@ struct au {
 
 int main(int argc, char **argv)
 {
-	const char *path = argc > 1 ? argv[1] : "/home/cfm880/qcom/test-4k-avc.h264";
+	const char *path;
 	unsigned int width = argc > 2 ? atoi(argv[2]) : 3840;
 	unsigned int height = argc > 3 ? atoi(argv[3]) : 2160;
 	struct au *aus = NULL;
@@ -107,6 +107,13 @@ int main(int argc, char **argv)
 	struct timespec t0, t1;
 	double secs;
 	int ret;
+
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s input.h264 [width height [frame.nv12]]\n",
+			argv[0]);
+		return 2;
+	}
+	path = argv[1];
 
 	fp = fopen(path, "rb");
 	if (!fp) { perror(path); return 1; }
@@ -132,7 +139,7 @@ int main(int argc, char **argv)
 			next = find_start(stream, fsize, pos + 1);
 			{
 				size_t nalo = pos + (stream[pos + 2] == 0 ? 3 : 2) + 1;
-				int t = nal_type(stream, fsize, nalo);
+				int t = nal_type(stream, nalo);
 				int vcl = (t >= 1 && t <= 5);
 				int fm = vcl ? first_mb(stream, fsize, nalo) : -1;
 

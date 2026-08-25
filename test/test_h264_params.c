@@ -154,7 +154,7 @@ static void parse_pps(const uint8_t *nal, size_t len, VAPictureParameterBufferH2
 
 int main(int argc, char **argv)
 {
-	const char *path = argc > 1 ? argv[1] : "/home/cfm880/qcom/test-1080p-3s.h264";
+	const char *path;
 	const char *outpath = argc > 2 ? argv[2] : "/tmp/reconstructed.h264";
 	FILE *fp, *out;
 	uint8_t *data;
@@ -165,6 +165,12 @@ int main(int argc, char **argv)
 	VAPictureParameterBufferH264 pic;
 	uint8_t out_sps[256], out_pps[64];
 	int out_sps_len, out_pps_len;
+
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s input.h264 [reconstructed.h264]\n", argv[0]);
+		return 2;
+	}
+	path = argv[1];
 
 	fp = fopen(path, "rb");
 	if (!fp) { perror(path); return 1; }
@@ -181,7 +187,7 @@ int main(int argc, char **argv)
 	while (pos >= 0) {
 		long next = find_start(data, fsize, pos + 1);
 		int t = data[pos] & 0x1f;
-		size_t end = next < 0 ? fsize : (size_t)next;
+		size_t end = next < 0 ? (size_t)fsize : (size_t)next;
 		size_t nalsz = end - pos;
 
 				if (t == 7 && sps_len < 0) {

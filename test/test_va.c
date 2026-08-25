@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Minimal libva client to verify a VA-API driver registers and advertises
- * decode profiles/entrypoints (stand-in for vainfo, P0 check).
+ * decode profiles/entrypoints (stand-in for vainfo).
  */
 
 #include <stdio.h>

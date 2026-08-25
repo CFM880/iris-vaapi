@@ -51,7 +51,6 @@ static int profile_idc(VAProfile profile)
 {
 	switch (profile) {
 	case VAProfileH264ConstrainedBaseline:
-	case VAProfileH264Baseline:
 		return 66;
 	case VAProfileH264Main:
 		return 77;

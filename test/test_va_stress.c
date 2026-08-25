@@ -166,8 +166,7 @@ static double now_s(void)
 
 int main(int argc, char **argv)
 {
-	const char *path = argc > 1 ? argv[1] :
-			    "/home/cfm880/qcom/test-1080p-nob.h264";
+	const char *path;
 	long total = argc > 2 ? atol(argv[2]) : 700;
 	uint8_t *data;
 	long fsize;
@@ -190,6 +189,12 @@ int main(int argc, char **argv)
 	int n_sync_ok = 0, worst_us = 0;
 	double t0, t1;
 
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s input.h264 [frame-count]\n", argv[0]);
+		return 2;
+	}
+	path = argv[1];
+
 	fp = fopen(path, "rb");
 	if (!fp) { perror(path); return 1; }
 	fseek(fp, 0, SEEK_END);
@@ -204,7 +209,7 @@ int main(int argc, char **argv)
 	memset(&pic, 0, sizeof(pic));
 	while (pos >= 0 && nnals < 4096) {
 		long next = find_start(data, fsize, pos + 3);
-		size_t end = next < 0 ? fsize : (size_t)next;
+		size_t end = next < 0 ? (size_t)fsize : (size_t)next;
 		int t = data[pos] & 0x1f;
 
 		nals[nnals].p = data + pos;

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * iris-vaapi: P0 VA-API driver skeleton for the Qualcomm Iris (SM8150)
- * stateful V4L2 decoder.
- *
- * This stage only registers the driver with libva and advertises the codec
- * profiles/entrypoints so that `vainfo` (and eventually Chrome) can see the
- * hardware.  Decode is intentionally not wired up yet.
+ * iris-vaapi: VA-API driver for the Qualcomm Iris (SM8150) stateful V4L2
+ * decoder.
  */
 
 #include <stdio.h>
@@ -39,8 +35,8 @@
 
 #include "decode.h" 
 
-#define IRIS_VAAPI_VERSION	"0.0.1"
-#define IRIS_VAAPI_VENDOR	"iris-vaapi P0: Qualcomm Iris SM8150 (V4L2) "
+#define IRIS_VAAPI_VERSION	"0.1.0"
+#define IRIS_VAAPI_VENDOR	"iris-vaapi: Qualcomm Iris SM8150 (V4L2) "
 
 /* Per-surface tracing is chatty and the GPU process inherits this stderr;
  * opt in with IRIS_VAAPI_DEBUG=1. */
@@ -780,8 +776,7 @@ iris_vaBufferInfo(VADriverContextP ctx, VABufferID buf_id,
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-/* Image/subpicture entries are required non-NULL by libva's driver
- * validation even for a decode-only P0 driver. */
+/* Image/subpicture entries are required non-NULL by libva's validation. */
 static VAStatus
 iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 		   int height, VAImage *image)
@@ -827,7 +822,7 @@ static VAStatus
 iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 {
 	struct iris_drv_data *dd = ctx->pDriverData;
-	unsigned int cap, pitch, size, w, h;
+	unsigned int pitch, size, w, h;
 	void *mem;
 	VABufferID bid;
 
