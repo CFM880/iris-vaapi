@@ -350,7 +350,11 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
 - stateful 固件 hold 1 帧：最后一张画面由 EOS flush 释放（已解决，见上）。
 - B 帧短序列引用未解析时丢帧（完整流正常，引擎解 74/75）。
 - 单实例单引擎，不支持并发多视频流。
-- H.264 4K60 高码率受固件解码上限（~49fps）。
+- Chrome 的稳定 surface 模型每帧需要一次 CAPTURE→DMA-BUF CPU 拷贝；
+  H.264 4K60 必须用 qcom-iris 的 cacheable CAPTURE：
+  `options qcom_iris h264_cached_capture=1`。本机 600 帧实测由 15.97s
+  （37.6fps，明显卡顿）降至 9.61s（62.5fps）。`install-system.sh` 会将
+  该选项安装到 `/etc/modprobe.d/99-iris-vaapi.conf`，模块重载或重启后生效。
 - 中断会话会让固件卡死（SESSION_INIT 超时 -110），需重载模块：
   `sudo rmmod qcom_iris && sudo modprobe qcom_iris`
 - surface 后备缺省用 DMA-heap（GPU 可导入）；未 chmod 时自动回退 memfd，
@@ -371,8 +375,11 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 | 会话中途死亡（GPU 进程被杀/错误路径） | 固件 wedge，之后所有解码 SESSION_INIT -110 → 永久回退 | close 前 DECODER_CMD STOP + 有界 drain |
 | 重建 H.264 SPS 的 VUI 非法 | `Overread VUI`、PPS 失配 | 按 Chromium packed-H264 builder 重建合法 VUI；展示重排仍由 Chromium DPB 完成 |
 | 固件按显示顺序延迟返还 CAPTURE | Chrome 已输出 VA surface，但对应 CAPTURE 帧尚未产生 → 4K 卡顿、短暂旧帧/花屏 | qcom-iris 暴露标准 display-delay 控制并向 Gen1 固件请求 decode-order output；VA 驱动在会话启动前设置 delay=0 |
-| Gen1 即使 decode-order 仍会成批返还 CAPTURE（实测每 3 帧） | `vaEndPicture` 已返回，但目标 surface 尚未写入；Chrome 不调用 `vaSyncSurface` 就交给 GPU，因而采到旧帧或写到一半的帧 | `vaEndPicture` 给稳定 DMA-BUF 挂未完成的 reservation write fence；CAPTURE 拷贝和 cache sync 完成后再 signal。GPU 自动等待，V4L2 解码仍保持流水线，不必逐帧同步阻塞 |
-| Chromium Flush 只排空软件 DPB，不向 libva/stateful V4L2 发送 EOS | 固件扣住片尾帧；context reset 后最后一个 surface 仍是其上一次内容，表现为片尾跳回上一帧 | 每个 H.264/HEVC AU 尾部附加 AUD 边界，促使固件异步释放当前帧；不在 `vaEndPicture` 等待，性能保持流水线 |
+| Gen1 即使 decode-order 仍会成批返还 CAPTURE（实测每 3 帧） | `vaEndPicture` 已返回，但目标 surface 尚未写入；不等待隐式同步的客户端会采到旧帧或写到一半的帧 | `vaEndPicture` 给稳定 DMA-BUF 挂未完成的 reservation write fence；CAPTURE 拷贝和 cache sync 完成后再 signal。遵守 DMA-BUF 隐式同步的消费者可保持异步流水线 |
+| 4K60 解码落后时 render target 先于旧 CAPTURE 返回而被复用 | 晚到的旧帧覆盖同一 backing，并误 signal 新一代帧的 fence，表现为偶发回退 1 帧 | seq/POC→surface 映射同时记录 surface generation；旧 generation 的 CAPTURE 只回收，不覆盖 backing、不解除新 fence |
+| ANGLE/GL 未可靠等待 DMA-BUF 导入后追加的 reservation fence | `mediaTime` 单调递增，但 canvas 像素指纹会回到早先帧（实测 1.083s 与 0.667s 相同） | H.264 `vaEndPicture` 返回前等待当前 decode-order target 完成；用硬件背压把性能不足变成正常丢帧，不再展示旧 backing |
+| 同步等待后 4K60 只有约 37.6fps | coherent CAPTURE 被 CPU 逐帧读取，12.5MB/帧的拷贝占满一个 CPU 核 | 加载 qcom-iris 时启用 `h264_cached_capture=1`，让 vb2 在 DMA 完成后维护 cache；同一 600 帧文件实测提升至 62.5fps |
+| Chromium Flush 只排空软件 DPB，不向 libva/stateful V4L2 发送 EOS | 固件扣住片尾帧；context reset 后最后一个 surface 仍是其上一次内容，表现为片尾跳回上一帧 | 每个 H.264/HEVC AU 尾部附加 AUD 边界，促使固件释放当前帧；H.264 可在 `vaEndPicture` 内等当前 target，无需下一帧输入或 EOS |
 
 排查工具：
 
@@ -404,6 +411,8 @@ sudo ./install-system.sh
 sudo install -m 0644 ../nabu-linux/linux/out-iris1/drivers/media/platform/qcom/iris/qcom-iris.ko \
   /lib/modules/$(uname -r)/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko
 sudo depmod -a && sudo modprobe -r qcom_iris && sudo modprobe qcom_iris
+# 确认 4K60 所需的 cacheable CAPTURE 已启用（应输出 Y）：
+cat /sys/module/qcom_iris/parameters/h264_cached_capture
 # Chrome（GPU 进程需继承 LIBVA_DRIVER_NAME）：
 export LIBVA_DRIVER_NAME=iris
 google-chrome --enable-logging=stderr --v=1 file:///path/to/video.html

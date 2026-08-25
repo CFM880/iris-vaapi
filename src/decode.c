@@ -103,6 +103,7 @@ struct iris_surface {
 	int queued;		/* some picture was decoded into this surface */
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
 	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
+	uint64_t generation;	/* render-target reuse generation */
 	struct iris_decode_ctx *owner;	/* engine that queued the picture */
 };
 
@@ -199,6 +200,7 @@ struct iris_decode_ctx {
 	size_t slice_len;
 	size_t slice_cap;
 	VASurfaceID current_target;
+	uint64_t current_generation;
 
 	uint8_t last_sps[256];
 	int last_sps_len;
@@ -238,6 +240,7 @@ struct iris_decode_ctx {
 	struct {
 		uint64_t seq;
 		VASurfaceID target;
+		uint64_t generation;
 		int used;
 	} target_ring[IRIS_TARGET_RING];
 	VASurfaceID last_target;	/* most recently queued picture */
@@ -250,6 +253,7 @@ struct iris_decode_ctx {
 	struct {
 		int32_t poc;
 		VASurfaceID target;
+		uint64_t generation;
 	} hevc_ring[IRIS_HEVC_RING];
 	unsigned int hevc_ring_head, hevc_ring_len;
 };
@@ -516,6 +520,7 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	s->queued = 0;
 	s->write_started = 0;
 	s->fence_token = 0;
+	s->generation = 0;
 	s->owner = NULL;
 	return 0;
 }
@@ -672,13 +677,15 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 }
 
 static void
-hevc_pending_add(struct iris_decode_ctx *ctx, int32_t poc, VASurfaceID target)
+hevc_pending_add(struct iris_decode_ctx *ctx, int32_t poc, VASurfaceID target,
+		 uint64_t generation)
 {
 	unsigned int n = (unsigned int)ARRAY_SIZE(ctx->hevc_ring);
 	unsigned int slot = (ctx->hevc_ring_head + ctx->hevc_ring_len) % n;
 
 	ctx->hevc_ring[slot].poc = poc;
 	ctx->hevc_ring[slot].target = target;
+	ctx->hevc_ring[slot].generation = generation;
 	if (ctx->hevc_ring_len < n) {
 		ctx->hevc_ring_len++;
 	} else {
@@ -689,13 +696,15 @@ hevc_pending_add(struct iris_decode_ctx *ctx, int32_t poc, VASurfaceID target)
 }
 
 static int
-hevc_pending_take(struct iris_decode_ctx *ctx, VASurfaceID *target)
+hevc_pending_take(struct iris_decode_ctx *ctx, VASurfaceID *target,
+		  uint64_t *generation)
 {
 	unsigned int n = (unsigned int)ARRAY_SIZE(ctx->hevc_ring);
 
 	if (!ctx->hevc_ring_len)
 		return -1;
 	*target = ctx->hevc_ring[ctx->hevc_ring_head].target;
+	*generation = ctx->hevc_ring[ctx->hevc_ring_head].generation;
 	ctx->hevc_ring_head = (ctx->hevc_ring_head + 1) % n;
 	ctx->hevc_ring_len--;
 	return 0;
@@ -710,10 +719,11 @@ static int
 assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 {
 	VASurfaceID id;
+	uint64_t generation;
 	struct iris_surface *s;
 
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
-		if (hevc_pending_take(ctx, &id)) {
+		if (hevc_pending_take(ctx, &id, &generation)) {
 			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 			return -1;
 		}
@@ -738,12 +748,25 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 			return -1;
 		}
 		id = ctx->target_ring[slot].target;
+		generation = ctx->target_ring[slot].generation;
 		ctx->target_ring[slot].used = 0;
 	}
 	s = find_surface(ctx, id);
 
 	if (!s) {
 		DBG("[assign] NO SURFACE id=%u\n", id);
+		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
+		return -1;
+	}
+	/* A VA client may recycle a render target as soon as it drops the old
+	 * output frame, while legacy Iris firmware can still have that picture
+	 * queued internally (up to its display/decode hold depth).  Do not let
+	 * such a late CAPTURE buffer overwrite the newer picture already mapped
+	 * to the same stable backing, nor signal the newer picture's fence. */
+	if (s->generation != generation) {
+		DBG("[assign] STALE id=%u generation=%llu current=%llu\n", id,
+		    (unsigned long long)generation,
+		    (unsigned long long)s->generation);
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	}
@@ -780,6 +803,45 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 }
 
 static int drain_available(struct iris_decode_ctx *ctx);
+
+/* Wait for one already-submitted render target without flushing the stream.
+ * H.264 access units carry a trailing AUD, so decode-order firmware can
+ * complete the current target without needing another picture to be queued.
+ * This is used before vaEndPicture returns: the ANGLE/GL import path on legacy
+ * Adreno does not reliably wait for reservation fences attached after the
+ * DMA-BUF was imported, and can otherwise sample that surface's old pixels. */
+static int
+wait_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id, int deadline)
+{
+	while (deadline-- > 0) {
+		struct iris_surface *s;
+		struct v4l2_dec_frame frame;
+		int changed, ret;
+
+		ret = drain_available(ctx);
+		if (ret)
+			return ret;
+		s = find_surface(ctx, id);
+		if (s && s->decoded)
+			return 0;
+
+		ret = v4l2_dec_poll_cap(&ctx->dec, 20);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			continue;
+		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
+		if (ret)
+			return ret;
+		while (v4l2_dec_dqout(&ctx->dec) == 0)
+			;
+		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
+		if (ret < 0)
+			continue;
+		assign_frame(ctx, &frame);
+	}
+	return -ETIMEDOUT;
+}
 
 /* Force the firmware to release the picture it is holding.  The stateful
  * decoder keeps the most recent picture until the next access unit (or an
@@ -857,14 +919,20 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 {
 	struct iris_surface *s = find_surface(ctx, target);
 
-	DBG("[begin] target=%u\n", target);
+	DBG("[begin] target=%u decoded=%d queued=%d generation=%llu\n",
+	    target, s ? s->decoded : -1, s ? s->queued : -1,
+	    (unsigned long long)(s ? s->generation : 0));
 	ctx->current_target = target;
 	/* VA clients reuse render targets.  A surface that held an earlier
 	 * picture must become pending again, otherwise vaSyncSurface can return
 	 * the stale backing before the newly decoded picture is copied into it. */
 	if (s) {
+		s->generation++;
+		ctx->current_generation = s->generation;
 		s->decoded = 0;
 		s->queued = 0;
+	} else {
+		ctx->current_generation = 0;
 	}
 	ctx->have_pic = 0;
 	ctx->have_hevc_pic = 0;
@@ -1352,6 +1420,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 			ctx->target_ring[slot].seq = ctx->seq;
 			ctx->target_ring[slot].target = ctx->current_target;
+			ctx->target_ring[slot].generation =
+				ctx->current_generation;
 			ctx->target_ring[slot].used = 1;
 		}
 
@@ -1394,7 +1464,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC)
 			hevc_pending_add(ctx,
 					 ctx->hevc_pic.CurrPic.pic_order_cnt,
-					 ctx->current_target);
+					 ctx->current_target,
+					 ctx->current_generation);
 		ctx->seq++;
 	}
 	free(au);
@@ -1404,6 +1475,21 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	 * picture's frame available so a client that syncs one picture at a
 	 * time (ffmpeg/Chrome) does not deadlock. */
 	drain_available(ctx);
+
+	/* Chrome sends a decoded frame to ANGLE immediately after vaEndPicture.
+	 * Its GL DMA-BUF import can sample the previous contents even though a
+	 * new reservation fence was attached.  H.264 is emitted in decode order
+	 * and each AU ends in AUD, so wait here until the target backing contains
+	 * this picture.  This applies hardware backpressure and turns overload
+	 * into ordinary frame dropping instead of visible backward frames. */
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
+		ret = wait_surface_ready(ctx, ctx->current_target, 100);
+		if (ret) {
+			DBG("[end] target=%u readiness wait failed: %d\n",
+			    ctx->current_target, ret);
+			return ret;
+		}
+	}
 
 	ctx->slice_len = 0;
 	ctx->have_pic = 0;
