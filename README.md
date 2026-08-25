@@ -114,6 +114,9 @@ make check
 [`docs/development-notes.md`](docs/development-notes.md)。Chromium 交互点见
 [`docs/chromium-integration.md`](docs/chromium-integration.md)。
 
+从全新系统打通内核、固件、VA-API、FFmpeg 和 Chrome 的完整步骤见
+[`docs/video-decode-setup.md`](docs/video-decode-setup.md)。
+
 ## 已知限制
 
 - 仅验证 SM8150 Iris1 和 NV12 8-bit；HEVC Main10/P010 尚未完成；
