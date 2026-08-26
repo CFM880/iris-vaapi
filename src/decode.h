@@ -28,13 +28,13 @@ int iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 		     unsigned int width, unsigned int height,
 		     unsigned int fourcc);
 void iris_surfs_free(struct iris_surfs *t, VASurfaceID id);
-/* Sync routing: drains the owning engine until @id is ready.  Unknown,
- * never-queued, already-decoded surfaces and surfaces whose engine is gone
- * succeed immediately (Chrome syncs pool surfaces before decoding into them,
- * and must not get spurious timeouts). */
+/* Sync routing: drains the owning engine until @id is ready.  Never-queued,
+ * already-decoded surfaces and surfaces whose engine is gone succeed
+ * immediately (Chrome syncs pool surfaces before decoding into them). */
 int iris_surfs_sync(struct iris_surfs *t, VASurfaceID id);
 /* Advisory readiness without draining an engine. */
 int iris_surfs_ready(struct iris_surfs *t, VASurfaceID id);
+int iris_surfs_valid(struct iris_surfs *t, VASurfaceID id);
 /* Export the backing of @id as a fresh DRM PRIME fd (caller owns it). */
 int iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
 		      unsigned int *pitch, unsigned int *size,
@@ -79,12 +79,16 @@ int iris_decode_flush(struct iris_decode_ctx *ctx);
 int iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target);
 int iris_decode_picture(struct iris_decode_ctx *ctx,
 			const VAPictureParameterBufferH264 *pic);
+int iris_decode_h264_iq_matrix(struct iris_decode_ctx *ctx,
+			       const VAIQMatrixBufferH264 *iq);
 /* Capture per-slice parameters (reference counts) for the PPS default. */
 int iris_decode_slice_params(struct iris_decode_ctx *ctx,
 			     const VASliceParameterBufferH264 *sp);
 /* HEVC: picture/slice params used to canonicalize parameter sets and RPS. */
 int iris_decode_hevc_picture(struct iris_decode_ctx *ctx,
 			     const VAPictureParameterBufferHEVC *pic);
+int iris_decode_hevc_iq_matrix(struct iris_decode_ctx *ctx,
+			       const VAIQMatrixBufferHEVC *iq);
 int iris_decode_hevc_slice_params(struct iris_decode_ctx *ctx,
 				  const VASliceParameterBufferHEVC *sp);
 int iris_decode_slice(struct iris_decode_ctx *ctx, const void *data,

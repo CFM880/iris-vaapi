@@ -32,6 +32,15 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif
 
+static unsigned int
+surface_pitch(unsigned int width, unsigned int fourcc)
+{
+	unsigned int bytes = fourcc == V4L2_PIX_FMT_P010 ? 2 : 1;
+	unsigned int alignment = fourcc == V4L2_PIX_FMT_P010 ? 256 : 128;
+
+	return ALIGN_TO(width * bytes, alignment);
+}
+
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC	0x0001U
 #endif
@@ -185,6 +194,7 @@ struct iris_decode_ctx {
 	unsigned int cap_pixfmt;	/* V4L2 CAPTURE pixel format */
 	int direct_capture;
 	int direct_error;
+	int fatal_error;
 	unsigned int direct_count;
 	unsigned int direct_requested_count;
 	struct {
@@ -197,8 +207,12 @@ struct iris_decode_ctx {
 
 	VAPictureParameterBufferH264 pic;
 	int have_pic;
+	VAIQMatrixBufferH264 h264_iq;
+	int have_h264_iq;
 	VAPictureParameterBufferHEVC hevc_pic;
 	int have_hevc_pic;
+	VAIQMatrixBufferHEVC hevc_iq;
+	int have_hevc_iq;
 	uint8_t *slice_data;
 	size_t slice_len;
 	size_t slice_cap;
@@ -209,12 +223,12 @@ struct iris_decode_ctx {
 
 	uint8_t last_sps[256];
 	int last_sps_len;
-	uint8_t last_pps[128];
+	uint8_t last_pps[4096];
 	int last_pps_len;
 	/* HEVC parameter-set cache (only emit when changed). */
 	uint8_t last_hevc_vps[64];
 	int last_hevc_vps_len;
-	uint8_t last_hevc_sps[256];
+	uint8_t last_hevc_sps[8192];
 	int last_hevc_sps_len;
 	uint8_t last_hevc_pps[128];
 	int last_hevc_pps_len;
@@ -226,7 +240,12 @@ struct iris_decode_ctx {
 	int raw_hevc_vps_len;
 	int raw_hevc_sps_len;
 	int raw_hevc_pps_len;
-	int refs_l0, refs_l1;	/* from slice params, for the PPS default */
+	int refs_l0, refs_l1;	/* effective per-slice reference counts */
+	int h264_pps_refs_l0, h264_pps_refs_l1;
+	struct {
+		VASliceParameterBufferH264 param;
+	} h264_slices[128];
+	unsigned int h264_slice_count;
 	struct {
 		VASliceParameterBufferHEVC param;
 	} hevc_slices[128];
@@ -293,6 +312,7 @@ surface_copy(struct iris_decode_ctx *ctx, struct iris_surface *s,
 	 * ioctl and remain ordinary coherent CPU mappings. */
 	if (!sync_started && dma_buf_cpu_sync(s->bfd,
 				    DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
+		s->write_started = 1;
 		sync_started = 1;
 	} else if (!sync_started && errno != ENOTTY && errno != EINVAL) {
 		return -errno;
@@ -380,10 +400,15 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 	ctx->eos_sent = 0;
 	ctx->last_target = 0;
 	ctx->have_pic = 0;
+	ctx->have_h264_iq = 0;
 	ctx->have_hevc_pic = 0;
+	ctx->have_hevc_iq = 0;
 	ctx->slice_len = 0;
 	ctx->refs_l0 = 0;
 	ctx->refs_l1 = 0;
+	ctx->h264_pps_refs_l0 = -1;
+	ctx->h264_pps_refs_l1 = -1;
+	ctx->h264_slice_count = 0;
 	ctx->hevc_slice_count = 0;
 	ctx->hevc_slice_next = 0;
 	ctx->hevc_pps_id = -1;
@@ -399,6 +424,7 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 	ctx->hevc_ring_head = 0;
 	ctx->hevc_ring_len = 0;
 	ctx->direct_error = 0;
+	ctx->fatal_error = 0;
 	target_ring_reset(ctx);
 	ctx->seq = 0;
 }
@@ -408,8 +434,10 @@ iris_decode_create(void)
 {
 	struct iris_decode_ctx *ctx = calloc(1, sizeof(*ctx));
 
-	if (ctx)
+	if (ctx) {
+		reset_stream_state(ctx);
 		ctx->stats_enabled = getenv("IRIS_VAAPI_STATS") != NULL;
+	}
 	return ctx;
 }
 
@@ -488,7 +516,8 @@ direct_collect_surfaces(struct iris_decode_ctx *ctx)
 		struct iris_surface *s = &ctx->surfs->s[i];
 
 		if (s->sw != ctx->width || s->sh != ctx->height ||
-		    s->bfd < 0 || (s->owner && s->owner != ctx))
+		    s->fourcc != ctx->cap_pixfmt || s->bfd < 0 ||
+		    (s->owner && s->owner != ctx))
 			continue;
 		ctx->direct[count].id = s->id;
 		ctx->direct[count].fd = s->bfd;
@@ -515,7 +544,7 @@ iris_decode_set_render_targets(struct iris_decode_ctx *ctx,
 		for (i = 0; i < count; i++) {
 			struct iris_surface *s = find_surface(ctx, targets[i]);
 
-			if (!s || s->bfd < 0)
+			if (!s || s->bfd < 0 || s->fourcc != ctx->cap_pixfmt)
 				return -EINVAL;
 			ctx->direct[i].id = targets[i];
 			ctx->direct[i].fd = s->bfd;
@@ -647,9 +676,8 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	 * GPU clients (Chrome/EGL); fall back to a plain memfd when the heap
 	 * node is root-only, which keeps local tests and CPU readback working.
 	 * Size with the layout Iris produces for linear NV12/P010 (128-byte
-	 * stride, 32-aligned luma height). */
-	size = ALIGN_TO(width * (fourcc == V4L2_PIX_FMT_P010 ? 2 : 1), 128) *
-		ALIGN_TO(height, 32) * 3 / 2;
+	 * NV12 stride, 256-byte P010 stride, 32-aligned luma height). */
+	size = surface_pitch(width, fourcc) * ALIGN_TO(height, 32) * 3 / 2;
 	DBG("[surf] id=%u size=%u w=%u h=%u fourcc=%#x\n",
 	    id, size, width, height, fourcc);
 	heap = open("/dev/dma_heap/system", O_RDWR);
@@ -721,8 +749,7 @@ static void
 surface_layout(const struct iris_surface *s, unsigned int *pitch,
 	       unsigned int *width, unsigned int *height)
 {
-	unsigned int p = ALIGN_TO(s->sw *
-		(s->fourcc == V4L2_PIX_FMT_P010 ? 2 : 1), 128);
+	unsigned int p = surface_pitch(s->sw, s->fourcc);
 	unsigned int w = s->sw;
 	unsigned int h = ALIGN_TO(s->sh, 32);
 
@@ -746,10 +773,12 @@ iris_surfs_sync(struct iris_surfs *t, VASurfaceID id)
 {
 	struct iris_surface *s = surfs_find(t, id);
 
-	/* Unknown, never-queued and already-decoded surfaces succeed without
+	/* Never-queued and already-decoded surfaces succeed without
 	 * draining anything: Chrome syncs freshly allocated pool surfaces
 	 * before exporting them and must not get spurious timeouts. */
-	if (!s || !s->queued || s->decoded)
+	if (!s)
+		return -EINVAL;
+	if (!s->queued || s->decoded)
 		return 0;
 	/* Drain whichever engine queued this picture; with one engine per
 	 * context that is exactly the context still holding the stream. */
@@ -768,6 +797,12 @@ iris_surfs_ready(struct iris_surfs *t, VASurfaceID id)
 	struct iris_surface *s = surfs_find(t, id);
 
 	return s ? s->decoded : 0;
+}
+
+int
+iris_surfs_valid(struct iris_surfs *t, VASurfaceID id)
+{
+	return surfs_find(t, id) != NULL;
 }
 
 int
@@ -928,13 +963,15 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
 		if (hevc_pending_take(ctx, &id, &generation)) {
 			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
-			return -1;
+			return -EIO;
 		}
 	} else {
 		uint64_t frame_seq, slot;
 
-		if (frame->timestamp < 1000000000ULL)
-			return -1;
+		if (frame->timestamp < 1000000000ULL) {
+			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
+			return -EIO;
+		}
 		frame_seq = (frame->timestamp / 1000000000ULL) - 1000;
 		slot = frame_seq % ARRAY_SIZE(ctx->target_ring);
 		if (!ctx->target_ring[slot].used ||
@@ -948,7 +985,7 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 			    ctx->target_ring[slot].used,
 			    (unsigned long long)ctx->target_ring[slot].seq);
 			v4l2_dec_qcap_idx(&ctx->dec, frame->index);
-			return -1;
+			return 0;
 		}
 		id = ctx->target_ring[slot].target;
 		generation = ctx->target_ring[slot].generation;
@@ -959,7 +996,7 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	if (!s) {
 		DBG("[assign] NO SURFACE id=%u\n", id);
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
-		return -1;
+		return 0;
 	}
 	/* A VA client may recycle a render target as soon as it drops the old
 	 * output frame, while legacy Iris firmware can still have that picture
@@ -971,7 +1008,7 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		    (unsigned long long)generation,
 		    (unsigned long long)s->generation);
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
-		return -1;
+		return 0;
 	}
 	if (ctx->direct_capture) {
 		VASurfaceID actual;
@@ -1020,7 +1057,12 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	} else {
 		surface_finish_write(&ctx->dec, s);
 	}
-	v4l2_dec_qcap_idx(&ctx->dec, frame->index);
+	{
+		int ret = v4l2_dec_qcap_idx(&ctx->dec, frame->index);
+
+		if (ret)
+			return ret;
+	}
 	s->decoded = 1;
 	s->queued = 1;
 	s->owner = ctx;
@@ -1030,8 +1072,8 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 static int drain_available(struct iris_decode_ctx *ctx);
 
 /* Wait for one already-submitted render target without flushing the stream.
- * H.264 access units carry a trailing AUD, so decode-order firmware can
- * complete the current target without needing another picture to be queued.
+ * The V4L2 session requests decode-order output, so firmware can complete the
+ * current target without needing another picture to be queued.
  * This is used before vaEndPicture returns: the ANGLE/GL import path on legacy
  * Adreno does not reliably wait for reservation fences attached after the
  * DMA-BUF was imported, and can otherwise sample that surface's old pixels. */
@@ -1061,9 +1103,17 @@ wait_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id, int deadline)
 		while (v4l2_dec_dqout(&ctx->dec) == 0)
 			;
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
-		if (ret < 0)
+		if (ret == -EAGAIN)
 			continue;
-		assign_frame(ctx, &frame);
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
+		ret = assign_frame(ctx, &frame);
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
 	}
 	return -ETIMEDOUT;
 }
@@ -1079,7 +1129,7 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 	int ret, deadline = 100;
 
 	if (!ctx->dec_open || !ctx->dec_started || ctx->eos_sent)
-		return 0;
+		return ctx->fatal_error;
 
 	ret = v4l2_dec_flush(&ctx->dec);
 	if (ret)
@@ -1092,7 +1142,11 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 		int changed;
 
 		ret = v4l2_dec_poll_cap(&ctx->dec, 20);
-		if (ret <= 0)
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
+		if (!ret)
 			continue;
 		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
 		if (ret)
@@ -1100,22 +1154,30 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 		while (v4l2_dec_dqout(&ctx->dec) == 0)
 			;
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
-		if (ret < 0)
+		if (ret == -EAGAIN)
 			continue;
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
 		DBG("[flush] got ts=%llu flags=0x%x\n",
 		    (unsigned long long)frame.timestamp, frame.flags);
-		if (frame.bytesused)
-			assign_frame(ctx, &frame);
+		if (frame.bytesused && assign_frame(ctx, &frame) < 0) {
+			ctx->fatal_error = -EIO;
+			return ctx->fatal_error;
+		}
 		if (ret == 1)
 			break;
 	}
-	return 0;
+	return ctx->dec.eos ? 0 : -ETIMEDOUT;
 }
 
 /* Non-blocking drain of whatever frames are ready. */
 static int
 drain_available(struct iris_decode_ctx *ctx)
 {
+	if (ctx->fatal_error)
+		return ctx->fatal_error;
 	if (ctx->eos_sent)
 		return 0;
 
@@ -1124,7 +1186,11 @@ drain_available(struct iris_decode_ctx *ctx)
 		int changed, ret;
 
 		ret = v4l2_dec_poll(&ctx->dec, 0);
-		if (ret <= 0)
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
+		if (!ret)
 			break;
 		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
 		if (ret)
@@ -1132,9 +1198,17 @@ drain_available(struct iris_decode_ctx *ctx)
 		while (v4l2_dec_dqout(&ctx->dec) == 0)
 			;
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
-		if (ret < 0)
+		if (ret == -EAGAIN)
 			break;
-		assign_frame(ctx, &frame);
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
+		ret = assign_frame(ctx, &frame);
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
 		if (ctx->direct_error)
 			return ctx->direct_error;
 	}
@@ -1150,6 +1224,10 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 
 	if (ctx->direct_error)
 		return ctx->direct_error;
+	if (ctx->fatal_error)
+		return ctx->fatal_error;
+	if (!s)
+		return -EINVAL;
 	/* Chrome creates its VAContext before it asks for the first surface.  The
 	 * opt-in pool preallocation has happened by the first BeginPicture, so bind
 	 * the deferred fixed ring here, before V4L2 is opened. */
@@ -1176,19 +1254,16 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 	/* VA clients reuse render targets.  A surface that held an earlier
 	 * picture must become pending again, otherwise vaSyncSurface can return
 	 * the stale backing before the newly decoded picture is copied into it. */
-	if (s) {
-		s->generation++;
-		ctx->current_generation = s->generation;
-		s->decoded = 0;
-		s->queued = 0;
-	} else {
-		ctx->current_generation = 0;
-	}
+	s->generation++;
+	ctx->current_generation = s->generation;
+	s->decoded = 0;
+	s->queued = 0;
 	ctx->have_pic = 0;
 	ctx->have_hevc_pic = 0;
 	ctx->slice_len = 0;
 	ctx->refs_l0 = 0;
 	ctx->refs_l1 = 0;
+	ctx->h264_slice_count = 0;
 	ctx->hevc_slice_count = 0;
 	ctx->hevc_slice_next = 0;
 	ctx->hevc_pps_id = -1;
@@ -1200,10 +1275,15 @@ int
 iris_decode_slice_params(struct iris_decode_ctx *ctx,
 			 const VASliceParameterBufferH264 *sp)
 {
-		if (sp->num_ref_idx_l0_active_minus1 > ctx->refs_l0)
+	if (sp->num_ref_idx_l0_active_minus1 > ctx->refs_l0)
 		ctx->refs_l0 = sp->num_ref_idx_l0_active_minus1;
 	if (sp->num_ref_idx_l1_active_minus1 > ctx->refs_l1)
 		ctx->refs_l1 = sp->num_ref_idx_l1_active_minus1;
+	if (ctx->h264_slice_count >= ARRAY_SIZE(ctx->h264_slices))
+		return -1;
+	memcpy(&ctx->h264_slices[ctx->h264_slice_count].param, sp,
+	       sizeof(*sp));
+	ctx->h264_slice_count++;
 	return 0;
 }
 
@@ -1217,11 +1297,33 @@ iris_decode_picture(struct iris_decode_ctx *ctx,
 }
 
 int
+iris_decode_h264_iq_matrix(struct iris_decode_ctx *ctx,
+			   const VAIQMatrixBufferH264 *iq)
+{
+	if (!iq)
+		return -EINVAL;
+	memcpy(&ctx->h264_iq, iq, sizeof(*iq));
+	ctx->have_h264_iq = 1;
+	return 0;
+}
+
+int
 iris_decode_hevc_picture(struct iris_decode_ctx *ctx,
 			 const VAPictureParameterBufferHEVC *pic)
 {
 	memcpy(&ctx->hevc_pic, pic, sizeof(*pic));
 	ctx->have_hevc_pic = 1;
+	return 0;
+}
+
+int
+iris_decode_hevc_iq_matrix(struct iris_decode_ctx *ctx,
+			   const VAIQMatrixBufferHEVC *iq)
+{
+	if (!iq)
+		return -EINVAL;
+	memcpy(&ctx->hevc_iq, iq, sizeof(*iq));
+	ctx->have_hevc_iq = 1;
 	return 0;
 }
 
@@ -1251,6 +1353,56 @@ has_start_code(const uint8_t *p, size_t len)
 	if (len >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1)
 		return 3;
 	return 0;
+}
+
+/* VA exposes the effective reference counts for each slice.  Those values
+ * include slice-header overrides and therefore must not be copied into the
+ * PPS on every picture.  Find slices that actually use the PPS defaults and
+ * learn the stable values from their VA parameters. */
+static int
+h264_update_pps_defaults(struct iris_decode_ctx *ctx)
+{
+	size_t i = 0;
+	unsigned int slice = 0;
+
+	while (i + 3 < ctx->slice_len) {
+		int sc = has_start_code(ctx->slice_data + i,
+					ctx->slice_len - i);
+		size_t start, end;
+		int mask;
+		const VASliceParameterBufferH264 *sp;
+
+		if (!sc) {
+			i++;
+			continue;
+		}
+		start = i + sc;
+		end = start;
+		while (end < ctx->slice_len &&
+		       !has_start_code(ctx->slice_data + end,
+				       ctx->slice_len - end))
+			end++;
+		if (end <= start || (ctx->slice_data[start] & 0x1f) < 1 ||
+		    (ctx->slice_data[start] & 0x1f) > 5) {
+			i = end;
+			continue;
+		}
+		if (slice >= ctx->h264_slice_count)
+			return -1;
+		sp = &ctx->h264_slices[slice++].param;
+		mask = h264_slice_default_ref_mask(ctx->slice_data + start,
+						  end - start, &ctx->pic);
+		if (mask < 0)
+			return -1;
+		if (mask & 1)
+			ctx->h264_pps_refs_l0 =
+				sp->num_ref_idx_l0_active_minus1;
+		if (mask & 2)
+			ctx->h264_pps_refs_l1 =
+				sp->num_ref_idx_l1_active_minus1;
+		i = end;
+	}
+	return slice == ctx->h264_slice_count ? 0 : -1;
 }
 
 static int
@@ -1446,10 +1598,12 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 		return -1;
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
-	au_cap = ctx->slice_len + 256;
+	au_cap = ctx->slice_len + sizeof(ctx->last_sps) +
+		 sizeof(ctx->last_pps) + 16;
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC)
 		au_cap += sizeof(ctx->raw_hevc_vps) + sizeof(ctx->raw_hevc_sps) +
-			  sizeof(ctx->raw_hevc_pps) + 16;
+			  sizeof(ctx->raw_hevc_pps) + sizeof(ctx->last_hevc_sps) +
+			  16;
 	if (ctx->au_cap < au_cap) {
 		void *n = realloc(ctx->au_data, au_cap);
 
@@ -1519,7 +1673,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 			au_len = 4 + n;
 		}
 		n = hevc_build_sps(au + au_len + 4, au_cap - au_len - 4 -
-				   ctx->slice_len, &ctx->hevc_pic);
+				   ctx->slice_len, &ctx->hevc_pic,
+				   ctx->have_hevc_iq ? &ctx->hevc_iq : NULL);
 		if (n <= 0) {
 			return -1;
 		}
@@ -1552,10 +1707,24 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	hevc_au_ready:
 		;
 	} else {
+	/* An IDR slice does not use the PPS reference defaults, so VA reports
+	 * zero for both lists.  Starting the stream with those zeros and later
+	 * redefining pps_id 0 when the first P/B slice arrives crashes legacy
+	 * Venus firmware.  Seed the conventional decoder default (up to three
+	 * active L0 references, bounded by max_num_ref_frames); a later slice
+	 * that actually uses the defaults supplies the exact values. */
+	if (ctx->h264_pps_refs_l0 < 0)
+		ctx->h264_pps_refs_l0 = ctx->pic.num_ref_frames ?
+			(ctx->pic.num_ref_frames > 3 ? 2 :
+			 ctx->pic.num_ref_frames - 1) : 0;
+	if (ctx->h264_pps_refs_l1 < 0)
+		ctx->h264_pps_refs_l1 = 0;
+	if (h264_update_pps_defaults(ctx))
+		return -1;
 	/* Only re-emit SPS/PPS when they change; a per-picture repetition
 	 * resets the firmware DPB and breaks P-frame references. */
 	n = h264_build_sps(au + 4, au_cap - 4 - ctx->slice_len, &ctx->pic,
-			   ctx->profile);
+			   ctx->profile, ctx->width, ctx->height);
 	if (n <= 0) {
 		return -1;
 	}
@@ -1568,7 +1737,12 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	}
 
 	n = h264_build_pps(au + au_len + 4, au_cap - au_len - 4 -
-			   ctx->slice_len, &ctx->pic, ctx->refs_l0, ctx->refs_l1);
+			   ctx->slice_len, &ctx->pic,
+			   ctx->have_h264_iq ? &ctx->h264_iq : NULL,
+			   ctx->h264_pps_refs_l0 < 0 ? 0 :
+			   ctx->h264_pps_refs_l0,
+			   ctx->h264_pps_refs_l1 < 0 ? 0 :
+			   ctx->h264_pps_refs_l1);
 	if (n <= 0) {
 		return -1;
 	}
@@ -1587,33 +1761,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	au_len += ctx->slice_len;
 	}
 
-	/* Chromium flushes its software DPB at end of stream but has no libva
-	 * operation that sends EOS to a stateful V4L2 decoder.  Iris would then
-	 * keep the final picture internally while Chromium presents its surface;
-	 * when the context is reset that surface still contains its previous
-	 * frame.  A trailing AUD starts the next access-unit boundary and makes
-	 * firmware release the current picture without making vaEndPicture wait,
-	 * so normal decode remains pipelined behind the DMA-BUF fence. */
-	if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
-		static const uint8_t aud[] = { 0, 0, 0, 1, 0x09, 0xf0 };
-
-		if (au_len + sizeof(aud) > au_cap) {
-			return -1;
-		}
-		memcpy(au + au_len, aud, sizeof(aud));
-		au_len += sizeof(aud);
-	} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
-		/* AUD_NUT, layer_id 0, temporal_id_plus1 1, pic_type 2. */
-		static const uint8_t aud[] = {
-			0, 0, 0, 1, 0x46, 0x01, 0x50
-		};
-
-		if (au_len + sizeof(aud) > au_cap) {
-			return -1;
-		}
-		memcpy(au + au_len, aud, sizeof(aud));
-		au_len += sizeof(aud);
-	}
+	/* Each V4L2 OUTPUT buffer must contain exactly one access unit.  In
+	 * particular, do not append an AUD: it starts an empty next access unit
+	 * and crashes legacy Iris firmware on otherwise valid streams. */
 
 	/* Opt-in bitstream capture for validating the VA-to-stateful translation
 	 * with an independent software decoder. */
@@ -1700,7 +1850,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 				ret = v4l2_dec_feed(&ctx->dec, au, au_len, ts);
 				if (ret != -EAGAIN)
 					break;
-				drain_available(ctx);
+				ret = drain_available(ctx);
+				if (ret)
+					break;
 				v4l2_dec_poll(&ctx->dec, 50);
 			}
 			if (ret) {
@@ -1719,7 +1871,9 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	 * arrives.  Draining right after this feed makes the *previous*
 	 * picture's frame available so a client that syncs one picture at a
 	 * time (ffmpeg/Chrome) does not deadlock. */
-	drain_available(ctx);
+	ret = drain_available(ctx);
+	if (ret)
+		return ret;
 
 	/* Chrome sends a decoded frame to ANGLE immediately after vaEndPicture.
 	 * Its GL DMA-BUF import can sample the previous contents even though a
@@ -1756,11 +1910,17 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 	/* Chrome preallocates a surface pool and syncs each freshly created
 	 * (never-decoded) surface before exporting it.  The backing buffer is
 	 * already valid, so an unqueued surface syncs immediately. */
-	if (s && !s->queued)
+	if (!s)
+		return -EINVAL;
+	if (ctx->fatal_error)
+		return ctx->fatal_error;
+	if (!s->queued)
 		return 0;
 
 	if (iris_decode_surface_ready(ctx, id))
 		return 0;
+	if (ctx->fatal_error)
+		return ctx->fatal_error;
 
 	/* The stateful firmware holds the last queued picture until an EOS
 	 * marker arrives.  If the client is syncing that final picture, feed
@@ -1779,7 +1939,11 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 		/* Wait for real CAPTURE progress; POLLOUT would wake us
 		 * instantly and burn the deadline before any frame is done. */
 		ret = v4l2_dec_poll_cap(&ctx->dec, 20);
-		if (ret <= 0)
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
+		if (!ret)
 			continue;
 		(void)changed;
 		ret = v4l2_dec_handle_events(&ctx->dec, &changed);
@@ -1788,21 +1952,30 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 		while (v4l2_dec_dqout(&ctx->dec) == 0)
 			;
 		ret = v4l2_dec_dqcap(&ctx->dec, &frame);
-		if (ret < 0)
+		if (ret == -EAGAIN)
 			continue;
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
 		DBG("[sync] got ts=%llu\n",
 		    (unsigned long long)frame.timestamp);
-		assign_frame(ctx, &frame);
+		ret = assign_frame(ctx, &frame);
+		if (ret < 0) {
+			ctx->fatal_error = ret;
+			return ret;
+		}
 		if (iris_decode_surface_ready(ctx, id))
 			return 0;
 	}
-	return -1;
+	return -ETIMEDOUT;
 }
 
 static int
 iris_decode_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
-	drain_available(ctx);
+	if (drain_available(ctx))
+		return 0;
 	{
 		struct iris_surface *s = find_surface(ctx, id);
 

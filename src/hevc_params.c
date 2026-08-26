@@ -61,6 +61,73 @@ static void bs_trailing(struct bs *b)
 		bs_put(b, 0, 1);
 }
 
+static const uint8_t diag4x4_x[16] = {
+	0, 0, 1, 0, 1, 2, 0, 1, 2, 3, 1, 2, 3, 2, 3, 3,
+};
+static const uint8_t diag4x4_y[16] = {
+	0, 1, 0, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 3, 2, 3,
+};
+static const uint8_t diag8x8_x[64] = {
+	0, 0, 1, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4, 0,
+	1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3,
+	4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6,
+	7, 3, 4, 5, 6, 7, 4, 5, 6, 7, 5, 6, 7, 6, 7, 7,
+};
+static const uint8_t diag8x8_y[64] = {
+	0, 1, 0, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 0, 5,
+	4, 3, 2, 1, 0, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4,
+	3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3,
+	2, 7, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 7, 6, 7,
+};
+
+static void
+hevc_scaling_list_data(struct bs *b, const VAIQMatrixBufferHEVC *iq)
+{
+	unsigned int size_id, matrix_id;
+
+	for (size_id = 0; size_id < 4; size_id++) {
+		unsigned int step = size_id == 3 ? 3 : 1;
+
+		for (matrix_id = 0; matrix_id < 6; matrix_id += step) {
+			const uint8_t *matrix;
+			unsigned int count = size_id ? 64 : 16;
+			int next = 8;
+			unsigned int i;
+
+			bs_put(b, 1, 1); /* scaling_list_pred_mode_flag */
+			if (size_id == 0)
+				matrix = iq->ScalingList4x4[matrix_id];
+			else if (size_id == 1)
+				matrix = iq->ScalingList8x8[matrix_id];
+			else if (size_id == 2)
+				matrix = iq->ScalingList16x16[matrix_id];
+			else
+				matrix = iq->ScalingList32x32[matrix_id / 3];
+			if (size_id == 2) {
+				next = iq->ScalingListDC16x16[matrix_id];
+				bs_se(b, next - 8);
+			} else if (size_id == 3) {
+				next = iq->ScalingListDC32x32[matrix_id / 3];
+				bs_se(b, next - 8);
+			}
+			for (i = 0; i < count; i++) {
+				unsigned int pos = size_id ?
+					diag8x8_y[i] * 8 + diag8x8_x[i] :
+					diag4x4_y[i] * 4 + diag4x4_x[i];
+				int value = matrix[pos];
+				int delta = value - next;
+
+				if (delta > 127)
+					delta -= 256;
+				else if (delta < -128)
+					delta += 256;
+				bs_se(b, delta);
+				next = value;
+			}
+		}
+	}
+}
+
 /* Convert the byte-aligned RBSP held by b into a NAL unit.  The two-byte
  * header is not escaped; emulation-prevention bytes apply to the RBSP only. */
 static int hevc_escape_nal(uint8_t *out, size_t out_size, const struct bs *b)
@@ -159,6 +226,16 @@ hevc_level_for_size(const VAPictureParameterBufferHEVC *pic)
 	return 186;
 }
 
+static unsigned int
+hevc_reorder_pics(const VAPictureParameterBufferHEVC *pic)
+{
+	/* VA-API does not expose sps_max_num_reorder_pics.  Keep it bounded by
+	 * the advertised DPB size; two is sufficient for the common hierarchical
+	 * B-frame streams accepted by the Iris firmware. */
+	return pic->sps_max_dec_pic_buffering_minus1 < 2 ?
+		pic->sps_max_dec_pic_buffering_minus1 : 2;
+}
+
 int
 hevc_build_vps(uint8_t *out, size_t out_size,
 	       const VAPictureParameterBufferHEVC *pic)
@@ -186,12 +263,12 @@ hevc_build_vps(uint8_t *out, size_t out_size,
 	bs_put(&b, 0xffff, 16);	/* vps_reserved_0xffff_16bits */
 	hevc_profile_tier_level(&b, 1, 0,
 			       pic->bit_depth_luma_minus8 ? 2 : 1, 1,
-			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
+			       1,
 			       hevc_level_for_size(pic));
 	bs_put(&b, 1, 1);	/* vps_sub_layer_ordering_info_present */
 	bs_ue(&b, pic->sps_max_dec_pic_buffering_minus1);
-	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 3 : 2);
-	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 0 : 5);
+	bs_ue(&b, hevc_reorder_pics(pic));
+	bs_ue(&b, 0);
 	bs_put(&b, 0, 6);	/* vps_max_layer_id */
 	bs_ue(&b, 0);		/* vps_num_layer_sets_minus1 */
 	bs_put(&b, 0, 1);	/* vps_timing_info_present_flag */
@@ -203,10 +280,11 @@ hevc_build_vps(uint8_t *out, size_t out_size,
 
 int
 hevc_build_sps(uint8_t *out, size_t out_size,
-	       const VAPictureParameterBufferHEVC *pic)
+	       const VAPictureParameterBufferHEVC *pic,
+	       const VAIQMatrixBufferHEVC *iq)
 {
 	struct bs b;
-	uint8_t rbsp[512];
+	uint8_t rbsp[4096];
 	unsigned int cfi;
 
 	if (!out || !pic)
@@ -226,7 +304,7 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, 1, 1);	/* sps_temporal_id_nesting_flag */
 	hevc_profile_tier_level(&b, 1, 0,
 			       pic->bit_depth_luma_minus8 ? 2 : 1, 1,
-			       hevc_level_for_size(pic) >= 153 ? 0 : 1,
+			       1,
 			       hevc_level_for_size(pic));
 	bs_ue(&b, 0);		/* sps_seq_parameter_set_id */
 	bs_ue(&b, cfi);
@@ -238,14 +316,12 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_ue(&b, pic->bit_depth_luma_minus8);
 	bs_ue(&b, pic->bit_depth_chroma_minus8);
 	bs_ue(&b, pic->log2_max_pic_order_cnt_lsb_minus4);
-	/* sub-layer ordering info (one set, present flag = 1).
-	 * VAPictureParameterBufferHEVC lacks sps_max_num_reorder_pics and
-	 * sps_max_latency_increase_plus1; emit typical x265 values (the
-	 * firmware uses them to size the DPB). */
+	/* VA-API omits the original reorder/latency syntax.  Bound reordering by
+	 * the known DPB size and do not invent a latency limit. */
 	bs_put(&b, 1, 1);
 	bs_ue(&b, pic->sps_max_dec_pic_buffering_minus1);
-	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 3 : 2);
-	bs_ue(&b, hevc_level_for_size(pic) >= 153 ? 0 : 5);
+	bs_ue(&b, hevc_reorder_pics(pic));
+	bs_ue(&b, 0);
 	bs_ue(&b, pic->log2_min_luma_coding_block_size_minus3);
 	bs_ue(&b, pic->log2_diff_max_min_luma_coding_block_size);
 	bs_ue(&b, pic->log2_min_transform_block_size_minus2);
@@ -253,10 +329,11 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 	bs_ue(&b, pic->max_transform_hierarchy_depth_inter);
 	bs_ue(&b, pic->max_transform_hierarchy_depth_intra);
 	bs_put(&b, pic->pic_fields.bits.scaling_list_enabled_flag, 1);
-	if (pic->pic_fields.bits.scaling_list_enabled_flag)
-		/* Scaling matrices arrive in a separate VA buffer and cannot be
-		 * represented here.  Signal the HEVC default matrices. */
-		bs_put(&b, 0, 1); /* sps_scaling_list_data_present_flag */
+	if (pic->pic_fields.bits.scaling_list_enabled_flag) {
+		bs_put(&b, iq != NULL, 1); /* sps_scaling_list_data_present_flag */
+		if (iq)
+			hevc_scaling_list_data(&b, iq);
+	}
 	bs_put(&b, pic->pic_fields.bits.amp_enabled_flag, 1);
 	bs_put(&b, pic->slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag,
 	       1);
@@ -282,28 +359,8 @@ hevc_build_sps(uint8_t *out, size_t out_size,
 		bs_ue(&b, 0);
 	bs_put(&b, pic->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag, 1);
 	bs_put(&b, pic->pic_fields.bits.strong_intra_smoothing_enabled_flag, 1);
-	/* VUI with timing info: the original stream carries it (needed by the
-	 * firmware for pacing references).  Field values below match real x265
-	 * output (verified 1080p/4K/8K): aspect_ratio_info=0, video_format=5,
-	 * chroma_loc_info=0. */
-	bs_put(&b, 1, 1);	/* vui_parameters_present_flag */
-	bs_put(&b, 0, 1);	/* aspect_ratio_info_present_flag */
-	bs_put(&b, 0, 1);	/* overscan_info_present_flag */
-	bs_put(&b, 1, 1);	/* video_signal_type_present_flag */
-	bs_put(&b, 5, 3);	/* video_format */
-	bs_put(&b, 0, 1);	/* video_full_range_flag */
-	bs_put(&b, 0, 1);	/* colour_description_present_flag */
-	bs_put(&b, 0, 1);	/* chroma_loc_info_present_flag */
-	bs_put(&b, 0, 1);	/* neutral_chroma_indication_flag */
-	bs_put(&b, 0, 1);	/* field_seq_flag */
-	bs_put(&b, 0, 1);	/* frame_field_info_present_flag */
-	bs_put(&b, 0, 1);	/* default_display_window_flag */
-	bs_put(&b, 1, 1);	/* vui_timing_info_present_flag */
-	bs_put(&b, 1, 32);	/* vui_num_units_in_tick = 1 */
-	bs_put(&b, 25, 32);	/* vui_time_scale = 25 */
-	bs_put(&b, 0, 1);	/* vui_poc_proportional_to_timing_flag */
-	bs_put(&b, 0, 1);	/* vui_hrd_parameters_present_flag */
-	bs_put(&b, 0, 1);	/* vui_bitstream_restriction_flag */
+	/* VUI/timing/colour metadata is absent from the VA picture buffer. */
+	bs_put(&b, 0, 1);	/* vui_parameters_present_flag */
 	bs_put(&b, 0, 1);	/* sps_extension_present_flag */
 
 	bs_trailing(&b);

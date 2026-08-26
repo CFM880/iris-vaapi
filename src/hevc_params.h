@@ -14,7 +14,8 @@ int hevc_build_vps(uint8_t *out, size_t out_size,
 		   const VAPictureParameterBufferHEVC *pic);
 /* Build an SPS NAL unit (without start code).  Returns the NAL size. */
 int hevc_build_sps(uint8_t *out, size_t out_size,
-		   const VAPictureParameterBufferHEVC *pic);
+		   const VAPictureParameterBufferHEVC *pic,
+		   const VAIQMatrixBufferHEVC *iq);
 /* Build a PPS NAL unit (without start code).  Returns the NAL size. */
 int hevc_build_pps(uint8_t *out, size_t out_size,
 		   const VAPictureParameterBufferHEVC *pic);

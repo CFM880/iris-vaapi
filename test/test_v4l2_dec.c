@@ -53,10 +53,13 @@ static long find_start(const unsigned char *buf, size_t size, size_t from)
 	size_t i;
 
 	for (i = from; i + 3 < size; i++) {
-		if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)
-			return i;
 		if (i + 4 < size && buf[i] == 0 && buf[i + 1] == 0 &&
 		    buf[i + 2] == 0 && buf[i + 3] == 1)
+			return i;
+		/* Do not rediscover bytes 1..3 of a four-byte start code as a
+		 * second three-byte start code. */
+		if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 &&
+		    (i == 0 || buf[i - 1] != 0))
 			return i;
 	}
 	return -1;
@@ -138,7 +141,7 @@ int main(int argc, char **argv)
 		while (pos >= 0) {
 			next = find_start(stream, fsize, pos + 1);
 			{
-				size_t nalo = pos + (stream[pos + 2] == 0 ? 3 : 2) + 1;
+				size_t nalo = pos + (stream[pos + 2] == 1 ? 3 : 4);
 				int t = nal_type(stream, nalo);
 				int vcl = (t >= 1 && t <= 5);
 				int fm = vcl ? first_mb(stream, fsize, nalo) : -1;
@@ -254,6 +257,43 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Stateful decoders may retain the final picture until STOP/EOS. */
+	ret = v4l2_dec_flush(&dec);
+	if (ret) {
+		fprintf(stderr, "flush failed ret=%d\n", ret);
+		return 1;
+	}
+	for (;;) {
+		int changed;
+
+		ret = v4l2_dec_poll_cap(&dec, 3000);
+		if (ret <= 0) {
+			fprintf(stderr, "drain poll %s\n",
+				ret ? "failed" : "timed out");
+			return 1;
+		}
+		ret = v4l2_dec_handle_events(&dec, &changed);
+		if (ret)
+			return 1;
+		for (;;) {
+			ret = v4l2_dec_dqcap(&dec, &frame);
+			if (ret == -EAGAIN)
+				break;
+			if (ret < 0)
+				return 1;
+			if (frame.bytesused) {
+				frames++;
+				if (dump && frames == 1)
+					fwrite(frame.mem, 1, frame.bytesused, dump);
+			}
+			if (ret == 1)
+				goto drained;
+			v4l2_dec_qcap(&dec, &frame);
+		}
+	}
+
+drained:
+
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
@@ -266,5 +306,5 @@ int main(int argc, char **argv)
 	v4l2_dec_close(&dec);
 	free(stream);
 	free(aus);
-	return 0;
+	return frames ? 0 : 1;
 }

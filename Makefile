@@ -3,7 +3,7 @@ CFLAGS ?= -O2
 # VA driver callbacks intentionally leave some ABI parameters unused.
 CFLAGS += -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS += $(shell pkg-config --cflags libva 2>/dev/null)
-LDFLAGS += -lva -ldl
+LDLIBS += -lva -ldl
 
 BUILD = build
 DRIVER = $(BUILD)/iris_drv_video.so
@@ -36,7 +36,7 @@ DECODE_OBJ = $(BUILD)/decode.o
 
 $(DRIVER): src/iris_vaapi.c $(BUILD)/decode.o $(BUILD)/v4l2_dec.o $(BUILD)/h264_params.o $(BUILD)/hevc_params.o $(HEVC_REWRITE_OBJ)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(LDFLAGS) $(LDLIBS)
 
 $(DECODE_OBJ): src/decode.c src/decode.h src/v4l2_dec.h src/h264_params.h src/hevc_params.h src/hevc_slice_rewrite.h
 	@mkdir -p $(BUILD)
@@ -56,7 +56,7 @@ $(V4L2_OBJ): src/v4l2_dec.c src/v4l2_dec.h src/iris_surface_fence.h
 
 $(TEST_VA): test/test_va.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -lva-drm
 
 $(TEST_V4L2): test/test_v4l2_dec.c $(V4L2_OBJ) src/v4l2_dec.h
 	@mkdir -p $(BUILD)
@@ -72,11 +72,11 @@ $(TEST_H264): test/test_h264_params.c $(H264_OBJ) src/h264_params.h
 
 $(TEST_VADEC): test/test_va_decode.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -lva-drm
 
 $(TEST_VP9): test/test_va_vp9.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -lva-drm
 
 $(TEST_V4L2_VP9): test/test_v4l2_vp9.c $(V4L2_OBJ) src/v4l2_dec.h
 	@mkdir -p $(BUILD)
@@ -96,7 +96,7 @@ $(TEST_HEVC_REWRITE): test/test_hevc_slice_rewrite.c $(HEVC_REWRITE_OBJ) src/hev
 
 $(TEST_VA_STRESS): test/test_va_stress.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -lva-drm
 
 $(TEST_SURFACE_FENCE): test/test_surface_fence.c src/iris_surface_fence.h
 	@mkdir -p $(BUILD)
@@ -105,7 +105,8 @@ $(TEST_SURFACE_FENCE): test/test_surface_fence.c src/iris_surface_fence.h
 clean:
 	rm -rf $(BUILD)
 
-check: $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE)
+check: $(TEST_H264) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE)
+	./$(TEST_H264)
 	./$(TEST_HEVC_PARAMS)
 	./$(TEST_HEVC_REWRITE)
 

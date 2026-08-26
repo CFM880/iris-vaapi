@@ -304,9 +304,11 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	struct v4l2_requestbuffers req;
 	struct v4l2_event_subscription sub;
 	unsigned int i;
+	int ret;
 
 	memset(d, 0, sizeof(*d));
 	d->cap_memory = V4L2_MEMORY_MMAP;
+	d->fd = -1;
 	d->fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
 	if (d->fd < 0) {
 		perror("open /dev/video0");
@@ -315,12 +317,14 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 
 	if (xioctl(d->fd, VIDIOC_QUERYCAP, &cap) < 0) {
 		perror("QUERYCAP");
-		return -errno;
+		ret = -errno;
+		goto error;
 	}
 	if (!(cap.capabilities & V4L2_CAP_VIDEO_M2M_MPLANE)) {
 		fprintf(stderr, "not an M2M mplane device: %s\n",
 			(char *)cap.driver);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error;
 	}
 	printf("v4l2-dec: device %s driver '%s' card '%s'\n", dev ? dev : "/dev/video0",
 	       (char *)cap.driver, (char *)cap.card);
@@ -346,7 +350,8 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		out_sizeimage(width, height);
 	if (xioctl(d->fd, VIDIOC_S_FMT, &d->out_fmt) < 0) {
 		perror("S_FMT OUTPUT");
-		return -errno;
+		ret = -errno;
+		goto error;
 	}
 
 	/* Select the raw output before OUTPUT STREAMON.  HFI Gen1 applies the
@@ -362,12 +367,14 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	cap_fmt.fmt.pix_mp.num_planes = 1;
 	if (xioctl(d->fd, VIDIOC_S_FMT, &cap_fmt) < 0) {
 		perror("S_FMT CAPTURE preconfigure");
-		return -errno;
+		ret = -errno;
+		goto error;
 	}
 	if (cap_fmt.fmt.pix_mp.pixelformat != cap_pixelformat) {
 		fprintf(stderr, "CAPTURE format %#x rejected (got %#x)\n",
 			cap_pixelformat, cap_fmt.fmt.pix_mp.pixelformat);
-		return -ENOTSUP;
+		ret = -ENOTSUP;
+		goto error;
 	}
 
 	/* Chrome can release a VA surface for presentation before a stateful
@@ -382,15 +389,20 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	req.memory = V4L2_MEMORY_MMAP;
 	if (xioctl(d->fd, VIDIOC_REQBUFS, &req) < 0) {
 		perror("REQBUFS OUTPUT");
-		return -errno;
+		ret = -errno;
+		goto error;
 	}
 	d->out_count = req.count;
 	d->out_meta = calloc(d->out_count, sizeof(*d->out_meta));
-	if (!d->out_meta)
-		return -ENOMEM;
+	if (!d->out_meta) {
+		ret = -ENOMEM;
+		goto error;
+	}
 	d->free_out = malloc(d->out_count * sizeof(*d->free_out));
-	if (!d->free_out)
-		return -ENOMEM;
+	if (!d->free_out) {
+		ret = -ENOMEM;
+		goto error;
+	}
 	for (i = 0; i < d->out_count; i++)
 		d->free_out[i] = d->out_count - 1 - i;
 	d->free_out_n = d->out_count;
@@ -401,13 +413,24 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		d->out_meta[i].index = i;
 		d->out_meta[i].m.planes = calloc(1, sizeof(struct v4l2_plane));
 		d->out_meta[i].length = 1;
-		if (xioctl(d->fd, VIDIOC_QUERYBUF, &d->out_meta[i]) < 0)
-			return -errno;
+		if (!d->out_meta[i].m.planes) {
+			ret = -ENOMEM;
+			goto error;
+		}
+		if (xioctl(d->fd, VIDIOC_QUERYBUF, &d->out_meta[i]) < 0) {
+			ret = -errno;
+			goto error;
+		}
 	}
-	if (v4l2_dec_mmap(d, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) < 0)
-		return -ENOMEM;
+	ret = v4l2_dec_mmap(d, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+	if (ret)
+		goto error;
 
 	return 0;
+
+error:
+	v4l2_dec_close(d);
+	return ret;
 }
 
 int v4l2_dec_set_capture_dmabufs(struct v4l2_dec *d, const int *fds,
@@ -417,23 +440,75 @@ int v4l2_dec_set_capture_dmabufs(struct v4l2_dec *d, const int *fds,
 		return -EINVAL;
 	d->cap_dmabuf_fds = malloc(count * sizeof(*d->cap_dmabuf_fds));
 	d->cap_dmabuf_sizes = malloc(count * sizeof(*d->cap_dmabuf_sizes));
-	if (!d->cap_dmabuf_fds || !d->cap_dmabuf_sizes)
+	if (!d->cap_dmabuf_fds || !d->cap_dmabuf_sizes) {
+		free(d->cap_dmabuf_fds);
+		free(d->cap_dmabuf_sizes);
+		d->cap_dmabuf_fds = NULL;
+		d->cap_dmabuf_sizes = NULL;
 		return -ENOMEM;
+	}
 	memcpy(d->cap_dmabuf_fds, fds, count * sizeof(*fds));
 	memcpy(d->cap_dmabuf_sizes, sizes, count * sizeof(*sizes));
 	d->cap_dmabuf_count = count;
 	return 0;
 }
 
+static int v4l2_dec_wait_first_source_change(struct v4l2_dec *d)
+{
+	struct pollfd pfd = {
+		.fd = d->fd,
+		.events = POLLPRI,
+	};
+	struct v4l2_event ev;
+	struct v4l2_format fmt;
+	int ret;
+
+	for (;;) {
+		do {
+			ret = poll(&pfd, 1, 3000);
+		} while (ret < 0 && errno == EINTR);
+		if (ret == 0)
+			return -ETIMEDOUT;
+		if (ret < 0)
+			return -errno;
+
+		memset(&ev, 0, sizeof(ev));
+		if (xioctl(d->fd, VIDIOC_DQEVENT, &ev) < 0) {
+			if (errno == EAGAIN || errno == ENOENT)
+				continue;
+			return -errno;
+		}
+		if (ev.type != V4L2_EVENT_SOURCE_CHANGE)
+			continue;
+
+		memset(&fmt, 0, sizeof(fmt));
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		if (xioctl(d->fd, VIDIOC_G_FMT, &fmt) < 0)
+			return -errno;
+		d->width = fmt.fmt.pix_mp.width;
+		d->height = fmt.fmt.pix_mp.height;
+		return 0;
+	}
+}
+
 int v4l2_dec_start(struct v4l2_dec *d)
 {
 	enum v4l2_buf_type type;
+	int ret;
 
 	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	if (xioctl(d->fd, VIDIOC_STREAMON, &type) < 0)
 		return -errno;
 	d->streaming = 1;
 
+	/* A stateful decoder does not know its decoded layout until the first
+	 * compressed access unit has been parsed.  Starting CAPTURE immediately
+	 * races that sequence event; legacy Venus can enter a global fatal state
+	 * if SESSION_START arrives while the instance is still in FIRST_IPSC
+	 * (substate 0x80). */
+	ret = v4l2_dec_wait_first_source_change(d);
+	if (ret)
+		return ret;
 	return v4l2_dec_setup_capture(d);
 }
 
@@ -721,8 +796,14 @@ void v4l2_dec_close(struct v4l2_dec *d)
 			r = v4l2_dec_dqcap(d, &frame);
 			if (r == 1)
 				break;	/* FLAG_LAST seen */
-			if (r < 0)
+			if (!r) {
+				if (v4l2_dec_qcap(d, &frame) < 0)
+					break;
+			} else if (r == -EAGAIN) {
 				v4l2_dec_poll_cap(d, 10);
+			} else if (r < 0) {
+				break;
+			}
 		}
 	}
 	v4l2_dec_stop(d);

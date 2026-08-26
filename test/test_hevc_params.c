@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Validate HEVC VPS/SPS/PPS re-serialization: reconstruct parameter sets from
- * a real VAPictureParameterBufferHEVC (values matching the 1920x1080 x265
- * test stream) and dump the NAL bytes for comparison against the original.
+/* Validate HEVC VPS/SPS/PPS fallback serialization from a real
+ * VAPictureParameterBufferHEVC.  Fields unavailable through VA-API (notably
+ * VUI timing) must remain absent instead of being fabricated.
  */
 
 #include <stdio.h>
@@ -27,19 +27,17 @@ static int check_nal(const char *name, const uint8_t *got, int got_len,
 
 int main(void)
 {
-	/* Parameter NALs extracted from the matching x265 1080p fixture. */
+	/* Canonical fallback NALs for the matching x265 1080p picture fields. */
 	static const uint8_t expected_vps[] = {
 		0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60,
 		0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
-		0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x98, 0x09,
+		0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0xc0, 0x90,
 	};
 	static const uint8_t expected_sps[] = {
 		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
 		0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
 		0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5,
-		0x96, 0x56, 0x69, 0x24, 0xca, 0xe6, 0x80, 0x80,
-		0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0c,
-		0x84,
+		0x96, 0x57, 0x92, 0x4c, 0xac, 0x80,
 	};
 	static const uint8_t expected_pps[] = {
 		0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40,
@@ -49,6 +47,7 @@ int main(void)
 		0x0f, 0xf1, 0x48, 0x48,
 	};
 	VAPictureParameterBufferHEVC pic;
+	VAIQMatrixBufferHEVC iq;
 	uint8_t out[512];
 	int n, failed = 0;
 
@@ -58,6 +57,15 @@ int main(void)
 	pic.pic_fields.bits.chroma_format_idc = 1;
 	pic.bit_depth_luma_minus8 = 0;
 	pic.bit_depth_chroma_minus8 = 0;
+	memset(&iq, 16, sizeof(iq));
+	pic.pic_fields.bits.scaling_list_enabled_flag = 1;
+	n = hevc_build_sps(out, sizeof(out), &pic, &iq);
+	if (n <= (int)sizeof(expected_sps) ||
+	    hevc_build_sps(out, 32, &pic, &iq) >= 0) {
+		fprintf(stderr, "HEVC scaling-list serialization failed\n");
+		failed = 1;
+	}
+	pic.pic_fields.bits.scaling_list_enabled_flag = 0;
 	pic.log2_max_pic_order_cnt_lsb_minus4 = 4;
 	pic.sps_max_dec_pic_buffering_minus1 = 4;
 	pic.log2_min_luma_coding_block_size_minus3 = 0;
@@ -86,7 +94,7 @@ int main(void)
 	n = hevc_build_vps(out, sizeof(out), &pic);
 	failed |= check_nal("VPS", out, n, expected_vps,
 			    sizeof(expected_vps));
-	n = hevc_build_sps(out, sizeof(out), &pic);
+	n = hevc_build_sps(out, sizeof(out), &pic, NULL);
 	failed |= check_nal("SPS", out, n, expected_sps,
 			    sizeof(expected_sps));
 	n = hevc_build_pps(out, sizeof(out), &pic);
@@ -102,7 +110,7 @@ int main(void)
 		fprintf(stderr, "VPS did not signal Main10 profile\n");
 		failed = 1;
 	}
-	n = hevc_build_sps(out, sizeof(out), &pic);
+	n = hevc_build_sps(out, sizeof(out), &pic, NULL);
 	if (n < 5 || out[3] != 0x02 || out[4] != 0x20) {
 		fprintf(stderr, "SPS did not signal Main10 profile\n");
 		failed = 1;
@@ -130,10 +138,10 @@ int main(void)
 
 	/* All builders must reject an output buffer that cannot hold the NAL. */
 	if (hevc_build_vps(out, 2, &pic) >= 0 ||
-	    hevc_build_sps(out, 2, &pic) >= 0 ||
+	    hevc_build_sps(out, 2, &pic, NULL) >= 0 ||
 	    hevc_build_pps(out, 2, &pic) >= 0 ||
 	    hevc_build_vps(NULL, sizeof(out), &pic) >= 0 ||
-	    hevc_build_sps(out, sizeof(out), NULL) >= 0) {
+	    hevc_build_sps(out, sizeof(out), NULL, NULL) >= 0) {
 		fprintf(stderr, "invalid builder input was not rejected\n");
 		failed = 1;
 	}

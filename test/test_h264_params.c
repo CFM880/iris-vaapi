@@ -57,6 +57,50 @@ static int br_se(struct br *b)
 	return (u & 1) ? (int)((u + 1) >> 1) : -(int)(u >> 1);
 }
 
+static int serializer_selftest(void)
+{
+	VAPictureParameterBufferH264 pic;
+	VAIQMatrixBufferH264 iq;
+	uint8_t out[4096];
+	/* first_mb=0, P slice, pps=0, frame_num=0, then override flag */
+	static const uint8_t p_default[] = { 0x41, 0xe0 };
+	static const uint8_t p_override[] = { 0x41, 0xe1 };
+	int n;
+
+	memset(&pic, 0, sizeof(pic));
+	memset(&iq, 16, sizeof(iq));
+	pic.seq_fields.bits.chroma_format_idc = 1;
+	pic.seq_fields.bits.frame_mbs_only_flag = 1;
+	pic.seq_fields.bits.direct_8x8_inference_flag = 1;
+	pic.pic_fields.bits.transform_8x8_mode_flag = 1;
+	pic.picture_width_in_mbs_minus1 = 19;
+	pic.picture_height_in_mbs_minus1 = 14;
+	pic.num_ref_frames = 4;
+	n = h264_build_sps(out, sizeof(out), &pic, VAProfileH264High, 320, 240);
+	if (n <= 0 ||
+	    h264_build_sps(out, 2, &pic, VAProfileH264High, 320, 240) >= 0)
+		return 1;
+	if (h264_build_sps(out, sizeof(out), NULL, VAProfileH264High,
+			   320, 240) >= 0)
+		return 1;
+	n = h264_build_sps(out, sizeof(out), &pic, VAProfileH264Main, 320, 240);
+	if (n <= 0)
+		return 1;
+	n = h264_build_pps(out, sizeof(out), &pic, &iq, 1, 0);
+	if (n <= 0 || h264_build_pps(out, 2, &pic, &iq, 1, 0) >= 0)
+		return 1;
+	pic.seq_fields.bits.pic_order_cnt_type = 2;
+	if (h264_slice_default_ref_mask(p_default, sizeof(p_default), &pic) != 1 ||
+	    h264_slice_default_ref_mask(p_override, sizeof(p_override), &pic) != 0 ||
+	    h264_slice_default_ref_mask(p_default, 1, &pic) >= 0)
+		return 1;
+	pic.seq_fields.bits.pic_order_cnt_type = 1;
+	if (h264_build_sps(out, sizeof(out), &pic, VAProfileH264High,
+			   320, 240) >= 0)
+		return 1;
+	return 0;
+}
+
 static long find_start(const uint8_t *buf, size_t size, size_t from)
 {
 	size_t i;
@@ -167,8 +211,7 @@ int main(int argc, char **argv)
 	int out_sps_len, out_pps_len;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s input.h264 [reconstructed.h264]\n", argv[0]);
-		return 2;
+		return serializer_selftest();
 	}
 	path = argv[1];
 
@@ -222,10 +265,14 @@ int main(int argc, char **argv)
 	       pic.seq_fields.bits.pic_order_cnt_type,
 	       pic.num_ref_frames,
 	       pic.seq_fields.bits.frame_mbs_only_flag);
+	printf("first slice default-ref mask=%d\n",
+	       h264_slice_default_ref_mask(slice_nal, slice_len, &pic));
 
 	out_sps_len = h264_build_sps(out_sps, sizeof(out_sps), &pic,
-				    VAProfileH264High);
-	out_pps_len = h264_build_pps(out_pps, sizeof(out_pps), &pic, 1, 0);
+				    VAProfileH264High,
+				    (pic.picture_width_in_mbs_minus1 + 1) * 16,
+				    (pic.picture_height_in_mbs_minus1 + 1) * 16);
+	out_pps_len = h264_build_pps(out_pps, sizeof(out_pps), &pic, NULL, 1, 0);
 	printf("rebuilt SPS %d bytes, PPS %d bytes\n", out_sps_len, out_pps_len);
 
 	out = fopen(outpath, "wb");
