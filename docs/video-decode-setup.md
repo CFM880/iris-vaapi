@@ -153,7 +153,7 @@ options qcom_iris allow_fw_boot=1 cached_capture=1
 ```
 
 - `allow_fw_boot=1`：允许打开视频节点时启动 Iris 固件；
-- `cached_capture=1`：为 H.264/HEVC 使用 cacheable CAPTURE，4K 播放必需。
+- `cached_capture=1`：为 H.264/HEVC/VP9 使用 cacheable CAPTURE，4K 播放必需。
 
 关闭所有浏览器和解码进程后重载模块：
 
@@ -243,7 +243,7 @@ sudo ./install-system.sh
 
 - `iris_drv_video.so`；
 - `/dev/dma_heap/system` 的 udev 权限规则；
-- H.264/HEVC 的 `cached_capture` modprobe 配置。
+- H.264/HEVC/VP9 的 `cached_capture` modprobe 配置。
 
 把当前用户加入视频和渲染设备组，然后重新登录：
 

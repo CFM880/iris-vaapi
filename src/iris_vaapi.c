@@ -40,6 +40,7 @@
 #endif
 
 #include "decode.h" 
+#include "v4l2_dec.h"
 
 #define IRIS_VAAPI_VERSION	"0.1.0"
 #define IRIS_VAAPI_VENDOR	"iris-vaapi: Qualcomm Iris SM8150 (V4L2) "
@@ -72,6 +73,7 @@ struct iris_drv_data {
 	unsigned int buffer_id;
 	unsigned int width, height;
 	VAProfile profile;
+	int p010_supported;
 	/* Display-level surface registry: pool surfaces outlive the contexts
 	 * that decode into them (Chrome destroys contexts on navigation while
 	 * frames are still exported/displayed). */
@@ -190,16 +192,25 @@ static VAStatus
 iris_vaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
 			   int *num_profiles)
 {
+	struct iris_drv_data *dd;
+	int count = 0;
+	unsigned int i;
+
 	if (!num_profiles)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	dd = iris_drv_data(ctx);
+	if (!dd)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	*num_profiles = NUM_IRIS_PROFILES;
-	if (profile_list) {
-		if (*num_profiles > (int)NUM_IRIS_PROFILES)
-			*num_profiles = NUM_IRIS_PROFILES;
-		memcpy(profile_list, iris_profiles,
-		       *num_profiles * sizeof(*profile_list));
+	for (i = 0; i < NUM_IRIS_PROFILES; i++) {
+		if (iris_profile_is_10bit(iris_profiles[i]) &&
+		    !dd->p010_supported)
+			continue;
+		if (profile_list)
+			profile_list[count] = iris_profiles[i];
+		count++;
 	}
+	*num_profiles = count;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -207,10 +218,18 @@ static VAStatus
 iris_vaQueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
 			      VAEntrypoint *entrypoint_list, int *num_entrypoints)
 {
+	struct iris_drv_data *dd;
 	int i;
 
 	if (!num_entrypoints)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	dd = iris_drv_data(ctx);
+	if (!dd)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (iris_profile_is_10bit(profile) && !dd->p010_supported) {
+		*num_entrypoints = 0;
+		return VA_STATUS_SUCCESS;
+	}
 
 	for (i = 0; i < (int)NUM_IRIS_PROFILES; i++) {
 		if (iris_profiles[i] == profile)
@@ -288,6 +307,8 @@ iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 	dd = iris_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (iris_profile_is_10bit(profile) && !dd->p010_supported)
+		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 	dd->profile = profile;
 
 	*config_id = ++dd->config_id;
@@ -1203,8 +1224,17 @@ __vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
 	ctx->str_vendor = IRIS_VAAPI_VENDOR IRIS_VAAPI_VERSION;
 	ctx->pDriverData = NULL;
 
-	if (!iris_drv_data(ctx))
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	{
+		struct iris_drv_data *dd = iris_drv_data(ctx);
+
+		if (!dd)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		dd->p010_supported = v4l2_dec_supports_capture_format(
+			"/dev/video0", V4L2_PIX_FMT_P010);
+		if (!dd->p010_supported)
+			fprintf(stderr,
+				"iris-vaapi: kernel does not advertise P010; hiding HEVC Main10 and VP9 Profile 2\n");
+	}
 
 	return VA_STATUS_SUCCESS;
 }

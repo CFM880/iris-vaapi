@@ -72,6 +72,8 @@ int main(int argc, char **argv)
 	const char *path = argc > 1 ? argv[1] : "/tmp/test-hevc.h265";
 	unsigned int width = argc > 2 ? atoi(argv[2]) : 1920;
 	unsigned int height = argc > 3 ? atoi(argv[3]) : 1088;
+	unsigned int cap_pixfmt = argc > 4 && !strcmp(argv[4], "p010") ?
+		V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 	unsigned char *stream;
 	struct au *aus;
 	struct v4l2_dec dec;
@@ -93,7 +95,7 @@ int main(int argc, char **argv)
 	printf("access units found: %u\n", n_aus);
 
 	ret = v4l2_dec_open(&dec, "/dev/video0", width, height,
-			    V4L2_PIX_FMT_HEVC, V4L2_PIX_FMT_NV12);
+			    V4L2_PIX_FMT_HEVC, cap_pixfmt);
 	if (ret) { fprintf(stderr, "open %d\n", ret); return 1; }
 	ret = v4l2_dec_feed(&dec, aus[0].data, aus[0].len, 0);
 	if (ret) { fprintf(stderr, "feed 0 %d\n", ret); return 1; }

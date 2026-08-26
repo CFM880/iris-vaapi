@@ -158,7 +158,7 @@ options qcom_iris allow_fw_boot=1 cached_capture=1
 ```
 
 - `allow_fw_boot=1` permits the Iris firmware to start when the video node is opened;
-- `cached_capture=1` enables cacheable H.264/HEVC CAPTURE buffers and is required for
+- `cached_capture=1` enables cacheable H.264/HEVC/VP9 CAPTURE buffers and is required for
   practical 4K performance.
 
 Close every browser and decoder using the device, then reload the module:
@@ -249,7 +249,7 @@ The script installs:
 
 - `iris_drv_video.so`;
 - a udev rule granting access to `/dev/dma_heap/system`;
-- the `cached_capture` modprobe configuration for H.264 and HEVC.
+- the `cached_capture` modprobe configuration for H.264, HEVC, and VP9.
 
 Add the current user to the video-device groups and log in again:
 

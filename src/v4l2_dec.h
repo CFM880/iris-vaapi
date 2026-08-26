@@ -53,6 +53,10 @@ struct v4l2_dec {
 	int eos;
 };
 
+/* Return non-zero when @dev advertises @pixelformat on its CAPTURE queue. */
+int v4l2_dec_supports_capture_format(const char *dev,
+				      unsigned int pixelformat);
+
 /* Open /dev/video0 (or @dev) for decode of a @width x @height stream using
  * the given bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...) and
  * uncompressed CAPTURE format (V4L2_PIX_FMT_NV12/P010). */

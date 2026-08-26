@@ -48,6 +48,29 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	return r;
 }
 
+int v4l2_dec_supports_capture_format(const char *dev,
+				      unsigned int pixelformat)
+{
+	struct v4l2_fmtdesc fmt;
+	int fd;
+
+	fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		return 0;
+
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	while (xioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0) {
+		if (fmt.pixelformat == pixelformat) {
+			close(fd);
+			return 1;
+		}
+		fmt.index++;
+	}
+	close(fd);
+	return 0;
+}
+
 int v4l2_dec_attach_surface_fence(struct v4l2_dec *d, int dmabuf_fd,
 				  uint64_t token)
 {

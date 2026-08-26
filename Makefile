@@ -16,6 +16,7 @@ TEST_V4L2 = $(BUILD)/test_v4l2_dec
 TEST_H264 = $(BUILD)/test_h264_params
 TEST_VADEC = $(BUILD)/test_va_decode
 TEST_VP9 = $(BUILD)/test_va_vp9
+TEST_V4L2_VP9 = $(BUILD)/test_v4l2_vp9
 TEST_HEVC = $(BUILD)/test_hevc_au
 TEST_HEVC_PARAMS = $(BUILD)/test_hevc_params
 TEST_HEVC_REWRITE = $(BUILD)/test_hevc_slice_rewrite
@@ -28,7 +29,7 @@ DRIVERDIR ?= $(shell pkg-config --variable=driverdir libva 2>/dev/null)
 DESTDIR ?=
 
 all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
-	$(TEST_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) \
+	$(TEST_VP9) $(TEST_V4L2_VP9) $(TEST_HEVC) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) \
 	$(TEST_VA_STRESS) $(TEST_SURFACE_FENCE)
 
 DECODE_OBJ = $(BUILD)/decode.o
@@ -76,6 +77,10 @@ $(TEST_VADEC): test/test_va_decode.c
 $(TEST_VP9): test/test_va_vp9.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -lva-drm
+
+$(TEST_V4L2_VP9): test/test_v4l2_vp9.c $(V4L2_OBJ) src/v4l2_dec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(V4L2_OBJ)
 
 $(TEST_HEVC): test/test_hevc_au.c $(V4L2_OBJ) src/v4l2_dec.h
 	@mkdir -p $(BUILD)

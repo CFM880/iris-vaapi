@@ -34,7 +34,7 @@ sudo apt install build-essential pkg-config libva-dev libdrm-dev vainfo
 ```
 
 内核侧源码和构建方法位于
-[`nabu-iris`](https://github.com/CFM880/nabu-iris)。H.264/HEVC 4K 播放应启用
+[`nabu-iris`](https://github.com/CFM880/nabu-iris)。H.264/HEVC/VP9 4K 播放应启用
 统一参数：
 
 ```text
@@ -52,6 +52,10 @@ LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 
 预期能看到 H.264、HEVC Main/Main10 和 VP9 Profile 0/Profile 2 的
 `VAEntrypointVLD`。
+
+驱动会按 `/dev/video0` 实际枚举的 CAPTURE 格式公布能力。若内核模块尚未更新、
+未提供 P010，Main10 和 Profile 2 会被隐藏，避免客户端逐帧尝试失败后再回退软件
+解码；此时应先更新并重载配套的 `nabu-iris` 模块。
 
 无需安装即可让 FFmpeg 使用当前构建：
 
@@ -108,6 +112,8 @@ make check
 ./build/test_va_stress stream.h264 700
 ./build/test_hevc_au stream.h265
 ./build/test_va_vp9 stream.ivf
+./build/test_hevc_au main10.h265 3840 2160 p010
+./build/test_v4l2_vp9 profile2.ivf 3840 2160 p010
 ./build/test_surface_fence /dev/video0
 ```
 
@@ -122,7 +128,8 @@ make check
 
 - 10-bit P010 路径需要配套的 `nabu-iris` 内核模块，仍需更多 Chrome/HDR
   显示链路回归；
-- stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；
+- stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
+  `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；
 - `IRIS_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
 - 非正常终止旧内核会话可能使固件超时，需要重载 `qcom_iris`；
 - 需要与本仓库功能匹配的 `nabu-iris` 内核模块，单独替换用户态驱动不够。

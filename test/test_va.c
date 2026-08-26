@@ -46,6 +46,7 @@ int main(int argc, char **argv)
 	int n_profiles = 32;
 	VAEntrypoint ep[8];
 	int n_ep = 8;
+	int have_p010 = 0;
 
 	int fd = open(drm_dev, O_RDWR);
 	if (fd < 0) {
@@ -74,6 +75,9 @@ int main(int argc, char **argv)
 	}
 	printf("%d profiles:\n", n_profiles);
 	for (i = 0; i < n_profiles; i++) {
+		if (profiles[i] == VAProfileHEVCMain10 ||
+		    profiles[i] == VAProfileVP9Profile2)
+			have_p010 = 1;
 		n_ep = 8;
 		st = vaQueryConfigEntrypoints(dpy, profiles[i], ep, &n_ep);
 		if (st != VA_STATUS_SUCCESS) {
@@ -89,7 +93,7 @@ int main(int argc, char **argv)
 
 	/* Exercise the 10-bit allocation and export path without starting the
 	 * decoder.  This catches P010 pitch/size/fourcc regressions on any host. */
-	{
+	if (have_p010) {
 		VAConfigAttrib attr = { .type = VAConfigAttribRTFormat };
 		VADRMPRIMESurfaceDescriptor desc;
 		VAConfigID config;
