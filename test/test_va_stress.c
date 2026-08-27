@@ -15,6 +15,7 @@
 
 #include <va/va.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
 
 /* Pictures kept in flight before syncing an earlier one. */
 #define LOOKAHEAD 10
@@ -297,6 +298,26 @@ int main(int argc, char **argv)
 	st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 1920, 1088, surf, 16,
 			      NULL, 0);
 	if (st) { fprintf(stderr, "vaCreateSurfaces: %s\n", vaErrorStr(st)); return 1; }
+	/* Optional Chrome-style setup: export the pool before its first decode.
+	 * The driver must retain its conservative visibility wait for these
+	 * already-importable backings while leaving the default stress path
+	 * asynchronous. */
+	if (getenv("IRIS_STRESS_EXPORT")) {
+		for (i = 0; i < 16; i++) {
+			VADRMPRIMESurfaceDescriptor desc;
+
+			memset(&desc, 0, sizeof(desc));
+			st = vaExportSurfaceHandle(dpy, surf[i],
+				VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+				VA_EXPORT_SURFACE_COMPOSED_LAYERS, &desc);
+			if (st) {
+				fprintf(stderr, "pre-export %d: %s\n", i,
+					vaErrorStr(st));
+				return 1;
+			}
+			close(desc.objects[0].fd);
+		}
+	}
 
 	{
 		VASliceParameterBufferH264 sp;

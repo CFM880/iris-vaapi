@@ -13,11 +13,13 @@ stateful V4L2 解码器。
 | 格式 | VA-API profile | 输出 | 状态 |
 |---|---|---|---|
 | H.264 | Constrained Baseline / Main / High | NV12 | 已验证 |
-| HEVC | Main / Main10 | NV12 / P010 | 8-bit 已验证；10-bit 实验支持 |
-| VP9 | Profile 0 / Profile 2 | NV12 / P010 | 8-bit 已验证；10-bit 实验支持 |
+| HEVC | Main / Main10 | NV12 / P010 | 已验证（8/10-bit） |
+| VP9 | Profile 0 / Profile 2 | NV12 / P010 | 已验证（8/10-bit） |
 
-H.264 与 HEVC 支持 Chrome 所需的稳定 DMA-BUF surface、异步 fence、解码顺序
-输出和片尾帧释放。实验性的 V4L2 CAPTURE 直连可通过
+HEVC Main10 与 VP9 Profile 2 已分别通过三轮 4K P010 完整码流测试，所有帧均
+成功输出且没有 corrupt frame，因此按 VA-API 解码能力计为已支持。H.264、HEVC
+与 VP9 支持 Chrome 所需的稳定 DMA-BUF surface、异步 fence、解码顺序输出和
+片尾帧释放。实验性的 V4L2 CAPTURE 直连可通过
 `IRIS_DIRECT_CAPTURE=1` 启用，默认仍使用已充分验证的稳定 surface 拷贝路径。
 
 ## 依赖
@@ -64,6 +66,11 @@ LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" \
 ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 \
   -i /path/to/video.mp4 -an -f null -
 ```
+
+H.264 对未导出的 VA surface 使用异步提交以保持硬件解码流水线；已经通过
+DRM PRIME 导出的 surface 继续在 `vaEndPicture` 做兼容性等待，避免旧 Adreno
+显示上一帧。诊断时可设置 `IRIS_H264_SYNC_END=1`，恢复所有 H.264 surface 的
+逐帧同步行为。
 
 ## 系统安装
 
@@ -117,6 +124,34 @@ make check
 ./build/test_surface_fence /dev/video0
 ```
 
+## 性能对比
+
+以下为 Xiaomi Pad 5（SM8150）4K60 完整码流的最大吞吐测试。CPU 以单核满载
+为 100%，RSS 为进程峰值；同一规格内交替运行 V4L2 与 VA-API。H.264 使用当前
+异步提交实现，其余结果来自初始完整基准。
+
+| 编码规格 | 位深 | 路径 | 解码速度 | CPU | 峰值 RSS |
+|---|---:|---|---:|---:|---:|
+| H.264 High | 8-bit | V4L2 | 167.55 fps | 30.24% | 415.84 MiB |
+| H.264 High | 8-bit | VA-API | 166.95 fps | 59.28% | 544.30 MiB |
+| HEVC Main | 8-bit | V4L2 | 176.30 fps | 31.71% | 411.63 MiB |
+| HEVC Main | 8-bit | VA-API | 173.83 fps | 52.29% | 675.49 MiB |
+| VP9 Profile 0 | 8-bit | V4L2 | 146.45 fps | 35.81% | 516.83 MiB |
+| VP9 Profile 0 | 8-bit | VA-API | 144.49 fps | 44.91% | 556.79 MiB |
+| HEVC Main10 | 10-bit | V4L2 P010 | 148.29 fps | 26.54% | 798.35 MiB |
+| HEVC Main10 | 10-bit | VA-API | 148.55 fps | 85.70% | 937.84 MiB |
+| VP9 Profile 2 | 10-bit | V4L2 P010 | 116.33 fps | 20.51% | 739.11 MiB |
+| VP9 Profile 2 | 10-bit | VA-API | 113.82 fps | 42.09% | 798.59 MiB |
+
+当前五种规格的 VA-API 与 V4L2 吞吐差均不超过 2.2%。H.264 异步优化将
+VA-API 从 65.55 fps 提升到 166.95 fps；虽然最大吞吐时 CPU 占用率提高，但
+完整码流总 CPU 时间从 8.66 秒降至 6.38 秒。VA-API 的 CPU 与内存开销仍高于
+直接 V4L2，下一步重点是消除 stable-surface 的整帧复制。
+
+原始数据和可复现脚本位于 [`benchmark-results/`](benchmark-results/) 与
+[`benchmarks/`](benchmarks/)；10-bit V4L2 测试程序会映射整个输入文件，因此
+表中的原始 RSS 包含输入文件大小，CSV 中另有扣除输入映射后的修正值。
+
 详细的实现过程、基准和历史排障记录保留在
 [`docs/development-notes.md`](docs/development-notes.md)。Chromium 交互点见
 [`docs/chromium-integration.md`](docs/chromium-integration.md)。
@@ -126,8 +161,11 @@ make check
 
 ## 已知限制
 
-- 10-bit P010 路径需要配套的 `nabu-iris` 内核模块，仍需更多 Chrome/HDR
-  显示链路回归；
+- 10-bit P010 解码需要配套的 `nabu-iris` 内核模块；HDR 元数据、色调映射和
+  最终显示效果仍取决于 Chrome、合成器和显示器链路；
+- FFmpeg 的 `hevc_v4l2m2m` 与 `vp9_v4l2m2m` 前端目前不会为 10-bit 输入选择
+  P010 CAPTURE，可能成功退出但输出 0 帧；VA-API 路径和仓库内显式 P010 的
+  V4L2 测试程序不受此限制；
 - stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
   `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；
 - `IRIS_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；

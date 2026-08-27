@@ -121,6 +121,7 @@ struct iris_surface {
 	unsigned int fourcc;	/* VA/V4L2 layout: NV12 or P010 */
 	int decoded;		/* a frame has been copied into the backing */
 	int queued;		/* some picture was decoded into this surface */
+	int exported;		/* backing has been exported to a DRM client */
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
 	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
 	uint64_t generation;	/* render-target reuse generation */
@@ -285,13 +286,18 @@ struct iris_decode_ctx {
 	uint64_t stats_copy_ns;
 	uint64_t stats_copy_bytes;
 	uint64_t stats_copy_frames;
+	uint64_t stats_capture_frames;
 	uint64_t stats_sync_ns;
 	uint64_t stats_rewrite_ns;
 	uint64_t stats_rewrite_bytes;
 	uint64_t stats_rewrites;
 	uint64_t stats_end_ns;
 	uint64_t stats_ends;
+	uint64_t stats_h264_wait_ns;
+	uint64_t stats_h264_waits;
+	uint64_t stats_h264_async;
 	uint64_t stats_direct_frames;
+	int force_h264_sync_end;
 };
 
 static int
@@ -437,6 +443,8 @@ iris_decode_create(void)
 	if (ctx) {
 		reset_stream_state(ctx);
 		ctx->stats_enabled = getenv("IRIS_VAAPI_STATS") != NULL;
+		ctx->force_h264_sync_end =
+			getenv("IRIS_H264_SYNC_END") != NULL;
 	}
 	return ctx;
 }
@@ -447,6 +455,12 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 	if (!ctx)
 		return;
 	if (ctx->dec_open) {
+		/* Complete accepted work on normal context destruction.  Asynchronous
+		 * clients such as FFmpeg's null sink may never call vaSyncSurface; a
+		 * final EOS drain keeps teardown from silently abandoning in-flight
+		 * pictures and makes end-to-end timing cover actual hardware work. */
+		if (ctx->dec_started && !ctx->eos_sent && !ctx->fatal_error)
+			(void)iris_decode_flush(ctx);
 		finish_pending_writes(ctx);
 		v4l2_dec_close(&ctx->dec);
 	}
@@ -454,7 +468,8 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 		double copy_sec = ctx->stats_copy_ns / 1e9;
 
 		fprintf(stderr,
-			"[iris-stats] frames=%llu direct=%llu copy=%.3fs %.1fGiB/s sync=%.3fs rewrite=%llu/%.1fMiB %.3fs end=%llu %.3fs\n",
+			"[iris-stats] capture=%llu copied=%llu direct=%llu copy=%.3fs %.1fGiB/s sync=%.3fs rewrite=%llu/%.1fMiB %.3fs end=%llu %.3fs h264-wait=%llu/%.3fs async=%llu\n",
+			(unsigned long long)ctx->stats_capture_frames,
 			(unsigned long long)ctx->stats_copy_frames,
 			(unsigned long long)ctx->stats_direct_frames,
 			copy_sec,
@@ -465,7 +480,10 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 			ctx->stats_rewrite_bytes / (1024.0 * 1024.0),
 			ctx->stats_rewrite_ns / 1e9,
 			(unsigned long long)ctx->stats_ends,
-			ctx->stats_end_ns / 1e9);
+			ctx->stats_end_ns / 1e9,
+			(unsigned long long)ctx->stats_h264_waits,
+			ctx->stats_h264_wait_ns / 1e9,
+			(unsigned long long)ctx->stats_h264_async);
 	}
 	detach_owned_surfaces(ctx);
 	free(ctx->slice_data);
@@ -711,6 +729,7 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	s->fourcc = fourcc;
 	s->decoded = 0;
 	s->queued = 0;
+	s->exported = 0;
 	s->write_started = 0;
 	s->fence_token = 0;
 	s->generation = 0;
@@ -825,6 +844,9 @@ iris_surfs_export(struct iris_surfs *t, VASurfaceID id, int *fd,
 	exported_fd = fcntl(s->bfd, F_DUPFD_CLOEXEC, 0);
 	if (exported_fd < 0)
 		return -1;
+	/* If this backing is reused for a later picture, legacy Adreno may have
+	 * imported it before the new reservation fence was attached. */
+	s->exported = 1;
 	*fd = exported_fd;
 	*pitch = p;
 	*size = s->bsize;
@@ -959,6 +981,9 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 	VASurfaceID id;
 	uint64_t generation;
 	struct iris_surface *s;
+
+	if (frame->bytesused && ctx->stats_enabled)
+		ctx->stats_capture_frames++;
 
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
 		if (hevc_pending_take(ctx, &id, &generation)) {
@@ -1875,18 +1900,31 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 	if (ret)
 		return ret;
 
-	/* Chrome sends a decoded frame to ANGLE immediately after vaEndPicture.
-	 * Its GL DMA-BUF import can sample the previous contents even though a
-	 * new reservation fence was attached.  H.264 is emitted in decode order
-	 * and each AU ends in AUD, so wait here until the target backing contains
-	 * this picture.  This applies hardware backpressure and turns overload
-	 * into ordinary frame dropping instead of visible backward frames. */
+	/* Chrome sends an already-exported surface to ANGLE immediately after
+	 * vaEndPicture.  Legacy Adreno can sample its previous contents even though
+	 * a new reservation fence was attached, so retain the conservative wait
+	 * for those surfaces.  Decode-only clients do not export their surfaces;
+	 * keeping those submissions asynchronous preserves the V4L2 pipeline and
+	 * leaves synchronization to vaSyncSurface, as required by VA-API. */
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
-		ret = wait_surface_ready(ctx, ctx->current_target, 100);
-		if (ret) {
-			DBG("[end] target=%u readiness wait failed: %d\n",
-			    ctx->current_target, ret);
-			return ret;
+		struct iris_surface *target = find_surface(ctx,
+							   ctx->current_target);
+
+		if (ctx->force_h264_sync_end || (target && target->exported)) {
+			uint64_t wait_start = ctx->stats_enabled ? monotonic_ns() : 0;
+
+			ret = wait_surface_ready(ctx, ctx->current_target, 100);
+			if (ctx->stats_enabled) {
+				ctx->stats_h264_wait_ns += monotonic_ns() - wait_start;
+				ctx->stats_h264_waits++;
+			}
+			if (ret) {
+				DBG("[end] target=%u readiness wait failed: %d\n",
+				    ctx->current_target, ret);
+				return ret;
+			}
+		} else if (ctx->stats_enabled) {
+			ctx->stats_h264_async++;
 		}
 	}
 

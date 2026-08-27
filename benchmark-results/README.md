@@ -9,9 +9,15 @@ Tracked files:
 - `h264-hevc8-v4l2-vaapi.csv`: H.264 High and HEVC Main 8-bit raw runs.
 - `vp9-profile0-v4l2-vaapi.csv`: VP9 Profile 0 raw runs.
 - `p010-v4l2-vaapi.csv`: HEVC Main10 and VP9 Profile 2 P010 raw runs.
-- `v4l2-vaapi-summary.sql`: reproducible aggregation across the raw runs.
-- `v4l2-vaapi-report.json`: canonical report input.
-- `v4l2-vaapi-report.html`: generated portable report.
+- `h264-vaapi-async-v4l2.csv`: H.264 results after enabling asynchronous
+  submission for decode-only VA surfaces.
+- `v4l2-vaapi-summary.sql`: reproducible aggregation of the initial baseline.
+- `v4l2-vaapi-report.json`: canonical initial-baseline report input.
+- `v4l2-vaapi-report.html`: generated initial-baseline portable report.
+
+The initial baseline report predates asynchronous H.264 submission. For the
+current H.264 result, use `h264-vaapi-async-v4l2.csv`; it supersedes only the
+H.264 rows, while the HEVC and VP9 rows in the initial report remain current.
 
 Per-run logs and generated elementary streams live in the ignored `logs/` and
 `streams/` directories so repeated comparisons do not pollute Git history.
@@ -21,10 +27,9 @@ Example output routing:
 ```sh
 python3 benchmarks/compare_decode_paths.py \
   --h264 /path/to/h264.mp4 \
-  --hevc /path/to/hevc.mp4 \
   --build-dir build \
-  --output-dir benchmark-results/logs/h264-hevc8 \
-  --results-file benchmark-results/h264-hevc8-v4l2-vaapi.csv
+  --output-dir benchmark-results/logs/h264-async \
+  --results-file benchmark-results/h264-vaapi-async-v4l2.csv
 
 python3 benchmarks/compare_decode_paths.py \
   --vp9 /path/to/vp9-profile0.webm \
