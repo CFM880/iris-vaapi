@@ -34,10 +34,16 @@ def command_for(sample: Sample, build_dir: Path) -> tuple[list[str], dict[str, s
             "p010",
         ], environment
 
+    environment.pop("IRIS_VULKAN_COPY", None)
     environment.update(
         LIBVA_DRIVER_NAME="iris",
         LIBVA_DRIVERS_PATH=str(build_dir.resolve()),
     )
+    if sample.decoder == "vaapi-vulkan":
+        environment.update(
+            IRIS_VULKAN_COPY="1",
+            VK_DRIVER_FILES="/usr/share/vulkan/icd.d/freedreno_icd.json",
+        )
     return [
         "ffmpeg",
         "-nostdin",
@@ -132,20 +138,38 @@ def main() -> int:
                         help="CSV destination (defaults to OUTPUT_DIR/results.csv)")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cooldown", type=float, default=1.0)
+    parser.add_argument("--include-vulkan-copy", action="store_true",
+                        help="also benchmark VA-API with IRIS_VULKAN_COPY=1")
+    parser.add_argument("--warmup", action="store_true",
+                        help="run every path once without recording it")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    decoders = ["v4l2", "vaapi"]
+    if args.include_vulkan_copy:
+        decoders.append("vaapi-vulkan")
+
     samples = [
         Sample("hevc-main10", decoder, args.hevc, 1797, 60.0)
-        for decoder in ("v4l2", "vaapi")
+        for decoder in decoders
     ] + [
         Sample("vp9-profile2", decoder, args.vp9, 1200, 19001 / 317)
-        for decoder in ("v4l2", "vaapi")
+        for decoder in decoders
     ]
+
+    if args.warmup:
+        for sample in samples:
+            print(f"warmup codec={sample.codec} decoder={sample.decoder}", flush=True)
+            row = run_sample(sample, 0, args.build_dir, args.output_dir)
+            if row["exit_code"] != 0 or not row["frame_count_ok"]:
+                print("warmup failed")
+                return 1
+            time.sleep(args.cooldown)
 
     rows: list[dict[str, object]] = []
     for repetition in range(1, args.repetitions + 1):
-        ordered = samples if repetition % 2 else list(reversed(samples))
+        offset = (repetition - 1) % len(samples)
+        ordered = samples[offset:] + samples[:offset]
         for sample in ordered:
             print(f"run={repetition} codec={sample.codec} decoder={sample.decoder}", flush=True)
             row = run_sample(sample, repetition, args.build_dir, args.output_dir)

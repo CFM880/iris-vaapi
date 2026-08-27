@@ -71,10 +71,16 @@ def ffmpeg_command(sample: Sample, build_dir: Path) -> tuple[list[str], dict[str
     if sample.decoder == "v4l2":
         command += ["-c:v", f"{sample.codec}_v4l2m2m"]
     else:
+        environment.pop("IRIS_VULKAN_COPY", None)
         environment.update(
             LIBVA_DRIVER_NAME="iris",
             LIBVA_DRIVERS_PATH=str(build_dir.resolve()),
         )
+        if sample.decoder == "vaapi-vulkan":
+            environment.update(
+                IRIS_VULKAN_COPY="1",
+                VK_DRIVER_FILES="/usr/share/vulkan/icd.d/freedreno_icd.json",
+            )
         command += [
             "-hwaccel",
             "vaapi",
@@ -85,7 +91,7 @@ def ffmpeg_command(sample: Sample, build_dir: Path) -> tuple[list[str], dict[str
         ]
 
     command += ["-i", str(sample.input_path), "-map", "0:v:0", "-an"]
-    if sample.decoder == "vaapi":
+    if sample.decoder.startswith("vaapi"):
         command += ["-pix_fmt", "vaapi"]
     command += ["-f", "null", "-"]
     return command, environment
@@ -152,6 +158,10 @@ def main() -> int:
                         help="CSV destination (defaults to OUTPUT_DIR/results.csv)")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cooldown", type=float, default=1.0)
+    parser.add_argument("--include-vulkan-copy", action="store_true",
+                        help="also benchmark VA-API with IRIS_VULKAN_COPY=1")
+    parser.add_argument("--warmup", action="store_true",
+                        help="run every path once without recording it")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,12 +174,25 @@ def main() -> int:
         codec, expected_frames, nominal_fps = probe(path)
         if codec not in {"h264", "hevc", "vp9"}:
             raise SystemExit(f"unsupported codec {codec!r}: {path}")
-        for decoder in ("v4l2", "vaapi"):
+        decoders = ["v4l2", "vaapi"]
+        if args.include_vulkan_copy:
+            decoders.append("vaapi-vulkan")
+        for decoder in decoders:
             samples.append(Sample(codec, decoder, path, expected_frames, nominal_fps))
+
+    if args.warmup:
+        for sample in samples:
+            print(f"warmup codec={sample.codec} decoder={sample.decoder}", flush=True)
+            row = run_sample(sample, 0, args.build_dir, args.output_dir)
+            if row["exit_code"] != 0 or not row["frame_count_ok"]:
+                print("warmup failed")
+                return 1
+            time.sleep(args.cooldown)
 
     rows: list[dict[str, object]] = []
     for repetition in range(1, args.repetitions + 1):
-        ordered = samples if repetition % 2 else list(reversed(samples))
+        offset = (repetition - 1) % len(samples)
+        ordered = samples[offset:] + samples[:offset]
         for sample in ordered:
             print(f"run={repetition} codec={sample.codec} decoder={sample.decoder}", flush=True)
             row = run_sample(sample, repetition, args.build_dir, args.output_dir)
