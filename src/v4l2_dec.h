@@ -21,6 +21,7 @@ struct v4l2_dec_frame {
 	void *mem;			/* mmap base, single semiplanar image */
 	__u32 flags;			/* V4L2_BUF_FLAG_* */
 	__u64 timestamp;
+	uint64_t capture_generation;
 };
 
 struct v4l2_dec {
@@ -41,6 +42,7 @@ struct v4l2_dec {
 	size_t *cap_dmabuf_sizes;
 	unsigned char *cap_queued;
 	unsigned int cap_dmabuf_count;
+	uint64_t cap_generation;
 	enum v4l2_memory cap_memory;
 	unsigned int out_count;
 	unsigned int cap_count;

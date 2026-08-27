@@ -27,12 +27,14 @@ HEVC Main10 与 VP9 Profile 2 已分别通过三轮 4K P010 完整码流测试�
 - Linux ARM64，带匹配的 `qcom-iris` 驱动；
 - VA-API 1.23 ABI（已使用 libva 2.22/2.23 验证）；
 - GCC、pkg-config、make；
+- 可选：`libvulkan-dev`（实验性的 Turnip DMA-BUF 异步复制）；
 - `/dev/video0`、DRM render node 和 `/dev/dma_heap/system`。
 
 在 Debian/Ubuntu 系统上：
 
 ```sh
-sudo apt install build-essential pkg-config libva-dev libdrm-dev vainfo
+sudo apt install build-essential pkg-config libva-dev libdrm-dev vainfo \
+  libvulkan-dev
 ```
 
 内核侧源码和构建方法位于
@@ -71,6 +73,15 @@ H.264 对未导出的 VA surface 使用异步提交以保持硬件解码流水�
 DRM PRIME 导出的 surface 继续在 `vaEndPicture` 做兼容性等待，避免旧 Adreno
 显示上一帧。诊断时可设置 `IRIS_H264_SYNC_END=1`，恢复所有 H.264 surface 的
 逐帧同步行为。
+
+设置 `IRIS_VULKAN_COPY=1` 可启用实验性的 Turnip DMA-BUF copy engine：V4L2
+CAPTURE buffer 通过 `VIDIOC_EXPBUF` 导出，Vulkan 异步复制到 Chrome 已导入的
+稳定 surface，GPU 完成后才 signal surface fence 并回收 CAPTURE buffer。Vulkan
+不可用或提交失败时会自动回退 CPU `memcpy`。当前仍默认使用 CPU 路径，先完成
+Chrome 长时间播放和多标签验证后再考虑默认启用。
+同一 VA display 的解码 context 共享一套 Vulkan instance/device，因此 seek、
+换流和多标签不会重复初始化 Turnip。SM8150 专用启动环境还可设置
+`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/freedreno_icd.json`，避免加载无关 ICD。
 
 ## 系统安装
 
@@ -145,8 +156,13 @@ make check
 
 当前五种规格的 VA-API 与 V4L2 吞吐差均不超过 2.2%。H.264 异步优化将
 VA-API 从 65.55 fps 提升到 166.95 fps；虽然最大吞吐时 CPU 占用率提高，但
-完整码流总 CPU 时间从 8.66 秒降至 6.38 秒。VA-API 的 CPU 与内存开销仍高于
-直接 V4L2，下一步重点是消除 stable-surface 的整帧复制。
+完整码流总 CPU 时间从 8.66 秒降至 6.38 秒。实验性的 Vulkan copy 路径已经把
+stable-surface CPU 整帧复制降为 0；H.264 4K 的 120 帧强制读回校验与 CPU
+路径逐帧一致，总 CPU 时间降低约 7%，墙钟时间增加约 2%。600 帧热态 null sink
+测试总 CPU 时间约从 2.69 秒降至 2.47 秒。默认 Vulkan loader 扫描全部 ICD 时
+Turnip 路径令 RSS 约增加 64 MiB；限定 Freedreno ICD 后本机增量约为 15 MiB。
+首次 Turnip 初始化仍有明显 CPU 成本，因此它目前主要用于验证“用 GPU 换 CPU”
+的方向，还不是默认配置。
 
 原始数据和可复现脚本位于 [`benchmark-results/`](benchmark-results/) 与
 [`benchmarks/`](benchmarks/)；10-bit V4L2 测试程序会映射整个输入文件，因此
@@ -166,8 +182,9 @@ VA-API 从 65.55 fps 提升到 166.95 fps；虽然最大吞吐时 CPU 占用率�
 - FFmpeg 的 `hevc_v4l2m2m` 与 `vp9_v4l2m2m` 前端目前不会为 10-bit 输入选择
   P010 CAPTURE，可能成功退出但输出 0 帧；VA-API 路径和仓库内显式 P010 的
   V4L2 测试程序不受此限制；
-- stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
-  `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；
+- 默认 stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
+  `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；可用
+  `IRIS_VULKAN_COPY=1` 改为实验性的异步 GPU 复制，但会增加 Turnip 内存开销；
 - `IRIS_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
 - 非正常终止旧内核会话可能使固件超时，需要重载 `qcom_iris`；
 - 需要与本仓库功能匹配的 `nabu-iris` 内核模块，单独替换用户态驱动不够。

@@ -233,6 +233,7 @@ static int v4l2_dec_setup_capture(struct v4l2_dec *d)
 	if (memory == V4L2_MEMORY_DMABUF && req.count != d->cap_dmabuf_count)
 		return -EINVAL;
 	d->cap_count = req.count;
+	d->cap_generation++;
 	d->cap_memory = memory;
 	d->cap_meta = calloc(d->cap_count, sizeof(*d->cap_meta));
 	d->cap_size = calloc(d->cap_count, sizeof(*d->cap_size));
@@ -646,6 +647,7 @@ int v4l2_dec_dqcap(struct v4l2_dec *d, struct v4l2_dec_frame *frame)
 	frame->flags = b.flags;
 	frame->timestamp = b.timestamp.tv_sec * 1000000000ULL +
 			   b.timestamp.tv_usec * 1000ULL;
+	frame->capture_generation = d->cap_generation;
 	d->cap_queued[b.index] = 0;
 	if (b.flags & V4L2_BUF_FLAG_LAST)
 		d->eos = 1;

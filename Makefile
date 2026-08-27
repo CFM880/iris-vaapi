@@ -3,7 +3,12 @@ CFLAGS ?= -O2
 # VA driver callbacks intentionally leave some ABI parameters unused.
 CFLAGS += -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS += $(shell pkg-config --cflags libva 2>/dev/null)
-LDLIBS += -lva -ldl
+LDLIBS += -lva -ldl -pthread
+
+ifneq ($(shell pkg-config --exists vulkan 2>/dev/null && echo yes),)
+CPPFLAGS += -DIRIS_HAVE_VULKAN $(shell pkg-config --cflags vulkan)
+LDLIBS += $(shell pkg-config --libs vulkan)
+endif
 
 BUILD = build
 DRIVER = $(BUILD)/iris_drv_video.so
@@ -11,6 +16,7 @@ V4L2_OBJ = $(BUILD)/v4l2_dec.o
 H264_OBJ = $(BUILD)/h264_params.o
 HEVC_OBJ = $(BUILD)/hevc_params.o
 HEVC_REWRITE_OBJ = $(BUILD)/hevc_slice_rewrite.o
+VK_COPY_OBJ = $(BUILD)/vk_copy.o
 TEST_VA = $(BUILD)/test_va
 TEST_V4L2 = $(BUILD)/test_v4l2_dec
 TEST_H264 = $(BUILD)/test_h264_params
@@ -34,13 +40,17 @@ all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
 
 DECODE_OBJ = $(BUILD)/decode.o
 
-$(DRIVER): src/iris_vaapi.c $(BUILD)/decode.o $(BUILD)/v4l2_dec.o $(BUILD)/h264_params.o $(BUILD)/hevc_params.o $(HEVC_REWRITE_OBJ)
+$(DRIVER): src/iris_vaapi.c $(BUILD)/decode.o $(BUILD)/v4l2_dec.o $(BUILD)/h264_params.o $(BUILD)/hevc_params.o $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJ) $(V4L2_OBJ) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDFLAGS) $(LDLIBS)
 
-$(DECODE_OBJ): src/decode.c src/decode.h src/v4l2_dec.h src/h264_params.h src/hevc_params.h src/hevc_slice_rewrite.h
+$(DECODE_OBJ): src/decode.c src/decode.h src/v4l2_dec.h src/h264_params.h src/hevc_params.h src/hevc_slice_rewrite.h src/vk_copy.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -g $(CPPFLAGS) -Isrc -c -o $@ src/decode.c
+
+$(VK_COPY_OBJ): src/vk_copy.c src/vk_copy.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vk_copy.c
 
 $(HEVC_OBJ): src/hevc_params.c src/hevc_params.h
 	@mkdir -p $(BUILD)

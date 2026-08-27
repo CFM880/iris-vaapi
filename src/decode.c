@@ -12,18 +12,21 @@
 #include <unistd.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
+#include <pthread.h>
 
 #include "decode.h"
 #include "h264_params.h"
 #include "hevc_params.h"
 #include "hevc_slice_rewrite.h"
 #include "v4l2_dec.h"
+#include "vk_copy.h"
 
 /* Chrome runs one VaapiVideoDecoder per video; every decoder owns a frame
  * pool of up to ~32 surfaces and pools coexist across tabs/resolution
  * changes, so the registry must hold several pools at once. */
 #define IRIS_MAX_SURFACES	128
 #define IRIS_AU_MAX		(16U * 1024 * 1024)
+#define IRIS_MAX_PENDING_COPIES	32
 
 #ifndef ALIGN_TO
 #define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -49,6 +52,7 @@ surface_pitch(unsigned int width, unsigned int fourcc)
  * stderr; unconditionally writing it stalls the decode loop when the terminal
  * is slow.  Opt in with IRIS_VAAPI_DEBUG=1. */
 static int g_dbg = -1;
+static uint64_t g_buffer_serial;
 
 static int dbg_enabled(void)
 {
@@ -112,6 +116,35 @@ dma_buf_cpu_sync(int fd, uint64_t flags)
 	return ret;
 }
 
+static void
+surface_fill_black(int fd, void *map, unsigned int pitch,
+		   unsigned int height, unsigned int fourcc)
+{
+	size_t luma_size = (size_t)pitch * ALIGN_TO(height, 32);
+	size_t total_size = luma_size * 3 / 2;
+	int sync_started;
+
+	sync_started = dma_buf_cpu_sync(fd,
+		DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
+	if (fourcc == V4L2_PIX_FMT_P010) {
+		uint16_t *pixels = map;
+		size_t i;
+
+		/* P010 stores limited-range 10-bit components in the high bits. */
+		for (i = 0; i < luma_size / sizeof(*pixels); i++)
+			pixels[i] = 64U << 6;
+		for (; i < total_size / sizeof(*pixels); i++)
+			pixels[i] = 512U << 6;
+	} else {
+		/* Limited-range NV12 black: Y=16, neutral interleaved UV=128. */
+		memset(map, 16, luma_size);
+		memset((uint8_t *)map + luma_size, 128, total_size - luma_size);
+	}
+	if (sync_started)
+		(void)dma_buf_cpu_sync(fd,
+			DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+}
+
 struct iris_surface {
 	VASurfaceID id;
 	int bfd;		/* backing fd (DMA-heap, or memfd fallback) */
@@ -125,6 +158,7 @@ struct iris_surface {
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
 	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
 	uint64_t generation;	/* render-target reuse generation */
+	uint64_t backing_serial;	/* unique identity for Vulkan import cache */
 	struct iris_decode_ctx *owner;	/* engine that queued the picture */
 };
 
@@ -183,9 +217,11 @@ surface_begin_device_write(struct v4l2_dec *dec, struct iris_surface *s,
 struct iris_surfs {
 	struct iris_surface s[IRIS_MAX_SURFACES];
 	int n;
+	struct iris_vk_copy *vk_copy;
 };
 
 struct iris_decode_ctx {
+	pthread_mutex_t mutex;
 	struct v4l2_dec dec;
 	int dec_open;
 	int dec_started;
@@ -196,6 +232,20 @@ struct iris_decode_ctx {
 	int direct_capture;
 	int direct_error;
 	int fatal_error;
+	struct iris_vk_copy *vk_copy;
+	int vk_copy_failed;
+	uint64_t vk_capture_generation;
+	uint64_t vk_capture_keys[IRIS_MAX_SURFACES];
+	struct {
+		struct iris_vk_job *job;
+		VASurfaceID id;
+		uint64_t generation;
+		uint64_t fence_token;
+		uint64_t start_ns;
+		size_t bytes;
+		unsigned int capture_index;
+		int used;
+	} pending_copies[IRIS_MAX_PENDING_COPIES];
 	unsigned int direct_count;
 	unsigned int direct_requested_count;
 	struct {
@@ -286,6 +336,10 @@ struct iris_decode_ctx {
 	uint64_t stats_copy_ns;
 	uint64_t stats_copy_bytes;
 	uint64_t stats_copy_frames;
+	uint64_t stats_vk_copy_ns;
+	uint64_t stats_vk_copy_bytes;
+	uint64_t stats_vk_copy_frames;
+	uint64_t stats_vk_copy_fallbacks;
 	uint64_t stats_capture_frames;
 	uint64_t stats_sync_ns;
 	uint64_t stats_rewrite_ns;
@@ -299,6 +353,9 @@ struct iris_decode_ctx {
 	uint64_t stats_direct_frames;
 	int force_h264_sync_end;
 };
+
+static struct iris_surface *
+find_surface(struct iris_decode_ctx *ctx, VASurfaceID id);
 
 static int
 surface_copy(struct iris_decode_ctx *ctx, struct iris_surface *s,
@@ -341,6 +398,199 @@ surface_copy(struct iris_decode_ctx *ctx, struct iris_surface *s,
 	return ret;
 }
 
+static int
+finish_vk_copy(struct iris_decode_ctx *ctx, unsigned int index, int wait)
+{
+	typeof(ctx->pending_copies[0]) *pending = &ctx->pending_copies[index];
+	struct iris_surface *s;
+	int ret, finish_ret = 0;
+
+	if (!pending->used)
+		return 0;
+	ret = iris_vk_copy_job_wait(ctx->vk_copy, pending->job,
+				    wait ? UINT64_MAX : 0);
+	if (ret <= 0)
+		return ret;
+
+	s = find_surface(ctx, pending->id);
+	if (s && s->generation == pending->generation &&
+	    s->fence_token == pending->fence_token) {
+		finish_ret = surface_finish_write(&ctx->dec, s);
+		s->decoded = 1;
+		s->queued = 1;
+		s->owner = ctx;
+	} else if (pending->fence_token) {
+		/* The VA client should not destroy/recycle an in-flight target,
+		 * but never leave its reservation fence permanently unsignalled if
+		 * it does. */
+		finish_ret = v4l2_dec_signal_surface_fence(
+			&ctx->dec, pending->fence_token);
+	}
+	ret = v4l2_dec_qcap_idx(&ctx->dec, pending->capture_index);
+	if (!finish_ret && ret)
+		finish_ret = ret;
+	if (ctx->stats_enabled) {
+		ctx->stats_vk_copy_ns += monotonic_ns() - pending->start_ns;
+		ctx->stats_vk_copy_bytes += pending->bytes;
+		ctx->stats_vk_copy_frames++;
+	}
+	iris_vk_copy_job_release(pending->job);
+	memset(pending, 0, sizeof(*pending));
+	return finish_ret ? finish_ret : 1;
+}
+
+static int
+reap_vk_copies(struct iris_decode_ctx *ctx, int wait_all)
+{
+	unsigned int i;
+	int ret;
+
+	if (!ctx->vk_copy)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(ctx->pending_copies); i++) {
+		if (!ctx->pending_copies[i].used)
+			continue;
+		ret = finish_vk_copy(ctx, i, wait_all);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+static void
+forget_vk_capture_buffers(struct iris_decode_ctx *ctx)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ctx->vk_capture_keys); i++) {
+		if (ctx->vk_capture_keys[i])
+			iris_vk_copy_forget(ctx->vk_copy,
+					    ctx->vk_capture_keys[i]);
+	}
+	ctx->vk_capture_generation = 0;
+	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
+}
+
+static int
+finish_vk_surface(struct iris_decode_ctx *ctx, VASurfaceID id, int wait)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ctx->pending_copies); i++) {
+		int ret;
+
+		if (!ctx->pending_copies[i].used ||
+		    ctx->pending_copies[i].id != id)
+			continue;
+		ret = finish_vk_copy(ctx, i, wait);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			return -EAGAIN;
+	}
+	return 0;
+}
+
+static int
+surface_vk_submit(struct iris_decode_ctx *ctx, struct iris_surface *s,
+		  const struct v4l2_dec_frame *frame)
+{
+	unsigned int pitch, source_size;
+	unsigned int slot;
+	struct iris_vk_job *job;
+	int source_fd, ret, completed = 0;
+
+	if (!ctx->vk_copy || ctx->vk_copy_failed)
+		return -ENOTSUP;
+	if (frame->index >= ARRAY_SIZE(ctx->vk_capture_keys))
+		return -ERANGE;
+	if (ctx->vk_capture_generation != frame->capture_generation) {
+		ret = reap_vk_copies(ctx, 1);
+		if (ret)
+			return ret;
+		forget_vk_capture_buffers(ctx);
+		ctx->vk_capture_generation = frame->capture_generation;
+	}
+	if (!ctx->vk_capture_keys[frame->index])
+		ctx->vk_capture_keys[frame->index] = __atomic_add_fetch(
+			&g_buffer_serial, 1, __ATOMIC_RELAXED);
+	ret = v4l2_dec_export(&ctx->dec, frame->index, &source_fd, &pitch,
+			      &source_size);
+	if (ret)
+		return ret;
+	/* Chrome imports stable surfaces before decode.  Legacy ANGLE does not
+	 * reliably observe reservation fences attached after that import, so
+	 * finish the GPU copy before returning a dequeued exported surface.  The
+	 * decode-only path below remains fully asynchronous. */
+	if (s->exported) {
+		uint64_t start = ctx->stats_enabled ? monotonic_ns() : 0;
+
+		ret = iris_vk_copy_dmabuf(ctx->vk_copy,
+					  ctx->vk_capture_keys[frame->index],
+					  source_fd, source_size,
+					  s->backing_serial, s->bfd, s->bsize,
+					  frame->bytesused);
+		if (!ret)
+			ret = surface_finish_write(&ctx->dec, s);
+		if (!ret) {
+			if (ctx->stats_enabled) {
+				ctx->stats_vk_copy_ns += monotonic_ns() - start;
+				ctx->stats_vk_copy_bytes += frame->bytesused;
+				ctx->stats_vk_copy_frames++;
+			}
+			completed = 1;
+		}
+		goto out;
+	}
+	for (slot = 0; slot < ARRAY_SIZE(ctx->pending_copies); slot++)
+		if (!ctx->pending_copies[slot].used)
+			break;
+	if (slot == ARRAY_SIZE(ctx->pending_copies)) {
+		ret = reap_vk_copies(ctx, 0);
+		if (ret)
+			goto out;
+		for (slot = 0; slot < ARRAY_SIZE(ctx->pending_copies); slot++)
+			if (!ctx->pending_copies[slot].used)
+				break;
+	}
+	if (slot == ARRAY_SIZE(ctx->pending_copies)) {
+		/* V4L2 currently has at most 20 CAPTURE buffers, so this is only
+		 * a defensive pressure valve. */
+		ret = finish_vk_copy(ctx, 0, 1);
+		if (ret < 0)
+			goto out;
+		slot = 0;
+	}
+
+	ret = iris_vk_copy_submit(ctx->vk_copy,
+				 ctx->vk_capture_keys[frame->index],
+				 source_fd, source_size,
+				 s->backing_serial, s->bfd, s->bsize,
+				 frame->bytesused, &job);
+	if (!ret) {
+		ctx->pending_copies[slot].job = job;
+		ctx->pending_copies[slot].id = s->id;
+		ctx->pending_copies[slot].generation = s->generation;
+		ctx->pending_copies[slot].fence_token = s->fence_token;
+		ctx->pending_copies[slot].start_ns = monotonic_ns();
+		ctx->pending_copies[slot].bytes = frame->bytesused;
+		ctx->pending_copies[slot].capture_index = frame->index;
+		ctx->pending_copies[slot].used = 1;
+	}
+out:
+	close(source_fd);
+	if (ret) {
+		ctx->stats_vk_copy_fallbacks++;
+		if (!ctx->vk_copy_failed)
+			fprintf(stderr,
+				"iris-vaapi: Vulkan DMA-BUF copy failed (%s); using CPU copy\n",
+				strerror(-ret));
+		ctx->vk_copy_failed = 1;
+		return ret;
+	}
+	return completed ? 1 : 0;
+}
+
 static void
 finish_pending_writes(struct iris_decode_ctx *ctx)
 {
@@ -348,6 +598,7 @@ finish_pending_writes(struct iris_decode_ctx *ctx)
 
 	if (!ctx->surfs || !ctx->dec_open)
 		return;
+	(void)reap_vk_copies(ctx, 1);
 	for (i = 0; i < ctx->surfs->n; i++) {
 		struct iris_surface *s = &ctx->surfs->s[i];
 
@@ -431,6 +682,8 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 	ctx->hevc_ring_len = 0;
 	ctx->direct_error = 0;
 	ctx->fatal_error = 0;
+	ctx->vk_capture_generation = 0;
+	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
 	target_ring_reset(ctx);
 	ctx->seq = 0;
 }
@@ -441,6 +694,12 @@ iris_decode_create(void)
 	struct iris_decode_ctx *ctx = calloc(1, sizeof(*ctx));
 
 	if (ctx) {
+		pthread_mutexattr_t attr;
+
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&ctx->mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
 		reset_stream_state(ctx);
 		ctx->stats_enabled = getenv("IRIS_VAAPI_STATS") != NULL;
 		ctx->force_h264_sync_end =
@@ -466,14 +725,20 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 	}
 	if (ctx->stats_enabled) {
 		double copy_sec = ctx->stats_copy_ns / 1e9;
+		double vk_copy_sec = ctx->stats_vk_copy_ns / 1e9;
 
 		fprintf(stderr,
-			"[iris-stats] capture=%llu copied=%llu direct=%llu copy=%.3fs %.1fGiB/s sync=%.3fs rewrite=%llu/%.1fMiB %.3fs end=%llu %.3fs h264-wait=%llu/%.3fs async=%llu\n",
+			"[iris-stats] capture=%llu copied=%llu vk-copy=%llu fallback=%llu direct=%llu copy=%.3fs %.1fGiB/s vk-copy=%.3fs %.1fGiB/s sync=%.3fs rewrite=%llu/%.1fMiB %.3fs end=%llu %.3fs h264-wait=%llu/%.3fs async=%llu\n",
 			(unsigned long long)ctx->stats_capture_frames,
 			(unsigned long long)ctx->stats_copy_frames,
+			(unsigned long long)ctx->stats_vk_copy_frames,
+			(unsigned long long)ctx->stats_vk_copy_fallbacks,
 			(unsigned long long)ctx->stats_direct_frames,
 			copy_sec,
 			copy_sec > 0 ? ctx->stats_copy_bytes / copy_sec /
+				(1024.0 * 1024.0 * 1024.0) : 0.0,
+			vk_copy_sec,
+			vk_copy_sec > 0 ? ctx->stats_vk_copy_bytes / vk_copy_sec /
 				(1024.0 * 1024.0 * 1024.0) : 0.0,
 			ctx->stats_sync_ns / 1e9,
 			(unsigned long long)ctx->stats_rewrites,
@@ -488,6 +753,7 @@ iris_decode_destroy(struct iris_decode_ctx *ctx)
 	detach_owned_surfaces(ctx);
 	free(ctx->slice_data);
 	free(ctx->au_data);
+	pthread_mutex_destroy(&ctx->mutex);
 	free(ctx);
 }
 
@@ -522,6 +788,7 @@ void
 iris_decode_set_surfaces(struct iris_decode_ctx *ctx, struct iris_surfs *t)
 {
 	ctx->surfs = t;
+	ctx->vk_copy = t ? t->vk_copy : NULL;
 }
 
 static unsigned int
@@ -642,12 +909,15 @@ iris_decode_reset(struct iris_decode_ctx *ctx)
 {
 	if (!ctx)
 		return;
+	pthread_mutex_lock(&ctx->mutex);
 	if (ctx->dec_open) {
 		finish_pending_writes(ctx);
+		forget_vk_capture_buffers(ctx);
 		v4l2_dec_close(&ctx->dec);
 		ctx->dec_open = 0;
 	}
 	reset_stream_state(ctx);
+	pthread_mutex_unlock(&ctx->mutex);
 }
 
 /* ---- Display-level surface registry ---- */
@@ -655,7 +925,11 @@ iris_decode_reset(struct iris_decode_ctx *ctx)
 struct iris_surfs *
 iris_surfs_create(void)
 {
-	return calloc(1, sizeof(struct iris_surfs));
+	struct iris_surfs *t = calloc(1, sizeof(*t));
+
+	if (t && getenv("IRIS_VULKAN_COPY"))
+		t->vk_copy = iris_vk_copy_create();
+	return t;
 }
 
 void
@@ -668,12 +942,22 @@ iris_surfs_destroy(struct iris_surfs *t)
 	for (i = 0; i < t->n; i++) {
 		struct iris_surface *s = &t->s[i];
 
+		if (s->owner)
+			pthread_mutex_lock(&s->owner->mutex);
+		if (s->owner)
+			(void)finish_vk_surface(s->owner, s->id, 1);
+		if (s->owner)
+			iris_vk_copy_forget(s->owner->vk_copy,
+					    s->backing_serial);
 		if (s->owner && s->owner->dec_open &&
 		    (s->write_started || s->fence_token))
 			surface_finish_write(&s->owner->dec, s);
 		munmap(t->s[i].bmap, t->s[i].bsize);
 		close(t->s[i].bfd);
+		if (s->owner)
+			pthread_mutex_unlock(&s->owner->mutex);
 	}
+	iris_vk_copy_destroy(t->vk_copy);
 	free(t);
 }
 
@@ -733,7 +1017,11 @@ iris_surfs_alloc(struct iris_surfs *t, VASurfaceID id,
 	s->write_started = 0;
 	s->fence_token = 0;
 	s->generation = 0;
+	s->backing_serial = __atomic_add_fetch(&g_buffer_serial, 1,
+					       __ATOMIC_RELAXED);
 	s->owner = NULL;
+	surface_fill_black(bfd, map, surface_pitch(width, fourcc), height,
+			   fourcc);
 	return 0;
 }
 
@@ -749,11 +1037,20 @@ iris_surfs_free(struct iris_surfs *t, VASurfaceID id)
 
 		if (s->id != id)
 			continue;
+		if (s->owner)
+			pthread_mutex_lock(&s->owner->mutex);
+		if (s->owner)
+			(void)finish_vk_surface(s->owner, s->id, 1);
+		if (s->owner)
+			iris_vk_copy_forget(s->owner->vk_copy,
+					    s->backing_serial);
 		if (s->owner && s->owner->dec_open &&
 		    (s->write_started || s->fence_token))
 			surface_finish_write(&s->owner->dec, s);
 		munmap(s->bmap, s->bsize);
 		close(s->bfd);
+		if (s->owner)
+			pthread_mutex_unlock(&s->owner->mutex);
 		t->s[i] = t->s[t->n - 1];
 		t->n--;
 		return;
@@ -1069,8 +1366,15 @@ assign_frame(struct iris_decode_ctx *ctx, const struct v4l2_dec_frame *frame)
 		v4l2_dec_qcap_idx(&ctx->dec, frame->index);
 		return -1;
 	} else if (frame->bytesused) {
-		int copy_ret = surface_copy(ctx, s, frame->mem,
-					    frame->bytesused);
+		int copy_ret = surface_vk_submit(ctx, s, frame);
+
+		if (copy_ret == 0)
+			return id;
+		if (copy_ret < 0)
+			copy_ret = surface_copy(ctx, s, frame->mem,
+						frame->bytesused);
+		else
+			copy_ret = 0;
 
 		if (copy_ret < 0) {
 			fprintf(stderr,
@@ -1113,6 +1417,9 @@ wait_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id, int deadline)
 		ret = drain_available(ctx);
 		if (ret)
 			return ret;
+		ret = finish_vk_surface(ctx, id, 1);
+		if (ret && ret != -EAGAIN)
+			return ret;
 		s = find_surface(ctx, id);
 		if (s && s->decoded)
 			return 0;
@@ -1147,8 +1454,8 @@ wait_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id, int deadline)
  * decoder keeps the most recent picture until the next access unit (or an
  * EOS marker) arrives; without this, vaSyncSurface on the last picture
  * always times out. */
-int
-iris_decode_flush(struct iris_decode_ctx *ctx)
+static int
+iris_decode_flush_impl(struct iris_decode_ctx *ctx)
 {
 	struct v4l2_dec_frame frame;
 	int ret, deadline = 100;
@@ -1194,15 +1501,35 @@ iris_decode_flush(struct iris_decode_ctx *ctx)
 		if (ret == 1)
 			break;
 	}
-	return ctx->dec.eos ? 0 : -ETIMEDOUT;
+	if (ctx->dec.eos) {
+		ret = reap_vk_copies(ctx, 1);
+		return ret;
+	}
+	return -ETIMEDOUT;
+}
+
+int
+iris_decode_flush(struct iris_decode_ctx *ctx)
+{
+	int ret;
+
+	pthread_mutex_lock(&ctx->mutex);
+	ret = iris_decode_flush_impl(ctx);
+	pthread_mutex_unlock(&ctx->mutex);
+	return ret;
 }
 
 /* Non-blocking drain of whatever frames are ready. */
 static int
 drain_available(struct iris_decode_ctx *ctx)
 {
+	int copy_ret;
+
 	if (ctx->fatal_error)
 		return ctx->fatal_error;
+	copy_ret = reap_vk_copies(ctx, 0);
+	if (copy_ret < 0)
+		return copy_ret;
 	if (ctx->eos_sent)
 		return 0;
 
@@ -1236,12 +1563,15 @@ drain_available(struct iris_decode_ctx *ctx)
 		}
 		if (ctx->direct_error)
 			return ctx->direct_error;
+		ret = reap_vk_copies(ctx, 0);
+		if (ret < 0)
+			return ret;
 	}
 	return 0;
 }
 
-int
-iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
+static int
+iris_decode_begin_impl(struct iris_decode_ctx *ctx, VASurfaceID target)
 {
 	struct iris_surface *s = find_surface(ctx, target);
 	int direct_index = ctx->direct_capture ?
@@ -1253,6 +1583,9 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 		return ctx->fatal_error;
 	if (!s)
 		return -EINVAL;
+	/* Never recycle a target while an earlier GPU copy still writes it. */
+	if (finish_vk_surface(ctx, target, 1) < 0)
+		return -EIO;
 	/* Chrome creates its VAContext before it asks for the first surface.  The
 	 * opt-in pool preallocation has happened by the first BeginPicture, so bind
 	 * the deferred fixed ring here, before V4L2 is opened. */
@@ -1294,6 +1627,17 @@ iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
 	ctx->hevc_pps_id = -1;
 	ctx->hevc_rewritten = 0;
 	return 0;
+}
+
+int
+iris_decode_begin(struct iris_decode_ctx *ctx, VASurfaceID target)
+{
+	int ret;
+
+	pthread_mutex_lock(&ctx->mutex);
+	ret = iris_decode_begin_impl(ctx, target);
+	pthread_mutex_unlock(&ctx->mutex);
+	return ret;
 }
 
 int
@@ -1601,8 +1945,8 @@ iris_decode_slice(struct iris_decode_ctx *ctx, const void *data, size_t len)
 	return 0;
 }
 
-int
-iris_decode_end(struct iris_decode_ctx *ctx)
+static int
+iris_decode_end_impl(struct iris_decode_ctx *ctx)
 {
 	uint8_t *au;
 	int rv;
@@ -1829,7 +2173,8 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 
 				qt->queued = 1;
 				qt->owner = ctx;
-				if (ctx->direct_capture)
+				if (ctx->direct_capture ||
+				    (ctx->vk_copy && !ctx->vk_copy_failed))
 					surface_begin_device_write(&ctx->dec, qt, token);
 				else
 					surface_begin_write(&ctx->dec, qt, token);
@@ -1940,7 +2285,18 @@ iris_decode_end(struct iris_decode_ctx *ctx)
 }
 
 int
-iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
+iris_decode_end(struct iris_decode_ctx *ctx)
+{
+	int ret;
+
+	pthread_mutex_lock(&ctx->mutex);
+	ret = iris_decode_end_impl(ctx);
+	pthread_mutex_unlock(&ctx->mutex);
+	return ret;
+}
+
+static int
+iris_decode_sync_impl(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
 	struct iris_surface *s = find_surface(ctx, id);
 	int deadline = 200;	/* ~2 s */
@@ -2009,10 +2365,23 @@ iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
 	return -ETIMEDOUT;
 }
 
+int
+iris_decode_sync(struct iris_decode_ctx *ctx, VASurfaceID id)
+{
+	int ret;
+
+	pthread_mutex_lock(&ctx->mutex);
+	ret = iris_decode_sync_impl(ctx, id);
+	pthread_mutex_unlock(&ctx->mutex);
+	return ret;
+}
+
 static int
 iris_decode_surface_ready(struct iris_decode_ctx *ctx, VASurfaceID id)
 {
 	if (drain_available(ctx))
+		return 0;
+	if (finish_vk_surface(ctx, id, 0) < 0)
 		return 0;
 	{
 		struct iris_surface *s = find_surface(ctx, id);
