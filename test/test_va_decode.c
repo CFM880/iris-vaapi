@@ -306,10 +306,57 @@ int main(int argc, char **argv)
 		if (st) { fprintf(stderr, "vaSyncSurface: %s\n", vaErrorStr(st)); return 1; }
 		printf("synced middle surface %u\n", s);
 
-		s = surf[9];	/* the final, firmware-held picture */
-		st = vaSyncSurface(dpy, s);
-		if (st) { fprintf(stderr, "vaSyncSurface last: %s\n", vaErrorStr(st)); return 1; }
-		printf("synced last surface %u\n", s);
+		/* Chromium keeps the VAContext across Reset()/seek and does not send
+		 * EOS to libva.  Submit a new IDR while the old firmware session is
+		 * still live; the driver must discard the old DPB/CAPTURE work first. */
+		{
+			VABufferID rb[3];
+
+			usleep(150000); /* model the demux pause around a user seek */
+			st = vaCreateBuffer(dpy, ctx, VASliceDataBufferType,
+					    slice_len[0], 1, slice[0], &rb[1]);
+			if (st) { fprintf(stderr, "restart slice buf: %s\n", vaErrorStr(st)); return 1; }
+			st = vaCreateBuffer(dpy, ctx, VAPictureParameterBufferType,
+					    sizeof(pic), 1, &pic, &rb[2]);
+			if (st) { fprintf(stderr, "restart pic buf: %s\n", vaErrorStr(st)); return 1; }
+			rb[0] = bufs[0];
+			st = vaBeginPicture(dpy, ctx, surf[10]);
+			if (st) { fprintf(stderr, "restart begin: %s\n", vaErrorStr(st)); return 1; }
+			st = vaRenderPicture(dpy, ctx, rb, 3);
+			if (st) { fprintf(stderr, "restart render: %s\n", vaErrorStr(st)); return 1; }
+			st = vaEndPicture(dpy, ctx);
+			if (st) { fprintf(stderr, "restart end: %s\n", vaErrorStr(st)); return 1; }
+			vaDestroyBuffer(dpy, rb[1]);
+			vaDestroyBuffer(dpy, rb[2]);
+			st = vaSyncSurface(dpy, surf[10]);
+			if (st) { fprintf(stderr, "restart sync: %s\n", vaErrorStr(st)); return 1; }
+			printf("synced live-seek IDR surface %u\n", surf[10]);
+		}
+
+		/* Syncing the live-seek IDR above sends EOS because it is now the
+		 * final target.  Exercise the separate EOS-reopen path too. */
+		{
+			VABufferID rb[3];
+
+			st = vaCreateBuffer(dpy, ctx, VASliceDataBufferType,
+					    slice_len[0], 1, slice[0], &rb[1]);
+			if (st) { fprintf(stderr, "post-EOS slice buf: %s\n", vaErrorStr(st)); return 1; }
+			st = vaCreateBuffer(dpy, ctx, VAPictureParameterBufferType,
+					    sizeof(pic), 1, &pic, &rb[2]);
+			if (st) { fprintf(stderr, "post-EOS pic buf: %s\n", vaErrorStr(st)); return 1; }
+			rb[0] = bufs[0];
+			st = vaBeginPicture(dpy, ctx, surf[11]);
+			if (st) { fprintf(stderr, "post-EOS begin: %s\n", vaErrorStr(st)); return 1; }
+			st = vaRenderPicture(dpy, ctx, rb, 3);
+			if (st) { fprintf(stderr, "post-EOS render: %s\n", vaErrorStr(st)); return 1; }
+			st = vaEndPicture(dpy, ctx);
+			if (st) { fprintf(stderr, "post-EOS end: %s\n", vaErrorStr(st)); return 1; }
+			vaDestroyBuffer(dpy, rb[1]);
+			vaDestroyBuffer(dpy, rb[2]);
+			st = vaSyncSurface(dpy, surf[11]);
+			if (st) { fprintf(stderr, "post-EOS sync: %s\n", vaErrorStr(st)); return 1; }
+			printf("synced post-EOS IDR surface %u\n", surf[11]);
+		}
 		{
 			int exi[] = { 0, 1, 3, 5 };
 			VADRMPRIMESurfaceDescriptor dsc;

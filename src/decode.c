@@ -27,6 +27,12 @@
 #define IRIS_MAX_SURFACES	128
 #define IRIS_AU_MAX		(16U * 1024 * 1024)
 #define IRIS_MAX_PENDING_COPIES	32
+/* VA-API has no decoder-reset callback.  A random-access picture following a
+ * user-visible pause is the best signal that a client reused its VAContext
+ * across a seek.  Every codec drains and reopens its firmware session at this
+ * boundary while preserving the monotonically increasing private timestamp
+ * epoch across the restart. */
+#define IRIS_SEEK_GAP_NS		100000000ULL
 
 #ifndef ALIGN_TO
 #define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -351,6 +357,8 @@ struct iris_decode_ctx {
 	uint64_t stats_h264_waits;
 	uint64_t stats_h264_async;
 	uint64_t stats_direct_frames;
+	uint64_t last_submit_ns;
+	int vp9_seek_barrier;
 	int force_h264_sync_end;
 };
 
@@ -647,29 +655,21 @@ target_ring_reset(struct iris_decode_ctx *ctx)
 	memset(ctx->target_ring, 0, sizeof(ctx->target_ring));
 }
 
-/* Clear all per-stream decode state: parameter-set caches, the sequence to
- * surface mapping and EOS bookkeeping.  Surfaces and their backings are
- * preserved so clients may keep exporting them. */
+/* Clear only state owned by one V4L2 firmware session.  Keep the picture that
+ * may already have been collected between vaBeginPicture and vaEndPicture.
+ *
+ * This distinction matters after EOS: ensure_decoder() runs from
+ * vaEndPicture, after the client has supplied the next picture.  Calling the
+ * full reset_stream_state() there used to erase that picture's slice data and
+ * parameters, so the first access unit after a seek/flush was incomplete. */
 static void
-reset_stream_state(struct iris_decode_ctx *ctx)
+reset_decoder_session_state(struct iris_decode_ctx *ctx)
 {
 	ctx->dec_started = 0;
 	ctx->eos_sent = 0;
 	ctx->last_target = 0;
-	ctx->have_pic = 0;
-	ctx->have_h264_iq = 0;
-	ctx->have_hevc_pic = 0;
-	ctx->have_hevc_iq = 0;
-	ctx->slice_len = 0;
-	ctx->refs_l0 = 0;
-	ctx->refs_l1 = 0;
 	ctx->h264_pps_refs_l0 = -1;
 	ctx->h264_pps_refs_l1 = -1;
-	ctx->h264_slice_count = 0;
-	ctx->hevc_slice_count = 0;
-	ctx->hevc_slice_next = 0;
-	ctx->hevc_pps_id = -1;
-	ctx->hevc_rewritten = 0;
 	ctx->last_sps_len = 0;
 	ctx->last_pps_len = 0;
 	ctx->last_hevc_vps_len = 0;
@@ -686,6 +686,29 @@ reset_stream_state(struct iris_decode_ctx *ctx)
 	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
 	target_ring_reset(ctx);
 	ctx->seq = 0;
+	ctx->last_submit_ns = 0;
+	ctx->vp9_seek_barrier = 0;
+}
+
+/* Clear all per-stream decode state: parameter-set caches, the sequence to
+ * surface mapping and EOS bookkeeping.  Surfaces and their backings are
+ * preserved so clients may keep exporting them. */
+static void
+reset_stream_state(struct iris_decode_ctx *ctx)
+{
+	reset_decoder_session_state(ctx);
+	ctx->have_pic = 0;
+	ctx->have_h264_iq = 0;
+	ctx->have_hevc_pic = 0;
+	ctx->have_hevc_iq = 0;
+	ctx->slice_len = 0;
+	ctx->refs_l0 = 0;
+	ctx->refs_l1 = 0;
+	ctx->h264_slice_count = 0;
+	ctx->hevc_slice_count = 0;
+	ctx->hevc_slice_next = 0;
+	ctx->hevc_pps_id = -1;
+	ctx->hevc_rewritten = 0;
 }
 
 struct iris_decode_ctx *
@@ -1182,12 +1205,14 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 	if (ctx->dec_open) {
 		/* After an EOS flush the firmware is done; a client that keeps
 		 * decoding (Chrome flush/reset, looped playback) needs a fresh
-		 * session. */
+		 * session.  Preserve the picture already collected for this
+		 * vaEndPicture call while clearing the old firmware bookkeeping. */
 		if (ctx->eos_sent) {
 			finish_pending_writes(ctx);
+			forget_vk_capture_buffers(ctx);
 			v4l2_dec_close(&ctx->dec);
 			ctx->dec_open = 0;
-			reset_stream_state(ctx);
+			reset_decoder_session_state(ctx);
 		} else {
 			return 0;
 		}
@@ -1220,6 +1245,35 @@ ensure_decoder(struct iris_decode_ctx *ctx)
 	}
 	ctx->dec_open = 1;
 	return 0;
+}
+
+/* Drop a live firmware session at a random-access boundary without touching
+ * the picture currently being assembled.  Chromium's decoder Reset() does
+ * not issue any VA-API operation, so a seek otherwise leaves old DPB and
+ * CAPTURE work in the stateful V4L2 session until the first post-seek frame
+ * arrives. */
+static void
+restart_decoder_session(struct iris_decode_ctx *ctx)
+{
+	int i;
+
+	if (!ctx->dec_open)
+		return;
+	finish_pending_writes(ctx);
+	forget_vk_capture_buffers(ctx);
+	v4l2_dec_close(&ctx->dec);
+	ctx->dec_open = 0;
+	/* Pending pictures from the abandoned stream keep their stable backing,
+	 * but no longer have firmware work that a later vaSyncSurface can drain. */
+	if (ctx->surfs) {
+		for (i = 0; i < ctx->surfs->n; i++) {
+			struct iris_surface *s = &ctx->surfs->s[i];
+
+			if (s->owner == ctx && s->queued && !s->decoded)
+				s->queued = 0;
+		}
+	}
+	reset_decoder_session_state(ctx);
 }
 
 static int
@@ -1508,6 +1562,41 @@ iris_decode_flush_impl(struct iris_decode_ctx *ctx)
 	return -ETIMEDOUT;
 }
 
+/* Establish a strict stream boundary for Chromium seeks.  Chromium does
+ * not forward Decoder::Reset() through VA-API, so the first post-seek key frame
+ * is the earliest point where the driver can act.  Finish the complete old
+ * OUTPUT/CAPTURE pipeline and observe LAST before closing it; only then may the
+ * already assembled seek key frame be submitted to a fresh firmware session.
+ * Preserve the private sequence epoch across every codec restart; legacy VPU5
+ * VP9 has proved sensitive to a timestamp rewind across a context reused by
+ * Chromium. */
+static int
+drain_and_restart_seek(struct iris_decode_ctx *ctx)
+{
+	uint64_t next_seq = ctx->seq;
+	unsigned int pending = 0, i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(ctx->target_ring); i++)
+		pending += ctx->target_ring[i].used != 0;
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC)
+		pending = ctx->hevc_ring_len;
+	DBG("[seek] draining %u pre-seek mappings codec=0x%x\n",
+	    pending, ctx->out_pixfmt);
+	ret = iris_decode_flush_impl(ctx);
+	if (ret) {
+		DBG("[seek] pre-seek drain failed codec=0x%x: %d\n",
+		    ctx->out_pixfmt, ret);
+		return ret;
+	}
+	restart_decoder_session(ctx);
+	ctx->seq = next_seq;
+	ctx->vp9_seek_barrier = ctx->out_pixfmt == V4L2_PIX_FMT_VP9;
+	DBG("[seek] old session complete codec=0x%x; restart at seq=%llu\n",
+	    ctx->out_pixfmt, (unsigned long long)ctx->seq);
+	return 0;
+}
+
 int
 iris_decode_flush(struct iris_decode_ctx *ctx)
 {
@@ -1722,6 +1811,93 @@ has_start_code(const uint8_t *p, size_t len)
 	if (len >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1)
 		return 3;
 	return 0;
+}
+
+/* Identify independently decodable pictures that can safely start a fresh
+ * stateful V4L2 session.  This is also the only signal the VA driver sees for
+ * Chromium seeks because the software decoder reset is not forwarded through
+ * libva. */
+static int
+is_random_access_picture(const struct iris_decode_ctx *ctx)
+{
+	size_t i = 0;
+
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9) {
+		unsigned int profile, show_existing, frame_type;
+		uint8_t b;
+
+		if (!ctx->slice_len)
+			return 0;
+		b = ctx->slice_data[0];
+		/* VP9's uncompressed header is packed most-significant bit first.
+		 * Profile 0 key/inter frames commonly start with 0x82/0x86: the
+		 * frame_marker is bits 7..6 and frame_type is bit 2. */
+		if ((b >> 6) != 2) /* frame_marker */
+			return 0;
+		profile = ((b >> 5) & 1) | (((b >> 4) & 1) << 1);
+		show_existing = (b >> (profile == 3 ? 2 : 3)) & 1;
+		if (show_existing)
+			return 0;
+		frame_type = (b >> (profile == 3 ? 1 : 2)) & 1;
+		return frame_type == 0;
+	}
+
+	while (i + 3 < ctx->slice_len) {
+		int sc = has_start_code(ctx->slice_data + i,
+					ctx->slice_len - i);
+		unsigned int type;
+
+		if (!sc) {
+			i++;
+			continue;
+		}
+		i += (size_t)sc;
+		if (i >= ctx->slice_len)
+			break;
+		if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
+			type = ctx->slice_data[i] & 0x1f;
+			if (type == 5) /* IDR */
+				return 1;
+		} else if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC) {
+			type = (ctx->slice_data[i] >> 1) & 0x3f;
+			if (type >= 16 && type <= 23) /* BLA/IDR/CRA */
+				return 1;
+		}
+		while (i < ctx->slice_len &&
+		       !has_start_code(ctx->slice_data + i,
+					ctx->slice_len - i))
+			i++;
+	}
+	return 0;
+}
+
+/* Build the shortest VP9 show_existing_frame access unit, selecting reference
+ * slot zero.  A key frame refreshes all eight slots, so slot zero is valid at
+ * the post-seek barrier.  show_existing_frame does not decode or refresh any
+ * reference; it only supplies the extra OUTPUT boundary needed to make legacy
+ * VPU5 release the preceding real inter frame. */
+static size_t
+vp9_show_existing_au(const struct iris_decode_ctx *ctx, uint8_t au[2])
+{
+	unsigned int profile;
+	uint8_t b;
+
+	if (!ctx->slice_len)
+		return 0;
+	b = ctx->slice_data[0];
+	if ((b >> 6) != 2)
+		return 0;
+	profile = ((b >> 5) & 1) | (((b >> 4) & 1) << 1);
+	au[0] = 0x80 | (b & 0x30);
+	if (profile == 3) {
+		/* profile 3 has reserved_zero before show_existing_frame; the
+		 * final frame_to_show_map_idx bit spills into the second byte. */
+		au[0] |= 0x04;
+		au[1] = 0;
+		return 2;
+	}
+	au[0] |= 0x08;
+	return 1;
 }
 
 /* VA exposes the effective reference counts for each slice.  Those values
@@ -1950,6 +2126,8 @@ iris_decode_end_impl(struct iris_decode_ctx *ctx)
 {
 	uint8_t *au;
 	int rv;
+	int random_access;
+	int vp9_barrier_submitted = 0;
 	uint64_t end_start = ctx->stats_enabled ? monotonic_ns() : 0;
 
 	DBG("[end] target=%u slice_len=%zu refs=%d/%d started=%d\n",
@@ -1965,6 +2143,31 @@ iris_decode_end_impl(struct iris_decode_ctx *ctx)
 	if (ctx->out_pixfmt == V4L2_PIX_FMT_HEVC &&
 	    ctx->hevc_slice_next != ctx->hevc_slice_count)
 		return -1;
+	random_access = is_random_access_picture(ctx);
+
+	/* Stateful firmware may retain pictures from before a Chromium seek because
+	 * decoder Reset() has no libva counterpart.  At the first safe random-access
+	 * picture, drain every codec's old session through LAST before reopening it,
+	 * so old and new access units never coexist in VPU.  Keep the driver's private
+	 * timestamp sequence monotonic across the restart. */
+	if (ctx->dec_started && random_access) {
+		uint64_t now = monotonic_ns();
+		uint64_t gap = ctx->last_submit_ns ? now - ctx->last_submit_ns : 0;
+		int seek_boundary = ctx->eos_sent || gap >= IRIS_SEEK_GAP_NS;
+
+		/* Do not restart on normal in-stream IDRs: some content has a key
+		 * frame every few hundred milliseconds.  EOS is unambiguous; without
+		 * EOS, the pause before the random-access picture distinguishes a seek
+		 * from normal frame cadence. */
+		if (seek_boundary) {
+			DBG("[end] seek boundary gap=%llums codec=0x%x: draining old session\n",
+			    (unsigned long long)(gap / 1000000ULL),
+			    ctx->out_pixfmt);
+			ret = drain_and_restart_seek(ctx);
+			if (ret)
+				return ret;
+		}
+	}
 
 	/* 16 MiB of stack would overflow the caller's stack; use the heap. */
 	au_cap = ctx->slice_len + sizeof(ctx->last_sps) +
@@ -2237,6 +2440,66 @@ iris_decode_end_impl(struct iris_decode_ctx *ctx)
 					 ctx->current_generation);
 		ctx->seq++;
 	}
+	/* Legacy VPU5 retains the current VP9 picture until another access unit
+	 * arrives.  Chrome may present an exported key-frame target immediately
+	 * after EndPicture and does not reliably observe a reservation fence added
+	 * after the DMA-BUF was imported.  Queue one internal duplicate key frame
+	 * to release the real target, then wait briefly for that real completion.
+	 * The duplicate has its own timestamp but no target-ring mapping, so its
+	 * eventual CAPTURE output is recycled rather than exposed to Chrome. */
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9 && random_access) {
+		uint64_t prime_ts = (ctx->seq + 1000) * 1000000000ULL;
+
+		for (int spin = 0; spin < 100; spin++) {
+			while (v4l2_dec_dqout(&ctx->dec) == 0)
+				;
+			ret = v4l2_dec_feed(&ctx->dec, au, au_len, prime_ts);
+			if (ret != -EAGAIN)
+				break;
+			ret = drain_available(ctx);
+			if (ret)
+				break;
+			v4l2_dec_poll(&ctx->dec, 50);
+		}
+		if (ret)
+			return ret;
+		DBG("[vp9-keyframe] prime seq=%llu target=%u\n",
+		    (unsigned long long)ctx->seq, ctx->current_target);
+		ctx->seq++;
+	}
+	/* The seek key frame above is complete before EndPicture returns, but VPU5
+	 * would hold the immediately following real inter frame.  ANGLE can sample
+	 * its exported target before the next Chrome decode call and briefly expose
+	 * the target's pre-seek pixels.  One show_existing_frame AU pushes that first
+	 * inter frame out without decoding a duplicate or changing VP9 references. */
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9 &&
+	    ctx->vp9_seek_barrier && !random_access) {
+		uint8_t show_existing[2];
+		size_t show_existing_len = vp9_show_existing_au(ctx, show_existing);
+		uint64_t barrier_ts = (ctx->seq + 1000) * 1000000000ULL;
+
+		if (!show_existing_len)
+			return -EINVAL;
+		for (int spin = 0; spin < 100; spin++) {
+			while (v4l2_dec_dqout(&ctx->dec) == 0)
+				;
+			ret = v4l2_dec_feed(&ctx->dec, show_existing,
+					    show_existing_len, barrier_ts);
+			if (ret != -EAGAIN)
+				break;
+			ret = drain_available(ctx);
+			if (ret)
+				break;
+			v4l2_dec_poll(&ctx->dec, 50);
+		}
+		if (ret)
+			return ret;
+		DBG("[vp9-seek] inter barrier seq=%llu target=%u\n",
+		    (unsigned long long)ctx->seq, ctx->current_target);
+		ctx->seq++;
+		ctx->vp9_seek_barrier = 0;
+		vp9_barrier_submitted = 1;
+	}
 	/* The stateful firmware holds each frame until the next access unit
 	 * arrives.  Draining right after this feed makes the *previous*
 	 * picture's frame available so a client that syncs one picture at a
@@ -2244,22 +2507,46 @@ iris_decode_end_impl(struct iris_decode_ctx *ctx)
 	ret = drain_available(ctx);
 	if (ret)
 		return ret;
+	if (ctx->out_pixfmt == V4L2_PIX_FMT_VP9 &&
+	    (random_access || vp9_barrier_submitted)) {
+		ret = wait_surface_ready(ctx, ctx->current_target, 20);
+		if (ret) {
+			DBG("[vp9-barrier] target=%u wait incomplete: %d\n",
+			    ctx->current_target, ret);
+			/* A seek boundary is specifically protecting ANGLE from stale
+			 * pixels.  Prefer decoder fallback to returning that surface
+			 * before it is ready. */
+			if (ctx->vp9_seek_barrier || vp9_barrier_submitted)
+				return ret;
+		}
+	}
 
 	/* Chrome sends an already-exported surface to ANGLE immediately after
 	 * vaEndPicture.  Legacy Adreno can sample its previous contents even though
-	 * a new reservation fence was attached, so retain the conservative wait
-	 * for those surfaces.  Decode-only clients do not export their surfaces;
-	 * keeping those submissions asynchronous preserves the V4L2 pipeline and
-	 * leaves synchronization to vaSyncSurface, as required by VA-API. */
-	if (ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
+	 * a new reservation fence was attached.  Asynchronous HEVC let Chrome
+	 * recycle a target one or two generations before its CAPTURE frame arrived,
+	 * so H.264 and HEVC exported targets need backpressure here.  VP9 normally
+	 * stays asynchronous because its firmware holds the current picture until
+	 * the next frame; its safe key-frame and post-seek barriers are handled
+	 * above only after an internal AU has pushed the target out. */
+	{
 		struct iris_surface *target = find_surface(ctx,
 							   ctx->current_target);
+		int wait_exported_codec = ctx->out_pixfmt == V4L2_PIX_FMT_H264 ||
+			ctx->out_pixfmt == V4L2_PIX_FMT_HEVC;
+		int exported_wait = wait_exported_codec && target &&
+			target->exported;
+		int forced_wait = ctx->out_pixfmt == V4L2_PIX_FMT_H264 &&
+			ctx->force_h264_sync_end;
 
-		if (ctx->force_h264_sync_end || (target && target->exported)) {
+		if (exported_wait || forced_wait) {
 			uint64_t wait_start = ctx->stats_enabled ? monotonic_ns() : 0;
 
+			DBG("[end] waiting exported target=%u codec=0x%x\n",
+			    ctx->current_target, ctx->out_pixfmt);
 			ret = wait_surface_ready(ctx, ctx->current_target, 100);
-			if (ctx->stats_enabled) {
+			if (ctx->stats_enabled &&
+			    ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
 				ctx->stats_h264_wait_ns += monotonic_ns() - wait_start;
 				ctx->stats_h264_waits++;
 			}
@@ -2268,14 +2555,17 @@ iris_decode_end_impl(struct iris_decode_ctx *ctx)
 				    ctx->current_target, ret);
 				return ret;
 			}
-		} else if (ctx->stats_enabled) {
+			DBG("[end] exported target=%u ready\n",
+			    ctx->current_target);
+		} else if (ctx->stats_enabled &&
+			   ctx->out_pixfmt == V4L2_PIX_FMT_H264) {
 			ctx->stats_h264_async++;
 		}
 	}
-
 	ctx->slice_len = 0;
 	ctx->have_pic = 0;
 	rv = 0;
+	ctx->last_submit_ns = monotonic_ns();
 	if (ctx->stats_enabled) {
 		ctx->stats_end_ns += monotonic_ns() - end_start;
 		ctx->stats_ends++;

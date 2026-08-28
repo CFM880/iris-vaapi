@@ -390,9 +390,9 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 | 固件按显示顺序延迟返还 CAPTURE | Chrome 已输出 VA surface，但对应 CAPTURE 帧尚未产生 → 4K 卡顿、短暂旧帧/花屏 | qcom-iris 暴露标准 display-delay 控制并向 Gen1 固件请求 decode-order output；VA 驱动在会话启动前设置 delay=0 |
 | Gen1 即使 decode-order 仍会成批返还 CAPTURE（实测每 3 帧） | `vaEndPicture` 已返回，但目标 surface 尚未写入；不等待隐式同步的客户端会采到旧帧或写到一半的帧 | `vaEndPicture` 给稳定 DMA-BUF 挂未完成的 reservation write fence；CAPTURE 拷贝和 cache sync 完成后再 signal。遵守 DMA-BUF 隐式同步的消费者可保持异步流水线 |
 | 4K60 解码落后时 render target 先于旧 CAPTURE 返回而被复用 | 晚到的旧帧覆盖同一 backing，并误 signal 新一代帧的 fence，表现为偶发回退 1 帧 | seq/POC→surface 映射同时记录 surface generation；旧 generation 的 CAPTURE 只回收，不覆盖 backing、不解除新 fence |
-| ANGLE/GL 未可靠等待 DMA-BUF 导入后追加的 reservation fence | `mediaTime` 单调递增，但 canvas 像素指纹会回到早先帧（实测 1.083s 与 0.667s 相同） | H.264 `vaEndPicture` 返回前等待当前 decode-order target 完成；用硬件背压把性能不足变成正常丢帧，不再展示旧 backing |
+| ANGLE/GL 未可靠等待 DMA-BUF 导入后追加的 reservation fence | `mediaTime` 单调递增，但 canvas 像素指纹会回到早先帧；HEVC 日志中 surface 在 CAPTURE 返回前已复用 1–2 代，持续出现 `assign STALE` | H.264/HEVC 的已导出 surface 在 `vaEndPicture` 返回前等待当前 decode-order target 和 stable copy 完成；VP9 关键帧用内部 prime AU 推出并等待，seek 后第一张 inter 帧再用不改变引用状态的 `show_existing_frame` 建立一次性完成屏障 |
 | 同步等待后 4K60 只有约 37.6fps | coherent CAPTURE 被 CPU 逐帧读取，12.5MB/帧的拷贝占满一个 CPU 核 | 加载 qcom-iris 时启用 `cached_capture=1`，让 H.264/HEVC/VP9 的 vb2 缓冲在 DMA 完成后维护 cache；H.264 600 帧实测提升至 62.5fps，VP9 Profile 2 由约 27fps 提升至 64fps |
-| Chromium Flush 只排空软件 DPB，不向 libva/stateful V4L2 发送 EOS | 固件扣住片尾帧；context reset 后最后一个 surface 仍是其上一次内容，表现为片尾跳回上一帧 | 每个 H.264/HEVC AU 尾部附加 AUD 边界，促使固件释放当前帧；H.264 可在 `vaEndPicture` 内等当前 target，无需下一帧输入或 EOS |
+| seek 后复用同一 `VAContext` | Chromium `Reset()` 既不发 VA EOS 也不重建 context；旧 DPB/CAPTURE 可被新随机访问帧顶出，且 `ensure_decoder` 曾在重开会话时误清当前 slice。仅直接 close H.264/HEVC 会放弃旧 in-flight surface；保留 VP9 live session 则会让新关键帧/prime 与 seek 前 AU 同时存在于 VPU，新输入先顶出旧 CAPTURE，表现为目标帧后闪回旧帧；丢弃旧映射又会让已提交给合成器的 backing 显示成黑帧 | 在识别到 H.264 IDR、HEVC BLA/IDR/CRA 或 VP9 key frame 但尚未提交它时，统一先向旧 session 发 EOS，等待全部 OUTPUT/CAPTURE 和 LAST，再关闭并重开；保留单调的私有 timestamp epoch，之后才提交 seek 帧，使新旧时间段从不同时进入 VPU。VP9 关键帧另由内部 prime AU 推出并等待，seek 后第一张 inter 帧再由 `show_existing_frame` 推出并等待 |
 
 排查工具：
 

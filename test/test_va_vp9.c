@@ -37,6 +37,56 @@ static int feed_frame(VADisplay dpy, VAContextID ctx, VASurfaceID surf,
 	return 0;
 }
 
+static int export_surface_once(VADisplay dpy, VASurfaceID surf)
+{
+	VADRMPRIMESurfaceDescriptor dsc;
+	VAStatus st;
+	unsigned int i;
+
+	/* Chromium exports its pool before decoding.  Do the same so this test
+	 * exercises the VP9 keyframe push/barrier path, not just async decode. */
+	st = vaExportSurfaceHandle(dpy, surf,
+				   VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+				   VA_EXPORT_SURFACE_READ_ONLY |
+				   VA_EXPORT_SURFACE_SEPARATE_LAYERS, &dsc);
+	if (st) {
+		fprintf(stderr, "pre-export surface %u: %s\n", surf,
+			vaErrorStr(st));
+		return -1;
+	}
+	for (i = 0; i < dsc.num_objects; i++)
+		close(dsc.objects[i].fd);
+	return 0;
+}
+
+static int vp9_keyframe(const unsigned char *data, size_t len)
+{
+	unsigned int profile, show_existing, frame_type;
+	unsigned int b;
+
+	if (!len)
+		return 0;
+	b = data[0];
+	if ((b >> 6) != 2)
+		return 0;
+	profile = ((b >> 5) & 1) | (((b >> 4) & 1) << 1);
+	show_existing = (b >> (profile == 3 ? 2 : 3)) & 1;
+	frame_type = (b >> (profile == 3 ? 1 : 2)) & 1;
+	return !show_existing && !frame_type;
+}
+
+static int vp9_profile(const unsigned char *data, size_t len)
+{
+	unsigned int b;
+
+	if (!len)
+		return -1;
+	b = data[0];
+	if ((b >> 6) != 2)
+		return -1;
+	return ((b >> 5) & 1) | (((b >> 4) & 1) << 1);
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = argc > 1 ? argv[1] : "/tmp/test-vp9.ivf";
@@ -48,10 +98,14 @@ int main(int argc, char **argv)
 	VADisplay dpy;
 	VAConfigID cfg;
 	VAContextID ctx;
+	VAProfile va_profile;
 	VASurfaceID surf[24];
 	VAStatus st;
 	int major = 0, minor = 0, fd;
+	int profile;
+	unsigned int rt_format;
 	unsigned int n_frames = 0;
+	unsigned int seeks_exercised = 0;
 	unsigned char *p, *end;
 
 	fp = fopen(path, "rb");
@@ -63,6 +117,30 @@ int main(int argc, char **argv)
 	if (!stream || fread(stream, 1, fsize, fp) != (size_t)fsize)
 		return 1;
 	fclose(fp);
+	if (fsize < 45) {
+		fprintf(stderr, "short IVF file\n");
+		return 1;
+	}
+	{
+		unsigned int first_size = stream[32] | (stream[33] << 8) |
+			(stream[34] << 16) | (stream[35] << 24);
+
+		if (first_size > (unsigned long)fsize - 44) {
+			fprintf(stderr, "bad first IVF frame\n");
+			return 1;
+		}
+		profile = vp9_profile(stream + 44, first_size);
+	}
+	if (profile == 0) {
+		va_profile = VAProfileVP9Profile0;
+		rt_format = VA_RT_FORMAT_YUV420;
+	} else if (profile == 2) {
+		va_profile = VAProfileVP9Profile2;
+		rt_format = VA_RT_FORMAT_YUV420_10BPP;
+	} else {
+		fprintf(stderr, "unsupported VP9 profile %d\n", profile);
+		return 1;
+	}
 
 	fd = open("/dev/dri/renderD128", O_RDWR);
 	if (fd < 0) { perror("open renderD128"); return 1; }
@@ -74,14 +152,17 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	st = vaCreateConfig(dpy, VAProfileVP9Profile0, VAEntrypointVLD, NULL, 0,
+	st = vaCreateConfig(dpy, va_profile, VAEntrypointVLD, NULL, 0,
 			    &cfg);
 	if (st) { fprintf(stderr, "vaCreateConfig: %s\n", vaErrorStr(st)); return 1; }
 	st = vaCreateContext(dpy, cfg, width, height, 0, NULL, 0, &ctx);
 	if (st) { fprintf(stderr, "vaCreateContext: %s\n", vaErrorStr(st)); return 1; }
-	st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, width, height, surf, 24,
+	st = vaCreateSurfaces(dpy, rt_format, width, height, surf, 24,
 			      NULL, 0);
 	if (st) { fprintf(stderr, "vaCreateSurfaces: %s\n", vaErrorStr(st)); return 1; }
+	for (unsigned int i = 0; i < 24; i++)
+		if (export_surface_once(dpy, surf[i]))
+			return 1;
 
 	/* Parse IVF: 32-byte header, then per-frame 4-byte size + 8-byte ts. */
 	p = stream + 32;
@@ -93,6 +174,13 @@ int main(int argc, char **argv)
 			fprintf(stderr, "bad frame size %u at %u\n", sz, n_frames);
 			break;
 		}
+		/* Delayed later keyframes are the closest VA-visible equivalent of
+		 * Chromium repeatedly reusing this context across seeks. */
+		if (seeks_exercised < 3 && n_frames &&
+		    vp9_keyframe(p + 12, sz)) {
+			usleep(150000);
+			seeks_exercised++;
+		}
 		if (feed_frame(dpy, ctx, surf[n_frames % 24], p + 12, sz)) {
 			fprintf(stderr, "feed failed at frame %u\n", n_frames);
 			break;
@@ -101,7 +189,7 @@ int main(int argc, char **argv)
 		p += 12 + sz;
 	}
 	free(stream);
-	printf("fed %u frames\n", n_frames);
+	printf("fed %u VP9 profile %d frames\n", n_frames, profile);
 
 	/* Sync the most recently fed surface (the firmware holds the last
 	 * picture until the next feed or EOS). */
@@ -121,7 +209,9 @@ int main(int argc, char **argv)
 
 			st = vaExportSurfaceHandle(dpy, s,
 						   VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-						   VA_EXPORT_SURFACE_READ_ONLY, &dsc);
+						   VA_EXPORT_SURFACE_READ_ONLY |
+						   VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+						   &dsc);
 			if (st) { fprintf(stderr, "export: %s\n", vaErrorStr(st)); return 1; }
 			mp = mmap(NULL, dsc.objects[0].size, PROT_READ, MAP_SHARED,
 				  dsc.objects[0].fd, 0);
