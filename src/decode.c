@@ -158,6 +158,7 @@ struct vpu_surface {
 	int decoded;		/* a frame has been copied into the backing */
 	int queued;		/* some picture was decoded into this surface */
 	int exported;		/* backing has been exported to a DRM client */
+	int initialized;		/* backing has decoded or neutral-black pixels */
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
 	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
 	uint64_t generation;	/* render-target reuse generation */
@@ -342,6 +343,7 @@ surface_copy(struct vpu_decode_ctx *ctx, struct vpu_surface *s,
 
 	start = ctx->stats_enabled ? monotonic_ns() : 0;
 	memcpy(s->bmap, src, size);
+	s->initialized = 1;
 	if (ctx->stats_enabled) {
 		ctx->stats_copy_ns += monotonic_ns() - start;
 		ctx->stats_copy_bytes += size;
@@ -376,6 +378,7 @@ finish_vk_copy(struct vpu_decode_ctx *ctx, unsigned int index, int wait)
 	    s->fence_token == pending->fence_token) {
 		finish_ret = surface_finish_write(ctx->session, s);
 		s->decoded = 1;
+		s->initialized = 1;
 		s->queued = 1;
 		s->owner = ctx;
 	} else if (pending->fence_token) {
@@ -965,14 +968,13 @@ vpu_surfaces_alloc(struct vpu_surfaces *t, VASurfaceID id,
 	s->decoded = 0;
 	s->queued = 0;
 	s->exported = 0;
+	s->initialized = 0;
 	s->write_started = 0;
 	s->fence_token = 0;
 	s->generation = 0;
 	s->backing_serial = __atomic_add_fetch(&g_buffer_serial, 1,
 					       __ATOMIC_RELAXED);
 	s->owner = NULL;
-	surface_fill_black(bfd, map, surface_pitch(width, fourcc), height,
-			   fourcc);
 	return 0;
 }
 
@@ -1039,6 +1041,18 @@ surface_layout(const struct vpu_surface *s, unsigned int *pitch,
 	*height = h;
 }
 
+static void
+surface_initialize(struct vpu_surface *s)
+{
+	unsigned int pitch, width, height;
+
+	if (s->initialized)
+		return;
+	surface_layout(s, &pitch, &width, &height);
+	surface_fill_black(s->bfd, s->bmap, pitch, height, s->fourcc);
+	s->initialized = 1;
+}
+
 static int
 vpu_decode_surface_ready(struct vpu_decode_ctx *ctx, VASurfaceID id);
 
@@ -1091,6 +1105,10 @@ vpu_surfaces_export(struct vpu_surfaces *t, VASurfaceID id, int *fd,
 
 	if (!s)
 		return -1;
+	/* VA surface contents are not observable until export/derive/get-image.
+	 * Keep decode-only pools lazy so allocating dozens of 4K P010 surfaces
+	 * does not write gigabytes of neutral-black pixels that no client reads. */
+	surface_initialize(s);
 	surface_layout(s, &p, &w, &h);
 	/* vaExportSurfaceHandle transfers ownership of every returned object
 	 * fd to the caller.  Keep the driver's backing fd private: Chrome
@@ -1111,17 +1129,19 @@ vpu_surfaces_export(struct vpu_surfaces *t, VASurfaceID id, int *fd,
 	return 0;
 }
 
-int
-vpu_surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
-		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height,
-		  unsigned int *fourcc)
+static int
+surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
+		unsigned int *pitch, unsigned int *size,
+		unsigned int *width, unsigned int *height,
+		unsigned int *fourcc, int initialize)
 {
 	struct vpu_surface *s = surfs_find(t, id);
 	unsigned int p, w, h;
 
 	if (!s)
 		return -1;
+	if (initialize)
+		surface_initialize(s);
 	surface_layout(s, &p, &w, &h);
 	*mem = s->bmap;
 	*pitch = p;
@@ -1130,6 +1150,24 @@ vpu_surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
 	*height = h;
 	*fourcc = s->fourcc;
 	return 0;
+}
+
+int
+vpu_surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
+		  unsigned int *pitch, unsigned int *size,
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc)
+{
+	return surfaces_buffer(t, id, mem, pitch, size, width, height, fourcc, 1);
+}
+
+int
+vpu_surfaces_peek_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
+		  unsigned int *pitch, unsigned int *size,
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc)
+{
+	return surfaces_buffer(t, id, mem, pitch, size, width, height, fourcc, 0);
 }
 
 static int
@@ -1339,6 +1377,7 @@ assign_frame(struct vpu_decode_ctx *ctx, const struct vpu_decoded_frame *frame)
 		}
 		surface_finish_write(ctx->session, s);
 		s->decoded = 1;
+		s->initialized = 1;
 		s->queued = 1;
 		s->owner = ctx;
 		ctx->stats_direct_frames++;

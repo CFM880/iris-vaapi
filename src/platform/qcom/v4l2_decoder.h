@@ -52,6 +52,7 @@ struct v4l2_dec {
 	int streaming;			/* OUTPUT queue streamed */
 	int streaming_cap;		/* CAPTURE queue streamed */
 	int cap_changed;		/* renegotiated since last check */
+	short poll_revents;		/* readiness returned by the last poll */
 	int eos;
 };
 

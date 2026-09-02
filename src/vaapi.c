@@ -612,7 +612,7 @@ vpu_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 		unsigned int pitch, size, width, height, fourcc;
 		int j = 0;
 
-		if (vpu_surfaces_buffer(dd->surfs, surface_list[i], &surface_mem,
+		if (vpu_surfaces_peek_buffer(dd->surfs, surface_list[i], &surface_mem,
 				      &pitch, &size, &width, &height, &fourcc))
 			return VA_STATUS_ERROR_INVALID_SURFACE;
 		/* A client should destroy derived images first.  Invalidate any that

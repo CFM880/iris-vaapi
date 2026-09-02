@@ -51,6 +51,8 @@ int vpu_codec_render(struct vpu_codec *codec, VABufferType type,
 		      const void *data, size_t size, unsigned int elements);
 int vpu_codec_build_access_unit(struct vpu_codec *codec,
 				 struct vpu_codec_access_unit *unit);
+/* unit->data remains valid until the next render/begin/finish operation on
+ * the same codec instance; platform submission must consume it synchronously. */
 
 /* Some stateful VPU implementations need a codec-valid internal access unit
  * to release the preceding picture.  Returns -ENOTSUP for codecs without one. */

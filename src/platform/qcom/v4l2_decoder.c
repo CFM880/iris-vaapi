@@ -538,11 +538,14 @@ int v4l2_dec_start(struct v4l2_dec *d)
 int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms)
 {
 	struct pollfd pfd;
+	int ret;
 
 	pfd.fd = d->fd;
 	pfd.events = POLLIN | POLLPRI | POLLOUT;
 	pfd.revents = 0;
-	return poll(&pfd, 1, timeout_ms);
+	ret = poll(&pfd, 1, timeout_ms);
+	d->poll_revents = ret > 0 ? pfd.revents : 0;
+	return ret;
 }
 
 /* Poll waiting specifically for a decoded CAPTURE frame or an event.
@@ -554,11 +557,14 @@ int v4l2_dec_poll(struct v4l2_dec *d, int timeout_ms)
 int v4l2_dec_poll_cap(struct v4l2_dec *d, int timeout_ms)
 {
 	struct pollfd pfd;
+	int ret;
 
 	pfd.fd = d->fd;
 	pfd.events = POLLIN | POLLPRI;
 	pfd.revents = 0;
-	return poll(&pfd, 1, timeout_ms);
+	ret = poll(&pfd, 1, timeout_ms);
+	d->poll_revents = ret > 0 ? pfd.revents : 0;
+	return ret;
 }
 
 int v4l2_dec_feed(struct v4l2_dec *d, const void *data, size_t len,
@@ -599,6 +605,12 @@ int v4l2_dec_handle_events(struct v4l2_dec *d, int *changed)
 	int ret;
 
 	*changed = 0;
+	/* All callers handle events immediately after poll().  Avoid a guaranteed
+	 * failing VIDIOC_DQEVENT on ordinary frame/output readiness; V4L2 signals
+	 * queued events through POLLPRI. */
+	if (!(d->poll_revents & POLLPRI))
+		return 0;
+	d->poll_revents &= (short)~POLLPRI;
 	for (;;) {
 		ret = xioctl(d->fd, VIDIOC_DQEVENT, &ev);
 		if (ret < 0) {

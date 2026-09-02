@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -169,6 +170,12 @@ int main(int argc, char **argv)
 		st = vaMapBuffer(dpy, image.buf, &surface_mem);
 		if (st != VA_STATUS_SUCCESS) {
 			fprintf(stderr, "map derived image failed: %s\n", vaErrorStr(st));
+			return 1;
+		}
+		if (((uint16_t *)surface_mem)[0] != (64U << 6) ||
+		    ((uint16_t *)((unsigned char *)surface_mem +
+				 image.offsets[1]))[0] != (512U << 6)) {
+			fprintf(stderr, "fresh P010 surface is not neutral black\n");
 			return 1;
 		}
 		memset(surface_mem, 0, image.data_size);

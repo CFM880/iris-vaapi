@@ -243,6 +243,7 @@ static int h264_build_access_unit(void *private,
 {
 	static const uint8_t start_code[4] = { 0, 0, 0, 1 };
 	struct h264_codec *codec = private;
+	const uint8_t *data;
 	size_t capacity;
 	size_t length = 0;
 	int bytes;
@@ -258,6 +259,7 @@ static int h264_build_access_unit(void *private,
 	ret = h264_reserve_access_unit(codec, capacity);
 	if (ret)
 		return ret;
+	data = codec->access_unit;
 
 	if (codec->pps_refs_l0 < 0)
 		codec->pps_refs_l0 = codec->picture.num_ref_frames ?
@@ -299,11 +301,16 @@ static int h264_build_access_unit(void *private,
 	}
 	if (codec->slice_length > capacity - length)
 		return -E2BIG;
-	memcpy(codec->access_unit + length, codec->slice_data,
-	       codec->slice_length);
-	length += codec->slice_length;
+	if (!length) {
+		data = codec->slice_data;
+		length = codec->slice_length;
+	} else {
+		memcpy(codec->access_unit + length, codec->slice_data,
+		       codec->slice_length);
+		length += codec->slice_length;
+	}
 
-	unit->data = codec->access_unit;
+	unit->data = data;
 	unit->size = length;
 	unit->random_access = h264_random_access(codec);
 	unit->refs_l0 = codec->refs_l0;

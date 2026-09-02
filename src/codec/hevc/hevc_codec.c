@@ -370,6 +370,7 @@ static int hevc_build_access_unit(void *private,
 {
 	static const uint8_t start_code[4] = { 0, 0, 0, 1 };
 	struct hevc_codec *codec = private;
+	const uint8_t *data;
 	size_t capacity;
 	size_t length = 0;
 	int raw_in_unit;
@@ -389,12 +390,12 @@ static int hevc_build_access_unit(void *private,
 	ret = hevc_reserve_access_unit(codec, capacity);
 	if (ret)
 		return ret;
+	data = codec->access_unit;
 
 	raw_in_unit = codec->rewritten ? 0 :
 		hevc_cache_raw_parameter_sets(codec);
 	if (raw_in_unit == 7 && !codec->rewritten) {
-		memcpy(codec->access_unit, codec->slice_data,
-		       codec->slice_length);
+		data = codec->slice_data;
 		length = codec->slice_length;
 		goto complete;
 	}
@@ -459,12 +460,17 @@ static int hevc_build_access_unit(void *private,
 	}
 	if (codec->slice_length > capacity - length)
 		return -E2BIG;
-	memcpy(codec->access_unit + length, codec->slice_data,
-	       codec->slice_length);
-	length += codec->slice_length;
+	if (!length) {
+		data = codec->slice_data;
+		length = codec->slice_length;
+	} else {
+		memcpy(codec->access_unit + length, codec->slice_data,
+		       codec->slice_length);
+		length += codec->slice_length;
+	}
 
 complete:
-	unit->data = codec->access_unit;
+	unit->data = data;
 	unit->size = length;
 	unit->random_access = hevc_random_access(codec);
 	unit->picture_order_count = codec->picture.CurrPic.pic_order_cnt;

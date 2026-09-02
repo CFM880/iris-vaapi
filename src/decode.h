@@ -43,9 +43,15 @@ int vpu_surfaces_export(struct vpu_surfaces *t, VASurfaceID id, int *fd,
 		      unsigned int *fourcc);
 /* Backing memory layout of @id (for vaDeriveImage/vaGetImage). */
 int vpu_surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
-		      unsigned int *pitch, unsigned int *size,
-		      unsigned int *width, unsigned int *height,
-		      unsigned int *fourcc);
+		  unsigned int *pitch, unsigned int *size,
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc);
+/* Internal metadata lookup used while destroying a surface.  Unlike
+ * vpu_surfaces_buffer(), this does not initialize never-visible pixels. */
+int vpu_surfaces_peek_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
+		  unsigned int *pitch, unsigned int *size,
+		  unsigned int *width, unsigned int *height,
+		  unsigned int *fourcc);
 
 /* ---- Per-context decode engines ---- */
 struct vpu_decode_ctx *vpu_decode_create(const struct vpu_platform *platform);
