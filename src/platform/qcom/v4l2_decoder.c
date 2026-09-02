@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Minimal stateful V4L2 M2M decoder engine for the Qualcomm Iris device.
+/* Low-level stateful V4L2 M2M decoder transport.
  *
  * Feeds whole H.264/HEVC/VP9 access units to the OUTPUT (bitstream) queue and
  * returns decoded NV12 frames from the CAPTURE queue.  The CAPTURE queue is
@@ -18,8 +18,8 @@
 
 #include <stdint.h>
 
-#include "v4l2_dec.h"
-#include "iris_surface_fence.h"
+#include "v4l2_decoder.h"
+#include "surface_fence.h"
 
 #define OUT_BUFFERS	16
 #define CAP_BUFFERS	20
@@ -48,8 +48,9 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	return r;
 }
 
-int v4l2_dec_supports_capture_format(const char *dev,
-				      unsigned int pixelformat)
+static int v4l2_dec_supports_format(const char *dev,
+				    enum v4l2_buf_type type,
+				    unsigned int pixelformat)
 {
 	struct v4l2_fmtdesc fmt;
 	int fd;
@@ -59,7 +60,7 @@ int v4l2_dec_supports_capture_format(const char *dev,
 		return 0;
 
 	memset(&fmt, 0, sizeof(fmt));
-	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	fmt.type = type;
 	while (xioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0) {
 		if (fmt.pixelformat == pixelformat) {
 			close(fd);
@@ -69,6 +70,20 @@ int v4l2_dec_supports_capture_format(const char *dev,
 	}
 	close(fd);
 	return 0;
+}
+
+int v4l2_dec_supports_capture_format(const char *dev,
+				      unsigned int pixelformat)
+{
+	return v4l2_dec_supports_format(dev,
+		V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, pixelformat);
+}
+
+int v4l2_dec_supports_output_format(const char *dev,
+				     unsigned int pixelformat)
+{
+	return v4l2_dec_supports_format(dev,
+		V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, pixelformat);
 }
 
 int v4l2_dec_attach_surface_fence(struct v4l2_dec *d, int dmabuf_fd,
@@ -312,7 +327,8 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	d->fd = -1;
 	d->fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
 	if (d->fd < 0) {
-		perror("open /dev/video0");
+		fprintf(stderr, "open %s: %s\n", dev ? dev : "/dev/video0",
+			strerror(errno));
 		return -errno;
 	}
 

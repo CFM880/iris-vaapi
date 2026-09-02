@@ -26,8 +26,8 @@ Chrome (VaapiVideoDecoder)
    │  vaBeginPicture/vaRenderPicture/vaEndPicture
    │  (VAPictureParameterBufferH264 + VASliceDataBufferType)
    ▼
-iris-vaapi 驱动 (iris_drv_video.so)
-   │  ① 重序列化 SPS/PPS NAL (h264_params.c)
+iris-vaapi 驱动 (vpu_drv_video.so)
+   │  ① 重序列化 SPS/PPS NAL (codec/h264/h264_params.c)
    │  ② slice 重组 → 完整 H.264 访问单元
    ▼
 V4L2 解码引擎 (v4l2_dec.c)
@@ -40,11 +40,11 @@ VASurfaceID ← NV12 DMA buffer（timestamp 匹配）
 
 ### P0 — VA-API 驱动骨架（✅ 完成）
 
-`src/iris_vaapi.c` 让 libva 能加载驱动并枚举解码能力：
+`src/vaapi.c` 让 libva 能加载驱动并枚举解码能力：
 
 ```
-$ LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH=$PWD/build vainfo
-Driver version: iris-vaapi P0: Qualcomm Iris SM8150 (V4L2) 0.0.1
+$ LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH=$PWD/build vainfo
+Driver version: vpu-vaapi P0: Qualcomm Iris SM8150 (V4L2) 0.0.1
       VAProfileH264ConstrainedBaseline:  VAEntrypointVLD
       VAProfileH264Main               :  VAEntrypointVLD
       VAProfileH264High               :  VAEntrypointVLD
@@ -61,7 +61,7 @@ Driver version: iris-vaapi P0: Qualcomm Iris SM8150 (V4L2) 0.0.1
 
 ### P1 — V4L2 解码引擎（✅ 完成并验证）
 
-`src/v4l2_dec.c/h` 独立验证了 iris 的完整解码流程：
+`src/platform/qcom/v4l2_decoder.c/h` 独立验证了 iris 的完整解码流程：
 
 **实测结果**（1080p25 H.264，3 秒流）：
 ```
@@ -97,9 +97,9 @@ mplane 常见坑：
 
 | 组件 | 状态 |
 |---|---|
-| `src/h264_params.c` — SPS/PPS 重序列化 | ✅ 已验证（重建 NAL 解码像素级一致）|
+| `src/codec/h264/h264_params.c` — SPS/PPS 重序列化 | ✅ 已验证（重建 NAL 解码像素级一致）|
 | `src/decode.c` — surface 管理 + slice 累积 + 异步解码 | ✅ |
-| `src/iris_vaapi.c` — vtable 解码路径 | ✅ |
+| `src/vaapi.c` — vtable 解码路径 | ✅ |
 | 端到端 `test/test_va_decode.c` | ✅ `DECODE OK` |
 
 关键实现要点：
@@ -217,9 +217,9 @@ slice header 会从该位开始整体错位。
 
 ### 当前转换方式
 
-1. `src/hevc_params.c` 从 `VAPictureParameterBufferHEVC` 序列化 canonical
+1. `src/codec/hevc/hevc_params.c` 从 `VAPictureParameterBufferHEVC` 序列化 canonical
    VPS/SPS/PPS，保留 slice 实际使用的 PPS id。
-2. `src/hevc_slice_rewrite.c` 解开 slice RBSP，解析到 short-term RPS，使用
+2. `src/codec/hevc/hevc_slice_rewrite.c` 解开 slice RBSP，解析到 short-term RPS，使用
    `ReferenceFrames[].pic_order_cnt/flags` 重建等价的 inline RPS，再复制其余
    slice header 和原始 CABAC payload，最后重新插入 emulation-prevention bytes。
 3. IDR、dependent slice，以及原本已经与 canonical SPS 兼容的 slice 直接复制；
@@ -240,7 +240,7 @@ slice header 会从该位开始整体错位。
 | ffmpeg VA-API → Iris 硬件 → CPU readback | ✅ 30/30 帧，显示顺序和像素 MD5 全部一致 |
 | 1080p 原始/重建 AU 直接喂 V4L2 | ✅ 均输出 1 帧，0 corrupt |
 
-可用 `IRIS_HEVC_DUMP=/tmp/rebuilt.h265` 保存驱动实际提交的重建码流，交给
+可用 `VPU_HEVC_DUMP=/tmp/rebuilt.h265` 保存驱动实际提交的重建码流，交给
 独立软件解码器复核。
 
 ### 当前边界
@@ -272,12 +272,12 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 | 卡点 | 修复 |
 |---|---|
 | 空 surface 的 `vaSyncSurface` 超时 | surface 从未入队解码时 sync 立即成功（`src/decode.c`：`queued` 标志）|
-| `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/iris_vaapi.c`）；Chrome DCHECK 每层必须单平面 |
+| `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/vaapi.c`）；Chrome DCHECK 每层必须单平面 |
 | `drm_format_modifier` 缺失 | 填 `DRM_FORMAT_MOD_LINEAR`（Chrome 校验 modifier 一致性）|
 
-**运行方式**：Chrome GPU 进程需继承 `LIBVA_DRIVER_NAME=iris`（用包装脚本
-`export LIBVA_DRIVER_NAME=iris; google-chrome ...`），驱动装到
-`/usr/lib/aarch64-linux-gnu/dri/iris_drv_video.so`，`/dev/dma_heap/system`
+**运行方式**：Chrome GPU 进程需继承 `LIBVA_DRIVER_NAME=vpu`（用包装脚本
+`export LIBVA_DRIVER_NAME=vpu; google-chrome ...`），驱动装到
+`/usr/lib/aarch64-linux-gnu/dri/vpu_drv_video.so`，`/dev/dma_heap/system`
 需 `sudo chmod 0666`（GPU 导入需要真实 DMA-BUF，memfd 回退不可用）。
 
 ## 测试工具
@@ -285,11 +285,11 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 | 工具 | 用途 |
 |---|---|
 | `test/test_va.c` | 最小 libva 客户端，验证驱动加载与 profile 枚举 |
-| `test/test_v4l2_dec.c` | V4L2 引擎测试：Annex-B 切 AU → 解码 → NV12 校验 |
-| `test/test_h264_params.c` | SPS/PPS 解析 + 重序列化验证 |
+| `test/platform/qcom/test_v4l2_decoder.c` | V4L2 引擎测试：Annex-B 切 AU → 解码 → NV12 校验 |
+| `test/codec/test_h264_params.c` | SPS/PPS 解析 + 重序列化验证 |
 | `test/test_va_decode.c` | 端到端 VA-API 解码 + 导出，含最后一张 sync（EOS flush） |
 | `test/test_va_vp9.c` | 端到端 VP9 VA-API 解码 + 导出（IVF 逐帧喂入）|
-| `test/test_hevc_au.c` | HEVC 引擎测试：整体流喂入 + EOS，统计帧数 |
+| `test/platform/qcom/test_hevc.c` | HEVC 引擎测试：整体流喂入 + EOS，统计帧数 |
 | `test/ioctllog.c` | LD_PRELOAD ioctl 记录器（反推 mpv 真实序列）|
 
 ## 复现命令
@@ -297,7 +297,7 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 ```sh
 make
 # P0: 枚举驱动
-LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH=$PWD/build vainfo
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH=$PWD/build vainfo
 # P1: 引擎解码（输出帧与软件解码逐像素一致）
 ./build/test_v4l2_dec /path/to/stream.h264 1920 1080 /tmp/frame.nv12
 ```
@@ -398,7 +398,7 @@ Chrome 的 `DecoderStream` 在 VaapiVideoDecoder 首次出错时即整体回退�
 
 ```sh
 # 驱动侧跟踪（GPU 进程继承 stderr）：
-export IRIS_VAAPI_DEBUG=1
+export VPU_VAAPI_DEBUG=1
 # >512 帧连播回归（Chrome 式流水线 sync）：
 ./build/test_va_stress /path/to/test-1080p-nob.h264 700
 # Chrome 侧确认当前用的解码器：
@@ -412,10 +412,10 @@ export IRIS_VAAPI_DEBUG=1
 ### 构建与测试命令
 ```sh
 make                                          # 构建驱动 + 测试工具
-LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH=$PWD/build vainfo   # P0
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH=$PWD/build vainfo   # P0
 ./build/test_v4l2_dec 流.h264 1920 1088       # P1 引擎
 ./build/test_va_decode 流.h264 输出.nv12      # P1 VA 路径
-LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=iris \
+LIBVA_DRIVERS_PATH=$PWD/build LIBVA_DRIVER_NAME=vpu \
   ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i 流.h264 -f null -  # P2 ffmpeg
 # 安装到系统供 Chrome 使用：
 sudo ./install-system.sh
@@ -427,7 +427,7 @@ sudo depmod -a && sudo modprobe -r qcom_iris && sudo modprobe qcom_iris
 # 确认 4K60 所需的 cacheable CAPTURE 已启用（应输出 Y）：
 cat /sys/module/qcom_iris/parameters/cached_capture
 # Chrome（GPU 进程需继承 LIBVA_DRIVER_NAME）：
-export LIBVA_DRIVER_NAME=iris
+export LIBVA_DRIVER_NAME=vpu
 google-chrome --enable-logging=stderr --v=1 file:///path/to/video.html
 ```
 

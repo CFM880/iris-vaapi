@@ -8,7 +8,7 @@ ARM64 Ubuntu installation running on the Xiaomi Pad 5 (`nabu`, SM8150):
 ```text
 Chrome / FFmpeg
        ↓ VA-API
-iris-vaapi (iris_drv_video.so)
+vpu-vaapi (vpu_drv_video.so)
        ↓ stateful V4L2
 qcom-iris (/dev/video0)
        ↓
@@ -21,7 +21,7 @@ A working installation satisfies all of the following conditions:
 - `/dev/video0` identifies itself as `Iris Decoder`;
 - `/dev/dri/renderD128` and `/dev/dma_heap/system` are accessible;
 - both `cached_capture` and `allow_fw_boot` are `Y`;
-- `vainfo` loads `iris-vaapi 0.1.0` and lists H.264, HEVC Main/Main10, and VP9
+- `vainfo` loads `vpu-vaapi 0.2.0` and lists H.264, HEVC Main/Main10, and VP9
   Profile 0/Profile 2;
 - FFmpeg or Chrome actually selects VA-API instead of a software decoder.
 
@@ -199,7 +199,7 @@ If `/dev/video0` is missing, inspect the kernel log first:
 sudo dmesg | grep -iE 'iris|venus|firmware|video-codec'
 ```
 
-## 5. Build and install iris-vaapi
+## 5. Build and install vpu-vaapi
 
 Install the build and diagnostic dependencies:
 
@@ -221,7 +221,7 @@ make check
 Test the build directory before replacing any system file:
 
 ```sh
-LIBVA_DRIVER_NAME=iris \
+LIBVA_DRIVER_NAME=vpu \
 LIBVA_DRIVERS_PATH="$PWD/build" \
 vainfo --display drm --device /dev/dri/renderD128
 ```
@@ -229,7 +229,7 @@ vainfo --display drm --device /dev/dri/renderD128
 Expected profiles:
 
 ```text
-Driver version: iris-vaapi: Qualcomm Iris SM8150 (V4L2) 0.1.0
+Driver version: vpu-vaapi: Qualcomm Iris stateful V4L2 M2M (qcom-iris) 0.2.0
 VAProfileH264ConstrainedBaseline: VAEntrypointVLD
 VAProfileH264Main:                VAEntrypointVLD
 VAProfileH264High:                VAEntrypointVLD
@@ -247,7 +247,7 @@ sudo ./install-system.sh
 
 The script installs:
 
-- `iris_drv_video.so`;
+- `vpu_drv_video.so`;
 - a udev rule granting access to `/dev/dma_heap/system`;
 - the `cached_capture` modprobe configuration for H.264, HEVC, and VP9.
 
@@ -261,7 +261,7 @@ After logging in again, confirm that all three device nodes are accessible witho
 `sudo`, then run:
 
 ```sh
-LIBVA_DRIVER_NAME=iris vainfo --display drm --device /dev/dri/renderD128
+LIBVA_DRIVER_NAME=vpu vainfo --display drm --device /dev/dri/renderD128
 ```
 
 ## 6. Validate one layer at a time
@@ -292,8 +292,8 @@ Continuous frame output without a timeout means that the firmware, kernel driver
 FFmpeg can read MP4, MKV, or WebM containers directly:
 
 ```sh
-IRIS_VAAPI_STATS=1 \
-LIBVA_DRIVER_NAME=iris \
+VPU_VAAPI_STATS=1 \
+LIBVA_DRIVER_NAME=vpu \
 ffmpeg -v verbose \
   -hwaccel vaapi \
   -vaapi_device /dev/dri/renderD128 \
@@ -316,15 +316,15 @@ Completely close all Chrome windows and background processes first so that the n
 process inherits the environment:
 
 ```sh
-export LIBVA_DRIVER_NAME=iris
+export LIBVA_DRIVER_NAME=vpu
 google-chrome --enable-features=VaapiVideoDecoder
 ```
 
 To enable driver-side diagnostics:
 
 ```sh
-IRIS_VAAPI_DEBUG=1 \
-LIBVA_DRIVER_NAME=iris \
+VPU_VAAPI_DEBUG=1 \
+LIBVA_DRIVER_NAME=vpu \
 google-chrome --enable-features=VaapiVideoDecoder \
   --enable-logging=stderr
 ```
@@ -336,18 +336,18 @@ While a video is playing, check:
 2. `chrome://gpu`: Video Acceleration should list H.264, HEVC, and VP9;
 3. the actual stream codec must be supported. AV1 correctly falls back to software.
 
-Do not set `IRIS_DIRECT_CAPTURE` for the normal configuration. Direct CAPTURE remains
+Do not set `VPU_DIRECT_CAPTURE` for the normal configuration. Direct CAPTURE remains
 experimental; the default stable DMA-BUF surface copy path is the supported setup.
 
 ## 7. Troubleshooting
 
 ### `vainfo` still reports an old driver
 
-The installed `iris_drv_video.so` is stale, or Chrome has not restarted:
+The installed `vpu_drv_video.so` is stale, or Chrome has not restarted:
 
 ```sh
 pkg-config --variable=driverdir libva
-LIBVA_DRIVER_NAME=iris vainfo --display drm --device /dev/dri/renderD128
+LIBVA_DRIVER_NAME=vpu vainfo --display drm --device /dev/dri/renderD128
 ```
 
 Run `make && sudo ./install-system.sh` again, then exit Chrome completely and restart it.
@@ -355,7 +355,7 @@ Run `make && sudo ./install-system.sh` again, then exit Chrome completely and re
 ### `vainfo` cannot find the iris driver
 
 ```sh
-find /usr/lib -name iris_drv_video.so -print
+find /usr/lib -name vpu_drv_video.so -print
 pkg-config --variable=driverdir libva
 ```
 

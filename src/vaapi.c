@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * iris-vaapi: VA-API driver for the Qualcomm Iris (SM8150) stateful V4L2
- * decoder.
+ * VA-API frontend for platform stateful VPU decoders.
  */
 
 #include <stdio.h>
@@ -44,55 +43,57 @@
 #endif
 
 #include "decode.h" 
-#include "v4l2_dec.h"
+#include "platform/platform.h"
+#include "codec/codec.h"
 
-#define IRIS_VAAPI_VERSION	"0.1.0"
-#define IRIS_VAAPI_VENDOR	"iris-vaapi: Qualcomm Iris SM8150 (V4L2) "
+#define VPU_VAAPI_VERSION	"0.2.0"
+#define VPU_PUBLIC	__attribute__((visibility("default")))
 
 /* Per-surface tracing is chatty and the GPU process inherits this stderr;
- * opt in with IRIS_VAAPI_DEBUG=1. */
+ * opt in with VPU_VAAPI_DEBUG=1. */
 static int dbg_enabled(void)
 {
 	static int dbg = -1;
 
 	if (dbg < 0)
-		dbg = getenv("IRIS_VAAPI_DEBUG") != NULL;
+		dbg = getenv("VPU_VAAPI_DEBUG") != NULL;
 	return dbg;
 }
 
 #define DBG(...)	do { if (dbg_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
 
 /* vtable needs a little state to hand out ids */
-#define IRIS_MAX_ENGINES	8
-#define IRIS_MAX_CONFIGS	32
+#define VPU_MAX_ENGINES	8
+#define VPU_MAX_CONFIGS	32
 
-struct iris_config {
+struct vpu_config {
 	VAConfigID id;
 	VAProfile profile;
 };
 
-struct iris_engine {
+struct vpu_engine {
 	VAContextID ctx_id;
-	VAProfile profile;
-	struct iris_decode_ctx *dec;
+	struct vpu_decode_ctx *dec;
 };
 
-struct iris_drv_data {
+struct vpu_drv_data {
 	unsigned int config_id;
 	unsigned int context_id;
 	unsigned int surface_id;
 	unsigned int buffer_id;
 	unsigned int width, height;
 	int p010_supported;
-	struct iris_config configs[IRIS_MAX_CONFIGS];
+	struct vpu_platform *platform;
+	char vendor[192];
+	struct vpu_config configs[VPU_MAX_CONFIGS];
 	int n_configs;
 	/* Display-level surface registry: pool surfaces outlive the contexts
 	 * that decode into them (Chrome destroys contexts on navigation while
 	 * frames are still exported/displayed). */
-	struct iris_surfs *surfs;
+	struct vpu_surfaces *surfs;
 	/* One engine (one V4L2 session) per VA context so concurrent videos
 	 * never share firmware DPB/queue state. */
-	struct iris_engine engines[IRIS_MAX_ENGINES];
+	struct vpu_engine engines[VPU_MAX_ENGINES];
 	int n_engines;
 	int n_bufs;
 	unsigned int buf_ids[256];
@@ -122,44 +123,35 @@ struct iris_drv_data {
 	int img_n;
 };
 
-static const VAProfile iris_profiles[] = {
-	VAProfileH264ConstrainedBaseline,
-	VAProfileH264Main,
-	VAProfileH264High,
-	VAProfileHEVCMain,
-	VAProfileHEVCMain10,
-	VAProfileVP9Profile0,
-	VAProfileVP9Profile2,
-};
-#define NUM_IRIS_PROFILES (sizeof(iris_profiles) / sizeof(iris_profiles[0]))
-
-static const VAEntrypoint iris_entrypoints[] = {
+static const VAEntrypoint vpu_entrypoints[] = {
 	VAEntrypointVLD,
 };
-#define NUM_IRIS_ENTRYPOINTS (sizeof(iris_entrypoints) / sizeof(iris_entrypoints[0]))
+#define NUM_VPU_ENTRYPOINTS (sizeof(vpu_entrypoints) / sizeof(vpu_entrypoints[0]))
 
 static int
-iris_profile_is_10bit(VAProfile profile)
+vpu_profile_is_10bit(VAProfile profile)
 {
-	return profile == VAProfileHEVCMain10 ||
-	       profile == VAProfileVP9Profile2;
+	enum vpu_pixel_format format;
+
+	return !vpu_codec_profile_info(profile, NULL, &format, NULL) &&
+	       format == VPU_PIXEL_FORMAT_P010;
 }
 
 static unsigned int
-iris_profile_fourcc(VAProfile profile)
+vpu_profile_fourcc(VAProfile profile)
 {
-	return iris_profile_is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+	return vpu_profile_is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 }
 
 static unsigned int
-iris_profile_rt_format(VAProfile profile)
+vpu_profile_rt_format(VAProfile profile)
 {
-	return iris_profile_is_10bit(profile) ?
+	return vpu_profile_is_10bit(profile) ?
 		VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
 }
 
 static unsigned int
-iris_surface_pitch(unsigned int width, unsigned int fourcc)
+vpu_surface_pitch(unsigned int width, unsigned int fourcc)
 {
 	unsigned int bytes = fourcc == VA_FOURCC_P010 ? 2 : 1;
 	unsigned int alignment = fourcc == VA_FOURCC_P010 ? 256 : 128;
@@ -168,18 +160,35 @@ iris_surface_pitch(unsigned int width, unsigned int fourcc)
 }
 
 static int
-iris_profile_supported(VAProfile profile)
+vpu_profile_known(VAProfile profile)
 {
-	unsigned int i;
-
-	for (i = 0; i < NUM_IRIS_PROFILES; i++)
-		if (iris_profiles[i] == profile)
-			return 1;
-	return 0;
+	return vpu_codec_profile_info(profile, NULL, NULL, NULL) == 0;
 }
 
-static struct iris_config *
-iris_find_config(struct iris_drv_data *dd, VAConfigID id)
+static enum vpu_codec_id
+vpu_profile_codec(VAProfile profile)
+{
+	enum vpu_codec_id codec = VPU_CODEC_H264;
+
+	(void)vpu_codec_profile_info(profile, &codec, NULL, NULL);
+	return codec;
+}
+
+static int
+vpu_profile_supported(struct vpu_drv_data *dd, VAProfile profile)
+{
+	enum vpu_pixel_format format;
+
+	if (!vpu_profile_known(profile) || !dd || !dd->platform)
+		return 0;
+	format = vpu_profile_is_10bit(profile) ? VPU_PIXEL_FORMAT_P010 :
+		VPU_PIXEL_FORMAT_NV12;
+	return vpu_platform_supports(dd->platform, vpu_profile_codec(profile),
+				    format);
+}
+
+static struct vpu_config *
+vpu_find_config(struct vpu_drv_data *dd, VAConfigID id)
 {
 	int i;
 
@@ -189,13 +198,13 @@ iris_find_config(struct iris_drv_data *dd, VAConfigID id)
 	return NULL;
 }
 
-static struct iris_drv_data *
-iris_drv_data(VADriverContextP ctx)
+static struct vpu_drv_data *
+vpu_drv_data(VADriverContextP ctx)
 {
 	if (!ctx)
 		return NULL;
 	if (!ctx->pDriverData) {
-		ctx->pDriverData = calloc(1, sizeof(struct iris_drv_data));
+		ctx->pDriverData = calloc(1, sizeof(struct vpu_drv_data));
 		if (!ctx->pDriverData)
 			return NULL;
 	}
@@ -203,7 +212,7 @@ iris_drv_data(VADriverContextP ctx)
 }
 
 static void
-iris_free_buffers(struct iris_drv_data *dd)
+vpu_free_buffers(struct vpu_drv_data *dd)
 {
 	int i;
 
@@ -213,22 +222,24 @@ iris_free_buffers(struct iris_drv_data *dd)
 }
 
 static VAStatus
-iris_vaTerminate(VADriverContextP ctx)
+vpu_vaTerminate(VADriverContextP ctx)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	if (dd) {
-		iris_free_buffers(dd);
+		vpu_free_buffers(dd);
 		for (i = 0; i < dd->img_n; i++)
 			free(dd->img_data[i]);
 		dd->img_n = 0;
 		dd->derived_n = 0;
 		for (i = 0; i < dd->n_engines; i++)
-			iris_decode_destroy(dd->engines[i].dec);
+			vpu_decode_destroy(dd->engines[i].dec);
 		dd->n_engines = 0;
-		iris_surfs_destroy(dd->surfs);
+		vpu_surfaces_destroy(dd->surfs);
 		dd->surfs = NULL;
+		vpu_platform_destroy(dd->platform);
+		dd->platform = NULL;
 		free(dd);
 		ctx->pDriverData = NULL;
 	}
@@ -236,25 +247,26 @@ iris_vaTerminate(VADriverContextP ctx)
 }
 
 static VAStatus
-iris_vaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
+vpu_vaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
 			   int *num_profiles)
 {
-	struct iris_drv_data *dd;
+	struct vpu_drv_data *dd;
 	int count = 0;
 	unsigned int i;
 
 	if (!num_profiles)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	for (i = 0; i < NUM_IRIS_PROFILES; i++) {
-		if (iris_profile_is_10bit(iris_profiles[i]) &&
-		    !dd->p010_supported)
+	for (i = 0; i < vpu_codec_profile_count(); i++) {
+		VAProfile profile = vpu_codec_profile_at(i);
+
+		if (!vpu_profile_supported(dd, profile))
 			continue;
 		if (profile_list)
-			profile_list[count] = iris_profiles[i];
+			profile_list[count] = profile;
 		count++;
 	}
 	*num_profiles = count;
@@ -262,63 +274,52 @@ iris_vaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
 }
 
 static VAStatus
-iris_vaQueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
+vpu_vaQueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
 			      VAEntrypoint *entrypoint_list, int *num_entrypoints)
 {
-	struct iris_drv_data *dd;
-	int i;
+	struct vpu_drv_data *dd;
 
 	if (!num_entrypoints)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (iris_profile_is_10bit(profile) && !dd->p010_supported) {
+	if (!vpu_profile_supported(dd, profile)) {
 		*num_entrypoints = 0;
 		return VA_STATUS_SUCCESS;
 	}
 
-	for (i = 0; i < (int)NUM_IRIS_PROFILES; i++) {
-		if (iris_profiles[i] == profile)
-			break;
-	}
-	if (i == (int)NUM_IRIS_PROFILES) {
-		*num_entrypoints = 0;
-		return VA_STATUS_SUCCESS;
-	}
-
-	*num_entrypoints = NUM_IRIS_ENTRYPOINTS;
+	*num_entrypoints = NUM_VPU_ENTRYPOINTS;
 	if (entrypoint_list) {
-		if (*num_entrypoints > (int)NUM_IRIS_ENTRYPOINTS)
-			*num_entrypoints = NUM_IRIS_ENTRYPOINTS;
-		memcpy(entrypoint_list, iris_entrypoints,
+		if (*num_entrypoints > (int)NUM_VPU_ENTRYPOINTS)
+			*num_entrypoints = NUM_VPU_ENTRYPOINTS;
+		memcpy(entrypoint_list, vpu_entrypoints,
 		       *num_entrypoints * sizeof(*entrypoint_list));
 	}
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
+vpu_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 			   VAEntrypoint entrypoint, VAConfigAttrib *attrib_list,
 			   int num_attribs)
 {
-	struct iris_drv_data *dd;
+	struct vpu_drv_data *dd;
 	int i;
 
 	if (entrypoint != VAEntrypointVLD)
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (!iris_profile_supported(profile) ||
-	    (iris_profile_is_10bit(profile) && !dd->p010_supported))
+	if (!vpu_profile_supported(dd, profile))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 	if (num_attribs < 0 || (num_attribs && !attrib_list))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	for (i = 0; i < num_attribs; i++) {
 		switch (attrib_list[i].type) {
 		case VAConfigAttribRTFormat:
-			attrib_list[i].value = iris_profile_rt_format(profile);
+			attrib_list[i].value = vpu_profile_rt_format(profile);
 			break;
 		case VAConfigAttribDecProcessing:
 			attrib_list[i].value = 0;
@@ -335,16 +336,16 @@ iris_vaGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
 	return VA_STATUS_SUCCESS;
 }
 
-static struct iris_surfs *
-iris_ensure_surfs(struct iris_drv_data *dd)
+static struct vpu_surfaces *
+vpu_ensure_surfs(struct vpu_drv_data *dd)
 {
 	if (!dd->surfs)
-		dd->surfs = iris_surfs_create();
+		dd->surfs = vpu_surfaces_create();
 	return dd->surfs;
 }
 
-static struct iris_decode_ctx *
-iris_context_engine(struct iris_drv_data *dd, VAContextID context_id)
+static struct vpu_decode_ctx *
+vpu_context_engine(struct vpu_drv_data *dd, VAContextID context_id)
 {
 	int i;
 
@@ -354,8 +355,8 @@ iris_context_engine(struct iris_drv_data *dd, VAContextID context_id)
 	return NULL;
 }
 
-static struct iris_engine *
-iris_context(struct iris_drv_data *dd, VAContextID context_id)
+static struct vpu_engine *
+vpu_context(struct vpu_drv_data *dd, VAContextID context_id)
 {
 	int i;
 
@@ -366,11 +367,11 @@ iris_context(struct iris_drv_data *dd, VAContextID context_id)
 }
 
 static VAStatus
-iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
+vpu_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 		    VAEntrypoint entrypoint, VAConfigAttrib *attrib_list,
 		    int num_attribs, VAConfigID *config_id)
 {
-	struct iris_drv_data *dd;
+	struct vpu_drv_data *dd;
 	int i;
 
 	if (entrypoint != VAEntrypointVLD)
@@ -380,17 +381,16 @@ iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 	if (num_attribs < 0 || (num_attribs && !attrib_list))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (!iris_profile_supported(profile) ||
-	    (iris_profile_is_10bit(profile) && !dd->p010_supported))
+	if (!vpu_profile_supported(dd, profile))
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	if (dd->n_configs >= IRIS_MAX_CONFIGS)
+	if (dd->n_configs >= VPU_MAX_CONFIGS)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 	for (i = 0; i < num_attribs; i++) {
 		if (attrib_list[i].type == VAConfigAttribRTFormat &&
-		    !(attrib_list[i].value & iris_profile_rt_format(profile)))
+		    !(attrib_list[i].value & vpu_profile_rt_format(profile)))
 			return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 		if (attrib_list[i].type == VAConfigAttribDecProcessing &&
 		    attrib_list[i].value)
@@ -407,9 +407,9 @@ iris_vaCreateConfig(VADriverContextP ctx, VAProfile profile,
 }
 
 static VAStatus
-iris_vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id)
+vpu_vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id)
 {
-	struct iris_drv_data *dd = ctx ? ctx->pDriverData : NULL;
+	struct vpu_drv_data *dd = ctx ? ctx->pDriverData : NULL;
 	int i;
 
 	if (!dd)
@@ -425,16 +425,16 @@ iris_vaDestroyConfig(VADriverContextP ctx, VAConfigID config_id)
 }
 
 static VAStatus
-iris_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
+vpu_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 			     VAProfile *profile, VAEntrypoint *entrypoint,
 			     VAConfigAttrib *attrib_list, int *num_attribs)
 {
-	struct iris_drv_data *dd = ctx ? ctx->pDriverData : NULL;
-	struct iris_config *cfg;
+	struct vpu_drv_data *dd = ctx ? ctx->pDriverData : NULL;
+	struct vpu_config *cfg;
 
 	if (!dd || !profile || !entrypoint || !num_attribs)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	cfg = iris_find_config(dd, config_id);
+	cfg = vpu_find_config(dd, config_id);
 	if (!cfg)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
 	*profile = cfg->profile;
@@ -443,7 +443,7 @@ iris_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 		/* num_attribs is an output here (clients pass uninitialized
 		 * garbage); always report one supported RT format. */
 		attrib_list[0].type = VAConfigAttribRTFormat;
-		attrib_list[0].value = iris_profile_rt_format(cfg->profile);
+		attrib_list[0].value = vpu_profile_rt_format(cfg->profile);
 		*num_attribs = 1;
 	} else {
 		*num_attribs = 1;
@@ -452,25 +452,25 @@ iris_vaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 }
 
 static VAStatus
-iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
+vpu_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
 		     int picture_height, int flag, VASurfaceID *render_targets,
 		     int num_render_targets, VAContextID *context_id)
 {
-	struct iris_drv_data *dd;
-	struct iris_surfs *t;
-	struct iris_decode_ctx *eng;
-	struct iris_config *cfg;
+	struct vpu_drv_data *dd;
+	struct vpu_surfaces *t;
+	struct vpu_decode_ctx *eng;
+	struct vpu_config *cfg;
 
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	cfg = iris_find_config(dd, config_id);
+	cfg = vpu_find_config(dd, config_id);
 	if (!cfg)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
-	t = iris_ensure_surfs(dd);
+	t = vpu_ensure_surfs(dd);
 	if (!t)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (dd->n_engines >= IRIS_MAX_ENGINES)
+	if (dd->n_engines >= VPU_MAX_ENGINES)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 
 	/* One fresh engine (V4L2 session) per context: Chrome recreates the
@@ -479,21 +479,24 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 	 * and a codec switch would feed the wrong pixfmt into a live OUTPUT
 	 * queue; either way decoding breaks and Chrome falls back to
 	 * software. */
-	eng = iris_decode_create();
+	eng = vpu_decode_create(dd->platform);
 	if (!eng)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	iris_decode_setup(eng, picture_width, picture_height, cfg->profile);
-	iris_decode_set_surfaces(eng, t);
-	if (iris_decode_set_render_targets(eng, render_targets,
+	if (vpu_decode_setup(eng, picture_width, picture_height,
+			      cfg->profile)) {
+		vpu_decode_destroy(eng);
+		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+	}
+	vpu_decode_set_surfaces(eng, t);
+	if (vpu_decode_set_render_targets(eng, render_targets,
 					   num_render_targets) < 0) {
-		iris_decode_destroy(eng);
+		vpu_decode_destroy(eng);
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	}
 
 	dd->width = picture_width;
 	dd->height = picture_height;
 	dd->engines[dd->n_engines].ctx_id = ++dd->context_id;
-	dd->engines[dd->n_engines].profile = cfg->profile;
 	dd->engines[dd->n_engines].dec = eng;
 	dd->n_engines++;
 	*context_id = dd->context_id;
@@ -501,9 +504,9 @@ iris_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_wid
 }
 
 static VAStatus
-iris_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
+vpu_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	if (!dd)
@@ -514,7 +517,7 @@ iris_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
 		/* Clean teardown between streams; sessions killed mid-flight
 		 * are what wedges the firmware (SESSION_INIT timeouts until
 		 * rmmod). */
-		iris_decode_destroy(dd->engines[i].dec);
+		vpu_decode_destroy(dd->engines[i].dec);
 		dd->engines[i] = dd->engines[dd->n_engines - 1];
 		dd->n_engines--;
 		return VA_STATUS_SUCCESS;
@@ -523,18 +526,18 @@ iris_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
 }
 
 static VAStatus
-iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
+vpu_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 		      int num_surfaces, VASurfaceID *surfaces)
 {
-	struct iris_drv_data *dd;
-	struct iris_surfs *t;
+	struct vpu_drv_data *dd;
+	struct vpu_surfaces *t;
 	unsigned int fourcc;
 	int i = 0;
 
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	t = iris_ensure_surfs(dd);
+	t = vpu_ensure_surfs(dd);
 	if (!t)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	if ((format & VA_RT_FORMAT_YUV420_10) && !dd->p010_supported)
@@ -551,9 +554,9 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 			(--dd->direct_spare_count) * sizeof(dd->direct_spares[0]));
 	}
 
-	if (i < num_surfaces && getenv("IRIS_DIRECT_CAPTURE") &&
+	if (i < num_surfaces && getenv("VPU_DIRECT_CAPTURE") &&
 	    !dd->direct_pool_initialized) {
-		const char *slots_env = getenv("IRIS_DIRECT_CAPTURE_SLOTS");
+		const char *slots_env = getenv("VPU_DIRECT_CAPTURE_SLOTS");
 		int requested = num_surfaces - i;
 		int allocate = requested < 20 ? 20 : requested;
 		int j;
@@ -574,7 +577,7 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 		for (j = 0; j < allocate; j++) {
 			VASurfaceID id = ++dd->surface_id;
 
-			if (iris_surfs_alloc(t, id, width, height, fourcc))
+			if (vpu_surfaces_alloc(t, id, width, height, fourcc))
 				return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 			if (j < requested)
 				surfaces[i++] = id;
@@ -587,7 +590,7 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 	for (; i < num_surfaces; i++) {
 		VASurfaceID id = ++dd->surface_id;
 
-		if (iris_surfs_alloc(t, id, width, height, fourcc))
+		if (vpu_surfaces_alloc(t, id, width, height, fourcc))
 			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 		surfaces[i] = id;
 	}
@@ -596,10 +599,10 @@ iris_vaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
 }
 
 static VAStatus
-iris_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
+vpu_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 		       int num_surfaces)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	if (!dd || !dd->surfs || !surface_list || num_surfaces < 0)
@@ -609,7 +612,7 @@ iris_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 		unsigned int pitch, size, width, height, fourcc;
 		int j = 0;
 
-		if (iris_surfs_buffer(dd->surfs, surface_list[i], &surface_mem,
+		if (vpu_surfaces_buffer(dd->surfs, surface_list[i], &surface_mem,
 				      &pitch, &size, &width, &height, &fourcc))
 			return VA_STATUS_ERROR_INVALID_SURFACE;
 		/* A client should destroy derived images first.  Invalidate any that
@@ -623,13 +626,13 @@ iris_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 			dd->derived_mem[j] = dd->derived_mem[dd->derived_n - 1];
 			dd->derived_n--;
 		}
-		iris_surfs_free(dd->surfs, surface_list[i]);
+		vpu_surfaces_free(dd->surfs, surface_list[i]);
 	}
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
+vpu_vaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
 		       unsigned int width, unsigned int height,
 		       VASurfaceID *surfaces, unsigned int num_surfaces,
 		       VASurfaceAttrib *attrib_list, unsigned int num_attribs)
@@ -641,18 +644,18 @@ iris_vaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
 		    attrib_list[i].value.type == VAGenericValueTypeInteger &&
 		    attrib_list[i].value.value.i == VA_FOURCC_P010)
 			format = VA_RT_FORMAT_YUV420_10;
-	return iris_vaCreateSurfaces(ctx, width, height, format, num_surfaces,
+	return vpu_vaCreateSurfaces(ctx, width, height, format, num_surfaces,
 				     surfaces);
 }
 
 static VAStatus
-iris_vaCreateBuffer(VADriverContextP ctx, VAContextID context_id,
+vpu_vaCreateBuffer(VADriverContextP ctx, VAContextID context_id,
 		    VABufferType type, unsigned int size, unsigned int num_elements,
 		    void *data, VABufferID *buf_id)
 {
-	struct iris_drv_data *dd;
+	struct vpu_drv_data *dd;
 
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	if (dd->n_bufs >= 256)
@@ -676,14 +679,14 @@ iris_vaCreateBuffer(VADriverContextP ctx, VAContextID context_id,
 }
 
 static VAStatus
-iris_vaBufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
+vpu_vaBufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
 			    unsigned int num_elements)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static int
-iris_find_buffer(struct iris_drv_data *dd, VABufferID buf_id)
+vpu_find_buffer(struct vpu_drv_data *dd, VABufferID buf_id)
 {
 	int i;
 
@@ -694,9 +697,9 @@ iris_find_buffer(struct iris_drv_data *dd, VABufferID buf_id)
 }
 
 static VAStatus
-iris_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
+vpu_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	*pbuf = NULL;
@@ -717,7 +720,7 @@ iris_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 		return VA_STATUS_SUCCESS;
 	}
 
-	i = iris_find_buffer(dd, buf_id);
+	i = vpu_find_buffer(dd, buf_id);
 	if (i < 0)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	*pbuf = dd->buf_data[i];
@@ -725,20 +728,20 @@ iris_vaMapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 }
 
 static VAStatus
-iris_vaUnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
+vpu_vaUnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
+vpu_vaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	if (!dd)
 		return VA_STATUS_SUCCESS;
-	i = iris_find_buffer(dd, buf_id);
+	i = vpu_find_buffer(dd, buf_id);
 	if (i < 0)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	free(dd->buf_data[i]);
@@ -752,153 +755,83 @@ iris_vaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
 }
 
 static VAStatus
-iris_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
+vpu_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
 		    VASurfaceID render_target)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
-	struct iris_decode_ctx *eng;
+	struct vpu_drv_data *dd = ctx->pDriverData;
+	struct vpu_decode_ctx *eng;
 
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	eng = iris_context_engine(dd, context_id);
+	eng = vpu_context_engine(dd, context_id);
 	if (!eng)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	return iris_decode_begin(eng, render_target) ?
+	return vpu_decode_begin(eng, render_target) ?
 		VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
+vpu_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 		     VABufferID *buffers, int num_buffers)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
-	struct iris_engine *engine;
-	struct iris_decode_ctx *eng;
-	VAProfile profile;
+	struct vpu_drv_data *dd = ctx->pDriverData;
+	struct vpu_engine *engine;
+	struct vpu_decode_ctx *eng;
 	int i;
 
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	engine = iris_context(dd, context_id);
+	engine = vpu_context(dd, context_id);
 	if (!engine)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 	eng = engine->dec;
-	profile = engine->profile;
 
 	for (i = 0; i < num_buffers; i++) {
-		int idx = iris_find_buffer(dd, buffers[i]);
-		void *data;
-		VABufferType type;
+		int idx = vpu_find_buffer(dd, buffers[i]);
+		int ret;
 
 		if (idx < 0)
 			return VA_STATUS_ERROR_INVALID_BUFFER;
-		data = dd->buf_data[idx];
-		type = dd->buf_types[idx];
-
-		switch (type) {
-		case VAPictureParameterBufferType:
-			/* VP9 frames carry their own header, so ignore the
-			 * (larger) VP9 picture parameter buffer.  HEVC parses
-			 * it to re-serialize VPS/SPS/PPS. */
-			if (profile == VAProfileVP9Profile0 ||
-			    profile == VAProfileVP9Profile1 ||
-			    profile == VAProfileVP9Profile2 ||
-			    profile == VAProfileVP9Profile3)
-				break;
-			if (profile == VAProfileHEVCMain ||
-			    profile == VAProfileHEVCMain10) {
-				if (dd->buf_sizes[idx] <
-				    sizeof(VAPictureParameterBufferHEVC))
-					return VA_STATUS_ERROR_INVALID_BUFFER;
-				if (iris_decode_hevc_picture(eng, data))
-					return VA_STATUS_ERROR_INVALID_BUFFER;
-				break;
-			}
-			if (dd->buf_sizes[idx] <
-			    sizeof(VAPictureParameterBufferH264))
-				return VA_STATUS_ERROR_INVALID_BUFFER;
-			iris_decode_picture(eng, data);
-			break;
-		case VASliceParameterBufferType:
-			if (profile == VAProfileVP9Profile0 ||
-			    profile == VAProfileVP9Profile1 ||
-			    profile == VAProfileVP9Profile2 ||
-			    profile == VAProfileVP9Profile3)
-				break;
-			if (profile == VAProfileHEVCMain ||
-			    profile == VAProfileHEVCMain10) {
-				if (dd->buf_sizes[idx] <
-				    sizeof(VASliceParameterBufferHEVC) *
-				    dd->buf_num_elements[idx])
-					return VA_STATUS_ERROR_INVALID_BUFFER;
-				for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
-					if (iris_decode_hevc_slice_params(eng,
-						(const VASliceParameterBufferHEVC *)data + j))
-						return VA_STATUS_ERROR_INVALID_BUFFER;
-				break;
-			}
-			if (dd->buf_sizes[idx] < sizeof(VASliceParameterBufferH264) *
-			    dd->buf_num_elements[idx])
-				return VA_STATUS_ERROR_INVALID_BUFFER;
-			for (unsigned int j = 0; j < dd->buf_num_elements[idx]; j++)
-				iris_decode_slice_params(eng,
-					(const VASliceParameterBufferH264 *)data + j);
-			break;
-		case VASliceDataBufferType:
-			if (iris_decode_slice(eng, data, dd->buf_sizes[idx]))
-				return VA_STATUS_ERROR_DECODING_ERROR;
-			break;
-		case VAIQMatrixBufferType:
-			if (profile == VAProfileH264ConstrainedBaseline ||
-			    profile == VAProfileH264Main ||
-			    profile == VAProfileH264High) {
-				if (dd->buf_sizes[idx] < sizeof(VAIQMatrixBufferH264) ||
-				    iris_decode_h264_iq_matrix(eng, data))
-					return VA_STATUS_ERROR_INVALID_BUFFER;
-			} else if (profile == VAProfileHEVCMain ||
-				   profile == VAProfileHEVCMain10) {
-				if (dd->buf_sizes[idx] < sizeof(VAIQMatrixBufferHEVC) ||
-				    iris_decode_hevc_iq_matrix(eng, data))
-					return VA_STATUS_ERROR_INVALID_BUFFER;
-			}
-			break;
-		default:
-			/* Buffer types unrelated to decode bitstream assembly. */
-			break;
-		}
+		ret = vpu_decode_render(eng, dd->buf_types[idx],
+			dd->buf_data[idx], dd->buf_sizes[idx],
+			dd->buf_num_elements[idx]);
+		if (ret)
+			return dd->buf_types[idx] == VASliceDataBufferType ?
+				VA_STATUS_ERROR_DECODING_ERROR :
+				VA_STATUS_ERROR_INVALID_BUFFER;
 	}
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaEndPicture(VADriverContextP ctx, VAContextID context_id)
+vpu_vaEndPicture(VADriverContextP ctx, VAContextID context_id)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
-	struct iris_decode_ctx *eng;
+	struct vpu_drv_data *dd = ctx->pDriverData;
+	struct vpu_decode_ctx *eng;
 
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	eng = iris_context_engine(dd, context_id);
+	eng = vpu_context_engine(dd, context_id);
 	if (!eng)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	return iris_decode_end(eng) ?
+	return vpu_decode_end(eng) ?
 		VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_target)
+vpu_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_target)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	if (!dd->surfs || !iris_surfs_valid(dd->surfs, render_target))
+	if (!dd->surfs || !vpu_surfaces_valid(dd->surfs, render_target))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	/* Route through the registry: the picture being synced may belong to
 	 * any live engine, and never-queued pool surfaces succeed without
 	 * draining anything. */
 	{
-		int r = iris_surfs_sync(dd->surfs, render_target);
+		int r = vpu_surfaces_sync(dd->surfs, render_target);
 
 		DBG("[sync] surf=%u -> r=%d\n", render_target, r);
 		if (!r)
@@ -909,24 +842,24 @@ iris_vaSyncSurface(VADriverContextP ctx, VASurfaceID render_target)
 }
 
 static VAStatus
-iris_vaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target,
+vpu_vaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target,
 			  VASurfaceStatus *status)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 
 	if (!dd || !status || !dd->surfs ||
-	    !iris_surfs_valid(dd->surfs, render_target))
+	    !vpu_surfaces_valid(dd->surfs, render_target))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	*status = iris_surfs_ready(dd->surfs, render_target) ?
+	*status = vpu_surfaces_ready(dd->surfs, render_target) ?
 		VASurfaceReady : VASurfaceRendering;
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
+vpu_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
 			 int *num_formats)
 {
-	struct iris_drv_data *dd;
+	struct vpu_drv_data *dd;
 	static const VAImageFormat nv12 = {
 		.fourcc = VA_FOURCC_NV12,
 		.byte_order = VA_LSB_FIRST,
@@ -940,7 +873,7 @@ iris_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
 
 	if (!num_formats)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	dd = iris_drv_data(ctx);
+	dd = vpu_drv_data(ctx);
 	if (!dd)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	if (format_list) {
@@ -953,7 +886,7 @@ iris_vaQueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
 }
 
 static VAStatus
-iris_vaQueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
+vpu_vaQueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
 			      int *num_attributes)
 {
 	if (!num_attributes)
@@ -963,19 +896,19 @@ iris_vaQueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_lis
 }
 
 static VAStatus
-iris_vaGetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
+vpu_vaGetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
 			    int num_attributes)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
+vpu_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
 			      VASurfaceAttrib *attrib_list,
 			      unsigned int *num_attribs)
 {
-	struct iris_drv_data *dd = dpy ? dpy->pDriverData : NULL;
-	struct iris_config *cfg;
+	struct vpu_drv_data *dd = dpy ? dpy->pDriverData : NULL;
+	struct vpu_config *cfg;
 	VASurfaceAttrib attrs[] = {
 		{ .type = VASurfaceAttribPixelFormat,
 		  .flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE,
@@ -1000,10 +933,10 @@ iris_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
-	cfg = iris_find_config(dd, config);
+	cfg = vpu_find_config(dd, config);
 	if (!cfg)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
-	attrs[0].value.value.i = iris_profile_fourcc(cfg->profile);
+	attrs[0].value.value.i = vpu_profile_fourcc(cfg->profile);
 	if (attrib_list) {
 		if (*num_attribs < want) {
 			*num_attribs = want;
@@ -1018,7 +951,7 @@ iris_vaQuerySurfaceAttributes(VADriverContextP dpy, VAConfigID config,
 }
 
 static VAStatus
-iris_vaBufferInfo(VADriverContextP ctx, VABufferID buf_id,
+vpu_vaBufferInfo(VADriverContextP ctx, VABufferID buf_id,
 		  VABufferType *type, unsigned int *size, unsigned int *num_elements)
 {
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
@@ -1026,10 +959,10 @@ iris_vaBufferInfo(VADriverContextP ctx, VABufferID buf_id,
 
 /* Image/subpicture entries are required non-NULL by libva's validation. */
 static VAStatus
-iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
+vpu_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 		   int height, VAImage *image)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	unsigned int pitch, size;
 	VABufferID bid;
 
@@ -1043,8 +976,8 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 	if (format->fourcc == VA_FOURCC_P010 && !dd->p010_supported)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
-	/* Match the stable surface/CAPTURE layout used by the Iris backend. */
-	pitch = iris_surface_pitch(width, format->fourcc);
+	/* Match the stable surface/CAPTURE layout used by the selected platform. */
+	pitch = vpu_surface_pitch(width, format->fourcc);
 	size = (unsigned int)pitch * ALIGN(height, 32) * 3 / 2;
 	dd->img_data[dd->img_n] = calloc(1, size);
 	if (!dd->img_data[dd->img_n])
@@ -1073,16 +1006,16 @@ iris_vaCreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
 }
 
 static VAStatus
-iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
+vpu_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	unsigned int pitch, size, w, h, fourcc;
 	void *mem;
 	VABufferID bid;
 
 	if (!dd || !image)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
+	if (vpu_surfaces_buffer(dd->surfs, surface, &mem, &pitch, &size,
 			      &w, &h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	if (dd->derived_n >= 256)
@@ -1111,9 +1044,9 @@ iris_vaDeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
 }
 
 static VAStatus
-iris_vaDestroyImage(VADriverContextP ctx, VAImageID image)
+vpu_vaDestroyImage(VADriverContextP ctx, VAImageID image)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	int i;
 
 	if (!dd)
@@ -1143,17 +1076,17 @@ iris_vaDestroyImage(VADriverContextP ctx, VAImageID image)
 }
 
 static VAStatus
-iris_vaSetImagePalette(VADriverContextP ctx, VAImageID image,
+vpu_vaSetImagePalette(VADriverContextP ctx, VAImageID image,
 		       unsigned char *palette)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
+vpu_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 		unsigned int width, unsigned int height, VAImageID image)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	unsigned int pitch, size, cap_w, cap_h, fourcc;
 	int img_i = -1;
 	void *mem, *dst = NULL;
@@ -1161,13 +1094,13 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 
 	if (!dd)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	if (!dd->surfs || !iris_surfs_valid(dd->surfs, surface))
+	if (!dd->surfs || !vpu_surfaces_valid(dd->surfs, surface))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
-	i = iris_surfs_sync(dd->surfs, surface);
+	i = vpu_surfaces_sync(dd->surfs, surface);
 	if (i)
 		return i == -ETIMEDOUT ? VA_STATUS_ERROR_TIMEDOUT :
 			VA_STATUS_ERROR_DECODING_ERROR;
-	if (iris_surfs_buffer(dd->surfs, surface, &mem, &pitch, &size,
+	if (vpu_surfaces_buffer(dd->surfs, surface, &mem, &pitch, &size,
 			      &cap_w, &cap_h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	for (i = 0; i < dd->img_n; i++)
@@ -1187,7 +1120,7 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 	{
 		unsigned int img_w = dd->img_ws[img_i];
 		unsigned int img_h = dd->img_hs[img_i];
-		unsigned int img_pitch = iris_surface_pitch(img_w, fourcc);
+		unsigned int img_pitch = vpu_surface_pitch(img_w, fourcc);
 		unsigned int img_chroma = img_pitch * ALIGN(img_h, 32);
 		unsigned int bytes = fourcc == VA_FOURCC_P010 ? 2 : 1;
 		unsigned int row_bytes;
@@ -1217,7 +1150,7 @@ iris_vaGetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 }
 
 static VAStatus
-iris_vaPutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image,
+vpu_vaPutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image,
 		int src_x, int src_y, unsigned int src_width,
 		unsigned int src_height, int dest_x, int dest_y,
 		unsigned int dest_width, unsigned int dest_height)
@@ -1226,7 +1159,7 @@ iris_vaPutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image,
 }
 
 static VAStatus
-iris_vaQuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list,
+vpu_vaQuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list,
 			      unsigned int *flags, unsigned int *num_formats)
 {
 	if (num_formats)
@@ -1235,27 +1168,27 @@ iris_vaQuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list,
 }
 
 static VAStatus
-iris_vaCreateSubpicture(VADriverContextP ctx, VAImageID image,
+vpu_vaCreateSubpicture(VADriverContextP ctx, VAImageID image,
 			VASubpictureID *subpicture)
 {
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
 static VAStatus
-iris_vaDestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture)
+vpu_vaDestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaSetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture,
+vpu_vaSetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture,
 			  VAImageID image)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaSetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture,
+vpu_vaSetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture,
 			      unsigned int chromakey_min,
 			      unsigned int chromakey_max,
 			      unsigned int chromakey_mask)
@@ -1264,14 +1197,14 @@ iris_vaSetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture,
 }
 
 static VAStatus
-iris_vaSetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpicture,
+vpu_vaSetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpicture,
 				float global_alpha)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaAssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture,
+vpu_vaAssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture,
 			   VASurfaceID *target_surfaces, int num_surfaces,
 			   short src_x, short src_y, unsigned short src_width,
 			   unsigned short src_height, short dest_x, short dest_y,
@@ -1282,24 +1215,24 @@ iris_vaAssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture,
 }
 
 static VAStatus
-iris_vaDeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture,
+vpu_vaDeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture,
 			     VASurfaceID *target_surfaces, int num_surfaces)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaSetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
+vpu_vaSetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list,
 			    int num_attributes)
 {
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
-iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
+vpu_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 			   uint32_t mem_type, uint32_t flags, void *descriptor)
 {
-	struct iris_drv_data *dd = ctx->pDriverData;
+	struct vpu_drv_data *dd = ctx->pDriverData;
 	VADRMPRIMESurfaceDescriptor *d = descriptor;
 	unsigned int w, h, pitch, size, fourcc;
 	uint32_t layer_flags;
@@ -1319,7 +1252,7 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 
 	DBG("[export] surf=%u type=%u flags=0x%x\n", surface_id,
 	    mem_type, flags);
-	if (iris_surfs_export(dd->surfs, surface_id, &fd, &pitch, &size,
+	if (vpu_surfaces_export(dd->surfs, surface_id, &fd, &pitch, &size,
 			      &w, &h, &fourcc))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
@@ -1361,53 +1294,53 @@ iris_vaExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 	return VA_STATUS_SUCCESS;
 }
 
-static const struct VADriverVTable iris_vtable_template = {
-	.vaTerminate = iris_vaTerminate,
-	.vaQueryConfigProfiles = iris_vaQueryConfigProfiles,
-	.vaQueryConfigEntrypoints = iris_vaQueryConfigEntrypoints,
-	.vaGetConfigAttributes = iris_vaGetConfigAttributes,
-	.vaCreateConfig = iris_vaCreateConfig,
-	.vaDestroyConfig = iris_vaDestroyConfig,
-	.vaQueryConfigAttributes = iris_vaQueryConfigAttributes,
-	.vaCreateSurfaces = iris_vaCreateSurfaces,
-	.vaDestroySurfaces = iris_vaDestroySurfaces,
-	.vaCreateContext = iris_vaCreateContext,
-	.vaDestroyContext = iris_vaDestroyContext,
-	.vaCreateBuffer = iris_vaCreateBuffer,
-	.vaBufferSetNumElements = iris_vaBufferSetNumElements,
-	.vaMapBuffer = iris_vaMapBuffer,
-	.vaUnmapBuffer = iris_vaUnmapBuffer,
-	.vaDestroyBuffer = iris_vaDestroyBuffer,
-	.vaBeginPicture = iris_vaBeginPicture,
-	.vaRenderPicture = iris_vaRenderPicture,
-	.vaEndPicture = iris_vaEndPicture,
-	.vaSyncSurface = iris_vaSyncSurface,
-	.vaQuerySurfaceStatus = iris_vaQuerySurfaceStatus,
-	.vaQueryImageFormats = iris_vaQueryImageFormats,
-	.vaCreateImage = iris_vaCreateImage,
-	.vaDeriveImage = iris_vaDeriveImage,
-	.vaDestroyImage = iris_vaDestroyImage,
-	.vaSetImagePalette = iris_vaSetImagePalette,
-	.vaGetImage = iris_vaGetImage,
-	.vaPutImage = iris_vaPutImage,
-	.vaQuerySubpictureFormats = iris_vaQuerySubpictureFormats,
-	.vaCreateSubpicture = iris_vaCreateSubpicture,
-	.vaDestroySubpicture = iris_vaDestroySubpicture,
-	.vaSetSubpictureImage = iris_vaSetSubpictureImage,
-	.vaSetSubpictureChromakey = iris_vaSetSubpictureChromakey,
-	.vaSetSubpictureGlobalAlpha = iris_vaSetSubpictureGlobalAlpha,
-	.vaAssociateSubpicture = iris_vaAssociateSubpicture,
-	.vaDeassociateSubpicture = iris_vaDeassociateSubpicture,
-	.vaQueryDisplayAttributes = iris_vaQueryDisplayAttributes,
-	.vaGetDisplayAttributes = iris_vaGetDisplayAttributes,
-	.vaSetDisplayAttributes = iris_vaSetDisplayAttributes,
-	.vaBufferInfo = iris_vaBufferInfo,
-	.vaCreateSurfaces2 = iris_vaCreateSurfaces2,
-	.vaQuerySurfaceAttributes = iris_vaQuerySurfaceAttributes,
-	.vaExportSurfaceHandle = iris_vaExportSurfaceHandle,
+static const struct VADriverVTable vpu_vtable_template = {
+	.vaTerminate = vpu_vaTerminate,
+	.vaQueryConfigProfiles = vpu_vaQueryConfigProfiles,
+	.vaQueryConfigEntrypoints = vpu_vaQueryConfigEntrypoints,
+	.vaGetConfigAttributes = vpu_vaGetConfigAttributes,
+	.vaCreateConfig = vpu_vaCreateConfig,
+	.vaDestroyConfig = vpu_vaDestroyConfig,
+	.vaQueryConfigAttributes = vpu_vaQueryConfigAttributes,
+	.vaCreateSurfaces = vpu_vaCreateSurfaces,
+	.vaDestroySurfaces = vpu_vaDestroySurfaces,
+	.vaCreateContext = vpu_vaCreateContext,
+	.vaDestroyContext = vpu_vaDestroyContext,
+	.vaCreateBuffer = vpu_vaCreateBuffer,
+	.vaBufferSetNumElements = vpu_vaBufferSetNumElements,
+	.vaMapBuffer = vpu_vaMapBuffer,
+	.vaUnmapBuffer = vpu_vaUnmapBuffer,
+	.vaDestroyBuffer = vpu_vaDestroyBuffer,
+	.vaBeginPicture = vpu_vaBeginPicture,
+	.vaRenderPicture = vpu_vaRenderPicture,
+	.vaEndPicture = vpu_vaEndPicture,
+	.vaSyncSurface = vpu_vaSyncSurface,
+	.vaQuerySurfaceStatus = vpu_vaQuerySurfaceStatus,
+	.vaQueryImageFormats = vpu_vaQueryImageFormats,
+	.vaCreateImage = vpu_vaCreateImage,
+	.vaDeriveImage = vpu_vaDeriveImage,
+	.vaDestroyImage = vpu_vaDestroyImage,
+	.vaSetImagePalette = vpu_vaSetImagePalette,
+	.vaGetImage = vpu_vaGetImage,
+	.vaPutImage = vpu_vaPutImage,
+	.vaQuerySubpictureFormats = vpu_vaQuerySubpictureFormats,
+	.vaCreateSubpicture = vpu_vaCreateSubpicture,
+	.vaDestroySubpicture = vpu_vaDestroySubpicture,
+	.vaSetSubpictureImage = vpu_vaSetSubpictureImage,
+	.vaSetSubpictureChromakey = vpu_vaSetSubpictureChromakey,
+	.vaSetSubpictureGlobalAlpha = vpu_vaSetSubpictureGlobalAlpha,
+	.vaAssociateSubpicture = vpu_vaAssociateSubpicture,
+	.vaDeassociateSubpicture = vpu_vaDeassociateSubpicture,
+	.vaQueryDisplayAttributes = vpu_vaQueryDisplayAttributes,
+	.vaGetDisplayAttributes = vpu_vaGetDisplayAttributes,
+	.vaSetDisplayAttributes = vpu_vaSetDisplayAttributes,
+	.vaBufferInfo = vpu_vaBufferInfo,
+	.vaCreateSurfaces2 = vpu_vaCreateSurfaces2,
+	.vaQuerySurfaceAttributes = vpu_vaQuerySurfaceAttributes,
+	.vaExportSurfaceHandle = vpu_vaExportSurfaceHandle,
 };
 
-VAStatus
+VPU_PUBLIC VAStatus
 __vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
 {
 	struct VADriverVTable *vt;
@@ -1423,37 +1356,59 @@ __vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
 	vt = calloc(1, sizeof(*vt));
 	if (!vt)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	*vt = iris_vtable_template;
+	*vt = vpu_vtable_template;
 
 	ctx->version_major = major_version;
 	ctx->version_minor = minor_version;
 	ctx->vtable = vt;
-	ctx->max_profiles = NUM_IRIS_PROFILES;
-	ctx->max_entrypoints = NUM_IRIS_ENTRYPOINTS;
+	ctx->max_profiles = vpu_codec_profile_count();
+	ctx->max_entrypoints = NUM_VPU_ENTRYPOINTS;
 	ctx->max_attributes = 1;
 	ctx->max_image_formats = 2;
 	ctx->max_subpic_formats = 1;
 	ctx->max_display_attributes = 0;
-	ctx->str_vendor = IRIS_VAAPI_VENDOR IRIS_VAAPI_VERSION;
+	ctx->str_vendor = "vpu-vaapi " VPU_VAAPI_VERSION;
 	ctx->pDriverData = NULL;
 
 	{
-		struct iris_drv_data *dd = iris_drv_data(ctx);
+		struct vpu_drv_data *dd = vpu_drv_data(ctx);
 
 		if (!dd)
 			return VA_STATUS_ERROR_ALLOCATION_FAILED;
-		dd->p010_supported = v4l2_dec_supports_capture_format(
-			"/dev/video0", V4L2_PIX_FMT_P010);
+		dd->platform = vpu_platform_create(NULL, NULL);
+		if (!dd->platform) {
+			free(dd);
+			ctx->pDriverData = NULL;
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+		snprintf(dd->vendor, sizeof(dd->vendor),
+			 "vpu-vaapi: %s (%s) %s",
+			 vpu_platform_description(dd->platform),
+			 vpu_platform_name(dd->platform), VPU_VAAPI_VERSION);
+		ctx->str_vendor = dd->vendor;
+		for (unsigned int i = 0; i < vpu_codec_profile_count(); i++) {
+			VAProfile profile = vpu_codec_profile_at(i);
+			enum vpu_pixel_format format;
+
+			if (!vpu_codec_profile_info(profile, NULL, &format, NULL) &&
+			    format == VPU_PIXEL_FORMAT_P010 &&
+			    vpu_profile_supported(dd, profile)) {
+				dd->p010_supported = 1;
+				break;
+			}
+		}
 		if (!dd->p010_supported)
 			fprintf(stderr,
-				"iris-vaapi: kernel does not advertise P010; hiding HEVC Main10 and VP9 Profile 2\n");
+				"vpu-vaapi: platform %s on %s does not advertise P010 profiles\n",
+				vpu_platform_name(dd->platform),
+				vpu_platform_device(dd->platform));
 	}
 
 	return VA_STATUS_SUCCESS;
 }
 
 /* Compatibility aliases for older libva releases */
-VAStatus
+VPU_PUBLIC VAStatus
 vaDriverInit(VADriverContextP ctx, int major_version, int minor_version)
 {
 	return __vaDriverInit_1_23(ctx, major_version, minor_version);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* End-to-end VA-API decode test: decode the first picture of an Annex-B
- * H.264 stream through the iris-vaapi driver and verify the exported NV12
+ * H.264 stream through the vpu-vaapi driver and verify the exported NV12
  * against FFmpeg's software decode.
  */
 

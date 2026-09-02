@@ -2,8 +2,8 @@
 /* Rewrite HEVC slice headers so reconstructed SPS files do not need the
  * original SPS short-term reference-picture-set tables. */
 
-#ifndef IRIS_VAAPI_HEVC_SLICE_REWRITE_H
-#define IRIS_VAAPI_HEVC_SLICE_REWRITE_H
+#ifndef VPU_VAAPI_HEVC_SLICE_REWRITE_H
+#define VPU_VAAPI_HEVC_SLICE_REWRITE_H
 
 #include <stddef.h>
 #include <stdint.h>

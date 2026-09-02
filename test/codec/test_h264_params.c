@@ -9,7 +9,7 @@
 #include <string.h>
 
 #include <va/va.h>
-#include "h264_params.h"
+#include "codec/h264/h264_params.h"
 
 struct br {
 	const uint8_t *p;

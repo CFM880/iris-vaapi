@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <va/va.h>
-#include "hevc_params.h"
+#include "codec/hevc/hevc_params.h"
 
 static int check_nal(const char *name, const uint8_t *got, int got_len,
 		     const uint8_t *want, size_t want_len)

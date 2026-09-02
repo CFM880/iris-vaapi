@@ -12,7 +12,7 @@ The repository previously contained unversioned copies of two Chromium `.cc` fil
 Those snapshots were removed because they become stale quickly and were not build inputs.
 Use the upstream links and record the Chromium revision when investigating behavior.
 
-Important compatibility points implemented by iris-vaapi:
+Important compatibility points implemented by vpu-vaapi:
 
 - surfaces can be synchronized and exported before their first decode;
 - exported NV12 uses separate linear layers and stable DMA-BUF backing;

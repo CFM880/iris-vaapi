@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "hevc_slice_rewrite.h"
+#include "codec/hevc/hevc_slice_rewrite.h"
 
 struct bits {
 	uint8_t data[256];

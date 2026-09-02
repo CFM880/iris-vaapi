@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#ifndef IRIS_SURFACE_FENCE_H
-#define IRIS_SURFACE_FENCE_H
+#ifndef IRIS_VAAPI_QCOM_SURFACE_FENCE_H
+#define IRIS_VAAPI_QCOM_SURFACE_FENCE_H
 
 #include <linux/ioctl.h>
 #include <linux/types.h>

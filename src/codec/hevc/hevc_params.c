@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Re-serialize HEVC VPS/SPS/PPS NAL units from VAPictureParameterBufferHEVC
- * so a whole-bitstream stateful decoder (iris) can be fed reconstructed
+ * so a whole-bitstream stateful decoder can be fed reconstructed
  * access units.
  *
  * Field order follows ITU-T H.265 and was cross-checked against ffmpeg's
@@ -231,7 +231,7 @@ hevc_reorder_pics(const VAPictureParameterBufferHEVC *pic)
 {
 	/* VA-API does not expose sps_max_num_reorder_pics.  Keep it bounded by
 	 * the advertised DPB size; two is sufficient for the common hierarchical
-	 * B-frame streams accepted by the Iris firmware. */
+	 * B-frame streams accepted by the supported stateful firmware. */
 	return pic->sps_max_dec_pic_buffering_minus1 < 2 ?
 		pic->sps_max_dec_pic_buffering_minus1 : 2;
 }

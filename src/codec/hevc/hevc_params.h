@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Re-serialize HEVC VPS/SPS/PPS NAL units from VAPictureParameterBufferHEVC
- * for the whole-bitstream stateful iris decoder. */
+ * for whole-bitstream stateful decoders. */
 
-#ifndef IRIS_VAAPI_HEVC_PARAMS_H
-#define IRIS_VAAPI_HEVC_PARAMS_H
+#ifndef VPU_VAAPI_HEVC_PARAMS_H
+#define VPU_VAAPI_HEVC_PARAMS_H
 
 #include <stdint.h>
 #include <stddef.h>

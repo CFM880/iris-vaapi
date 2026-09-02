@@ -10,27 +10,27 @@
 
 #include "vk_copy.h"
 
-#ifdef IRIS_HAVE_VULKAN
+#ifdef VPU_HAVE_VULKAN
 
 #include <vulkan/vulkan.h>
 
-#define IRIS_VK_MAX_BUFFERS 192
-#define IRIS_VK_MAX_JOBS 32
+#define VPU_VK_MAX_BUFFERS 192
+#define VPU_VK_MAX_JOBS 32
 
-struct iris_vk_buffer {
+struct vpu_vk_buffer {
 	VkBuffer buffer;
 	VkDeviceMemory memory;
 	uint64_t key;
 	size_t size;
 };
 
-struct iris_vk_job {
+struct vpu_vk_job {
 	VkCommandBuffer command;
 	VkFence fence;
 	int in_use;
 };
 
-struct iris_vk_copy {
+struct vpu_vk_copy {
 	pthread_mutex_t mutex;
 	VkInstance instance;
 	VkPhysicalDevice physical;
@@ -39,9 +39,9 @@ struct iris_vk_copy {
 	uint32_t queue_family;
 	VkCommandPool command_pool;
 	PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties;
-	struct iris_vk_buffer buffers[IRIS_VK_MAX_BUFFERS];
+	struct vpu_vk_buffer buffers[VPU_VK_MAX_BUFFERS];
 	unsigned int buffer_count;
-	struct iris_vk_job jobs[IRIS_VK_MAX_JOBS];
+	struct vpu_vk_job jobs[VPU_VK_MAX_JOBS];
 };
 
 static int
@@ -71,7 +71,7 @@ has_device_extension(VkPhysicalDevice physical, const char *name)
 }
 
 static int
-select_physical_device(struct iris_vk_copy *copy)
+select_physical_device(struct vpu_vk_copy *copy)
 {
 	VkPhysicalDevice *devices;
 	uint32_t count = 0, i;
@@ -143,8 +143,8 @@ select_physical_device(struct iris_vk_copy *copy)
 	return ret;
 }
 
-struct iris_vk_copy *
-iris_vk_copy_create(void)
+struct vpu_vk_copy *
+vpu_vk_copy_create(void)
 {
 	static const char *extensions[] = {
 		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
@@ -153,7 +153,7 @@ iris_vk_copy_create(void)
 	};
 	VkApplicationInfo app = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = "iris-vaapi-copy",
+		.pApplicationName = "vpu-vaapi-copy",
 		.apiVersion = VK_API_VERSION_1_1,
 	};
 	VkInstanceCreateInfo instance_info = {
@@ -178,14 +178,14 @@ iris_vk_copy_create(void)
 	VkCommandBufferAllocateInfo command_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = IRIS_VK_MAX_JOBS,
+		.commandBufferCount = VPU_VK_MAX_JOBS,
 	};
-	VkCommandBuffer commands[IRIS_VK_MAX_JOBS];
+	VkCommandBuffer commands[VPU_VK_MAX_JOBS];
 	VkFenceCreateInfo fence_info = {
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 	};
 	VkPhysicalDeviceProperties props;
-	struct iris_vk_copy *copy;
+	struct vpu_vk_copy *copy;
 	float priority = 1.0f;
 	int ret;
 
@@ -219,7 +219,7 @@ iris_vk_copy_create(void)
 	if (vkAllocateCommandBuffers(copy->device, &command_info, commands) !=
 	    VK_SUCCESS)
 		goto fail;
-	for (unsigned int i = 0; i < IRIS_VK_MAX_JOBS; i++) {
+	for (unsigned int i = 0; i < VPU_VK_MAX_JOBS; i++) {
 		copy->jobs[i].command = commands[i];
 		if (vkCreateFence(copy->device, &fence_info, NULL,
 				  &copy->jobs[i].fence) != VK_SUCCESS)
@@ -227,19 +227,19 @@ iris_vk_copy_create(void)
 	}
 
 	vkGetPhysicalDeviceProperties(copy->physical, &props);
-	fprintf(stderr, "iris-vaapi: Vulkan DMA-BUF copy enabled on %s\n",
+	fprintf(stderr, "vpu-vaapi: Vulkan DMA-BUF copy enabled on %s\n",
 		props.deviceName);
 	return copy;
 
 fail:
 	fprintf(stderr,
-		"iris-vaapi: Vulkan DMA-BUF copy unavailable; using CPU copy\n");
-	iris_vk_copy_destroy(copy);
+		"vpu-vaapi: Vulkan DMA-BUF copy unavailable; using CPU copy\n");
+	vpu_vk_copy_destroy(copy);
 	return NULL;
 }
 
 static int
-choose_memory_type(struct iris_vk_copy *copy, uint32_t bits)
+choose_memory_type(struct vpu_vk_copy *copy, uint32_t bits)
 {
 	VkPhysicalDeviceMemoryProperties props;
 	uint32_t i;
@@ -257,8 +257,8 @@ choose_memory_type(struct iris_vk_copy *copy, uint32_t bits)
 	return -1;
 }
 
-static struct iris_vk_buffer *
-import_buffer(struct iris_vk_copy *copy, uint64_t key, int fd, size_t size)
+static struct vpu_vk_buffer *
+import_buffer(struct vpu_vk_copy *copy, uint64_t key, int fd, size_t size)
 {
 	VkExternalMemoryBufferCreateInfo external = {
 		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
@@ -288,7 +288,7 @@ import_buffer(struct iris_vk_copy *copy, uint64_t key, int fd, size_t size)
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext = &import,
 	};
-	struct iris_vk_buffer *buffer;
+	struct vpu_vk_buffer *buffer;
 	uint32_t memory_bits;
 	int memory_type, import_fd;
 
@@ -299,7 +299,7 @@ import_buffer(struct iris_vk_copy *copy, uint64_t key, int fd, size_t size)
 		if (buffer->key == key && buffer->size == size)
 			return buffer;
 	}
-	if (copy->buffer_count >= IRIS_VK_MAX_BUFFERS)
+	if (copy->buffer_count >= VPU_VK_MAX_BUFFERS)
 		return NULL;
 
 	buffer = &copy->buffers[copy->buffer_count];
@@ -347,10 +347,10 @@ fail:
 }
 
 static int
-iris_vk_copy_submit_locked(struct iris_vk_copy *copy,
+vpu_vk_copy_submit_locked(struct vpu_vk_copy *copy,
 			uint64_t src_key, int src_fd, size_t src_size,
 			uint64_t dst_key, int dst_fd, size_t dst_size,
-			size_t size, struct iris_vk_job **job_out)
+			size_t size, struct vpu_vk_job **job_out)
 {
 	VkCommandBufferBeginInfo begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -363,13 +363,13 @@ iris_vk_copy_submit_locked(struct iris_vk_copy *copy,
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		.commandBufferCount = 1,
 	};
-	struct iris_vk_buffer *src, *dst;
-	struct iris_vk_job *job = NULL;
+	struct vpu_vk_buffer *src, *dst;
+	struct vpu_vk_job *job = NULL;
 	VkResult result;
 
 	if (!copy || !job_out || !size || size > src_size || size > dst_size)
 		return -EINVAL;
-	for (unsigned int i = 0; i < IRIS_VK_MAX_JOBS; i++) {
+	for (unsigned int i = 0; i < VPU_VK_MAX_JOBS; i++) {
 		if (!__atomic_load_n(&copy->jobs[i].in_use,
 				     __ATOMIC_ACQUIRE)) {
 			job = &copy->jobs[i];
@@ -430,17 +430,17 @@ iris_vk_copy_submit_locked(struct iris_vk_copy *copy,
 }
 
 int
-iris_vk_copy_submit(struct iris_vk_copy *copy,
+vpu_vk_copy_submit(struct vpu_vk_copy *copy,
 			uint64_t src_key, int src_fd, size_t src_size,
 			uint64_t dst_key, int dst_fd, size_t dst_size,
-			size_t size, struct iris_vk_job **job_out)
+			size_t size, struct vpu_vk_job **job_out)
 {
 	int ret;
 
 	if (!copy)
 		return -EINVAL;
 	pthread_mutex_lock(&copy->mutex);
-	ret = iris_vk_copy_submit_locked(copy, src_key, src_fd, src_size,
+	ret = vpu_vk_copy_submit_locked(copy, src_key, src_fd, src_size,
 					 dst_key, dst_fd, dst_size, size,
 					 job_out);
 	pthread_mutex_unlock(&copy->mutex);
@@ -448,7 +448,7 @@ iris_vk_copy_submit(struct iris_vk_copy *copy,
 }
 
 int
-iris_vk_copy_job_wait(struct iris_vk_copy *copy, struct iris_vk_job *job,
+vpu_vk_copy_job_wait(struct vpu_vk_copy *copy, struct vpu_vk_job *job,
 			  uint64_t timeout_ns)
 {
 	VkResult result;
@@ -469,14 +469,14 @@ iris_vk_copy_job_wait(struct iris_vk_copy *copy, struct iris_vk_job *job,
 }
 
 void
-iris_vk_copy_job_release(struct iris_vk_job *job)
+vpu_vk_copy_job_release(struct vpu_vk_job *job)
 {
 	if (job)
 		__atomic_store_n(&job->in_use, 0, __ATOMIC_RELEASE);
 }
 
 static void
-iris_vk_copy_forget_locked(struct iris_vk_copy *copy, uint64_t key)
+vpu_vk_copy_forget_locked(struct vpu_vk_copy *copy, uint64_t key)
 {
 	unsigned int i;
 
@@ -496,35 +496,35 @@ iris_vk_copy_forget_locked(struct iris_vk_copy *copy, uint64_t key)
 }
 
 void
-iris_vk_copy_forget(struct iris_vk_copy *copy, uint64_t key)
+vpu_vk_copy_forget(struct vpu_vk_copy *copy, uint64_t key)
 {
 	if (!copy || !key)
 		return;
 	pthread_mutex_lock(&copy->mutex);
-	iris_vk_copy_forget_locked(copy, key);
+	vpu_vk_copy_forget_locked(copy, key);
 	pthread_mutex_unlock(&copy->mutex);
 }
 
 int
-iris_vk_copy_dmabuf(struct iris_vk_copy *copy,
+vpu_vk_copy_dmabuf(struct vpu_vk_copy *copy,
 			uint64_t src_key, int src_fd, size_t src_size,
 			uint64_t dst_key, int dst_fd, size_t dst_size,
 			size_t size)
 {
-	struct iris_vk_job *job;
+	struct vpu_vk_job *job;
 	int ret;
 
-	ret = iris_vk_copy_submit(copy, src_key, src_fd, src_size,
+	ret = vpu_vk_copy_submit(copy, src_key, src_fd, src_size,
 				  dst_key, dst_fd, dst_size, size, &job);
 	if (ret)
 		return ret;
-	ret = iris_vk_copy_job_wait(copy, job, UINT64_MAX);
-	iris_vk_copy_job_release(job);
+	ret = vpu_vk_copy_job_wait(copy, job, UINT64_MAX);
+	vpu_vk_copy_job_release(job);
 	return ret == 1 ? 0 : ret;
 }
 
 void
-iris_vk_copy_destroy(struct iris_vk_copy *copy)
+vpu_vk_copy_destroy(struct vpu_vk_copy *copy)
 {
 	unsigned int i;
 
@@ -532,7 +532,7 @@ iris_vk_copy_destroy(struct iris_vk_copy *copy)
 		return;
 	if (copy->device)
 		vkDeviceWaitIdle(copy->device);
-	for (i = 0; i < IRIS_VK_MAX_JOBS; i++)
+	for (i = 0; i < VPU_VK_MAX_JOBS; i++)
 		if (copy->jobs[i].fence)
 			vkDestroyFence(copy->device, copy->jobs[i].fence, NULL);
 	for (i = 0; i < copy->buffer_count; i++) {
@@ -553,25 +553,25 @@ iris_vk_copy_destroy(struct iris_vk_copy *copy)
 
 #else
 
-struct iris_vk_copy *
-iris_vk_copy_create(void)
+struct vpu_vk_copy *
+vpu_vk_copy_create(void)
 {
 	fprintf(stderr,
-		"iris-vaapi: built without Vulkan support; using CPU copy\n");
+		"vpu-vaapi: built without Vulkan support; using CPU copy\n");
 	return NULL;
 }
 
 void
-iris_vk_copy_destroy(struct iris_vk_copy *copy)
+vpu_vk_copy_destroy(struct vpu_vk_copy *copy)
 {
 	(void)copy;
 }
 
 int
-iris_vk_copy_submit(struct iris_vk_copy *copy,
+vpu_vk_copy_submit(struct vpu_vk_copy *copy,
 			uint64_t src_key, int src_fd, size_t src_size,
 			uint64_t dst_key, int dst_fd, size_t dst_size,
-			size_t size, struct iris_vk_job **job)
+			size_t size, struct vpu_vk_job **job)
 {
 	(void)copy;
 	(void)src_key;
@@ -586,7 +586,7 @@ iris_vk_copy_submit(struct iris_vk_copy *copy,
 }
 
 int
-iris_vk_copy_job_wait(struct iris_vk_copy *copy, struct iris_vk_job *job,
+vpu_vk_copy_job_wait(struct vpu_vk_copy *copy, struct vpu_vk_job *job,
 			  uint64_t timeout_ns)
 {
 	(void)copy;
@@ -596,20 +596,20 @@ iris_vk_copy_job_wait(struct iris_vk_copy *copy, struct iris_vk_job *job,
 }
 
 void
-iris_vk_copy_job_release(struct iris_vk_job *job)
+vpu_vk_copy_job_release(struct vpu_vk_job *job)
 {
 	(void)job;
 }
 
 void
-iris_vk_copy_forget(struct iris_vk_copy *copy, uint64_t key)
+vpu_vk_copy_forget(struct vpu_vk_copy *copy, uint64_t key)
 {
 	(void)copy;
 	(void)key;
 }
 
 int
-iris_vk_copy_dmabuf(struct iris_vk_copy *copy,
+vpu_vk_copy_dmabuf(struct vpu_vk_copy *copy,
 			uint64_t src_key, int src_fd, size_t src_size,
 			uint64_t dst_key, int dst_fd, size_t dst_size,
 			size_t size)

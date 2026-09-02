@@ -268,8 +268,8 @@ int main(int argc, char **argv)
 
 	/* Optional: dump the assembled AU byte stream (Annex-B) for feeding
 	 * an independent decoder / engine test. */
-	if (getenv("IRIS_STRESS_DUMP")) {
-		FILE *d = fopen(getenv("IRIS_STRESS_DUMP"), "wb");
+	if (getenv("VPU_STRESS_DUMP")) {
+		FILE *d = fopen(getenv("VPU_STRESS_DUMP"), "wb");
 		int a, j;
 		static const uint8_t sc[4] = { 0, 0, 0, 1 };
 
@@ -302,7 +302,7 @@ int main(int argc, char **argv)
 	 * The driver must retain its conservative visibility wait for these
 	 * already-importable backings while leaving the default stress path
 	 * asynchronous. */
-	if (getenv("IRIS_STRESS_EXPORT")) {
+	if (getenv("VPU_STRESS_EXPORT")) {
 		for (i = 0; i < 16; i++) {
 			VADRMPRIMESurfaceDescriptor desc;
 

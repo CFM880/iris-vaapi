@@ -8,7 +8,7 @@
 ```text
 Chrome / FFmpeg
        ↓ VA-API
-iris-vaapi (iris_drv_video.so)
+vpu-vaapi (vpu_drv_video.so)
        ↓ stateful V4L2
 qcom-iris (/dev/video0)
        ↓
@@ -21,7 +21,7 @@ SM8150 Iris1 / Venus 固件
 - `/dev/video0` 是 `Iris Decoder`；
 - `/dev/dri/renderD128` 和 `/dev/dma_heap/system` 可访问；
 - `cached_capture` 与 `allow_fw_boot` 均为 `Y`；
-- `vainfo` 加载 `iris-vaapi 0.1.0`，列出 H.264、HEVC Main/Main10 和 VP9
+- `vainfo` 加载 `vpu-vaapi 0.2.0`，列出 H.264、HEVC Main/Main10 和 VP9
   Profile 0/Profile 2；
 - FFmpeg 或 Chrome 实际选择 VA-API，而不是软件解码器。
 
@@ -193,7 +193,7 @@ Streaming
 sudo dmesg | grep -iE 'iris|venus|firmware|video-codec'
 ```
 
-## 5. 构建并安装 iris-vaapi
+## 5. 构建并安装 vpu-vaapi
 
 安装依赖：
 
@@ -215,7 +215,7 @@ make check
 先从构建目录测试，不覆盖系统文件：
 
 ```sh
-LIBVA_DRIVER_NAME=iris \
+LIBVA_DRIVER_NAME=vpu \
 LIBVA_DRIVERS_PATH="$PWD/build" \
 vainfo --display drm --device /dev/dri/renderD128
 ```
@@ -223,7 +223,7 @@ vainfo --display drm --device /dev/dri/renderD128
 预期：
 
 ```text
-Driver version: iris-vaapi: Qualcomm Iris SM8150 (V4L2) 0.1.0
+Driver version: vpu-vaapi: Qualcomm Iris stateful V4L2 M2M (qcom-iris) 0.2.0
 VAProfileH264ConstrainedBaseline: VAEntrypointVLD
 VAProfileH264Main:                VAEntrypointVLD
 VAProfileH264High:                VAEntrypointVLD
@@ -241,7 +241,7 @@ sudo ./install-system.sh
 
 该脚本同时安装：
 
-- `iris_drv_video.so`；
+- `vpu_drv_video.so`；
 - `/dev/dma_heap/system` 的 udev 权限规则；
 - H.264/HEVC/VP9 的 `cached_capture` modprobe 配置。
 
@@ -254,7 +254,7 @@ sudo usermod -aG video,render "$USER"
 重新登录后确认不需要 `sudo` 即可访问三个节点，再运行：
 
 ```sh
-LIBVA_DRIVER_NAME=iris vainfo --display drm --device /dev/dri/renderD128
+LIBVA_DRIVER_NAME=vpu vainfo --display drm --device /dev/dri/renderD128
 ```
 
 ## 6. 分层验证解码
@@ -283,8 +283,8 @@ ffmpeg -i input.mp4 -map 0:v:0 -c:v copy -bsf:v h264_mp4toannexb test.h264
 FFmpeg 可以直接读取 MP4/MKV/WebM：
 
 ```sh
-IRIS_VAAPI_STATS=1 \
-LIBVA_DRIVER_NAME=iris \
+VPU_VAAPI_STATS=1 \
+LIBVA_DRIVER_NAME=vpu \
 ffmpeg -v verbose \
   -hwaccel vaapi \
   -vaapi_device /dev/dri/renderD128 \
@@ -305,15 +305,15 @@ LIBVA_DRIVERS_PATH="$PWD/build"
 先完全关闭所有 Chrome 窗口和后台进程，确保新 GPU 进程继承环境变量：
 
 ```sh
-export LIBVA_DRIVER_NAME=iris
+export LIBVA_DRIVER_NAME=vpu
 google-chrome --enable-features=VaapiVideoDecoder
 ```
 
 需要驱动日志时：
 
 ```sh
-IRIS_VAAPI_DEBUG=1 \
-LIBVA_DRIVER_NAME=iris \
+VPU_VAAPI_DEBUG=1 \
+LIBVA_DRIVER_NAME=vpu \
 google-chrome --enable-features=VaapiVideoDecoder \
   --enable-logging=stderr
 ```
@@ -325,18 +325,18 @@ google-chrome --enable-features=VaapiVideoDecoder \
 2. `chrome://gpu`：Video Acceleration 应列出 H.264/HEVC/VP9；
 3. 视频实际编码必须在支持范围内。AV1 会正常回退软件解码。
 
-默认不要设置 `IRIS_DIRECT_CAPTURE`。它仍是实验路径；正常发布配置使用稳定
+默认不要设置 `VPU_DIRECT_CAPTURE`。它仍是实验路径；正常发布配置使用稳定
 DMA-BUF surface 拷贝路径。
 
 ## 7. 常见问题
 
 ### `vainfo` 仍显示旧版本
 
-系统中仍是旧的 `iris_drv_video.so`，或 Chrome 没有重启：
+系统中仍是旧的 `vpu_drv_video.so`，或 Chrome 没有重启：
 
 ```sh
 pkg-config --variable=driverdir libva
-LIBVA_DRIVER_NAME=iris vainfo --display drm --device /dev/dri/renderD128
+LIBVA_DRIVER_NAME=vpu vainfo --display drm --device /dev/dri/renderD128
 ```
 
 重新执行 `make && sudo ./install-system.sh`，再完全退出并重启 Chrome。
@@ -344,7 +344,7 @@ LIBVA_DRIVER_NAME=iris vainfo --display drm --device /dev/dri/renderD128
 ### `vainfo` 找不到 iris 驱动
 
 ```sh
-find /usr/lib -name iris_drv_video.so -print
+find /usr/lib -name vpu_drv_video.so -print
 pkg-config --variable=driverdir libva
 ```
 

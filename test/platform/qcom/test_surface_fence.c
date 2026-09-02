@@ -9,7 +9,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include "iris_surface_fence.h"
+#include "platform/qcom/surface_fence.h"
 
 int main(int argc, char **argv)
 {

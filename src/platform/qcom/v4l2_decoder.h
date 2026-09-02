@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Minimal stateful V4L2 M2M decoder engine for the Qualcomm Iris device.
+/* Low-level stateful V4L2 M2M decoder transport.
  *
  * Feeds whole H.264/HEVC/VP9 access units to the OUTPUT (bitstream) queue and
  * returns decoded NV12 frames from the CAPTURE queue, including resolution
  * renegotiation on V4L2_EVENT_SOURCE_CHANGE.
  */
 
-#ifndef IRIS_VAAPI_V4L2_DEC_H
-#define IRIS_VAAPI_V4L2_DEC_H
+#ifndef IRIS_VAAPI_QCOM_V4L2_DECODER_H
+#define IRIS_VAAPI_QCOM_V4L2_DECODER_H
 
 #include <linux/videodev2.h>
 #include <poll.h>
@@ -58,6 +58,8 @@ struct v4l2_dec {
 /* Return non-zero when @dev advertises @pixelformat on its CAPTURE queue. */
 int v4l2_dec_supports_capture_format(const char *dev,
 				      unsigned int pixelformat);
+int v4l2_dec_supports_output_format(const char *dev,
+				     unsigned int pixelformat);
 
 /* Open /dev/video0 (or @dev) for decode of a @width x @height stream using
  * the given bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...) and

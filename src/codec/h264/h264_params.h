@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Re-serialize H.264 SPS/PPS NAL units from VAPictureParameterBufferH264 so a
- * whole-bitstream stateful decoder (iris) can be fed reconstructed access
+ * whole-bitstream stateful decoder can be fed reconstructed access
  * units. */
 
-#ifndef IRIS_VAAPI_H264_PARAMS_H
-#define IRIS_VAAPI_H264_PARAMS_H
+#ifndef VPU_VAAPI_H264_PARAMS_H
+#define VPU_VAAPI_H264_PARAMS_H
 
 #include <stdint.h>
 #include <va/va.h>

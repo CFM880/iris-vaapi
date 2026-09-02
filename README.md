@@ -1,10 +1,13 @@
-# iris-vaapi
+# vpu-vaapi
 
-面向 Qualcomm SM8150 Iris1 的实验性 VA-API 驱动。它把 Chrome、FFmpeg 等
-VA-API 客户端提交的参数和 slice 重组成完整访问单元，再交给 `qcom-iris`
-stateful V4L2 解码器。
+实验性、分层的 VA-API 解码驱动。它把 Chrome、FFmpeg 等 VA-API 客户端提交的
+参数和 slice 交给独立 codec adapter 重组成完整访问单元，再通过 platform 层
+交给硬件。
+当前 `qcom-iris` 平台面向 Qualcomm SM8150 Iris1 stateful V4L2 解码器；VA
+前端、codec adapter、调度/surface 和平台设备操作已解耦。后续既可以增加
+codec，也可以增加独立平台实现。
 
-当前版本：`0.1.0`。
+当前版本：`0.2.0`。
 
 > 项目仍处于实验阶段，目前只针对 Xiaomi Pad 5（`nabu`）及配套内核验证。
 
@@ -20,7 +23,7 @@ HEVC Main10 与 VP9 Profile 2 已分别通过三轮 4K P010 完整码流测试�
 成功输出且没有 corrupt frame，因此按 VA-API 解码能力计为已支持。H.264、HEVC
 与 VP9 支持 Chrome 所需的稳定 DMA-BUF surface、异步 fence、解码顺序输出和
 片尾帧释放。实验性的 V4L2 CAPTURE 直连可通过
-`IRIS_DIRECT_CAPTURE=1` 启用，默认仍使用已充分验证的稳定 surface 拷贝路径。
+`VPU_DIRECT_CAPTURE=1` 启用，默认仍使用已充分验证的稳定 surface 拷贝路径。
 
 ## 依赖
 
@@ -51,8 +54,18 @@ options qcom_iris cached_capture=1
 git clone https://github.com/CFM880/iris-vaapi.git
 cd iris-vaapi
 make -j"$(nproc)"
-LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" vainfo
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 ```
+
+默认选择 `qcom-iris` 平台和 `/dev/video0`。多 VPU 系统或调试时可以显式选择：
+
+```sh
+VPU_PLATFORM=qcom-iris VPU_DEVICE=/dev/video1 \
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
+```
+
+分层结构、platform 契约和新增平台步骤见
+[`docs/architecture.md`](docs/architecture.md)。
 
 预期能看到 H.264、HEVC Main/Main10 和 VP9 Profile 0/Profile 2 的
 `VAEntrypointVLD`。
@@ -64,17 +77,17 @@ LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 无需安装即可让 FFmpeg 使用当前构建：
 
 ```sh
-LIBVA_DRIVER_NAME=iris LIBVA_DRIVERS_PATH="$PWD/build" \
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" \
 ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 \
   -i /path/to/video.mp4 -an -f null -
 ```
 
 H.264 对未导出的 VA surface 使用异步提交以保持硬件解码流水线；已经通过
 DRM PRIME 导出的 surface 继续在 `vaEndPicture` 做兼容性等待，避免旧 Adreno
-显示上一帧。诊断时可设置 `IRIS_H264_SYNC_END=1`，恢复所有 H.264 surface 的
+显示上一帧。诊断时可设置 `VPU_H264_SYNC_END=1`，恢复所有 H.264 surface 的
 逐帧同步行为。
 
-设置 `IRIS_VULKAN_COPY=1` 可启用实验性的 Turnip DMA-BUF copy engine：V4L2
+设置 `VPU_VULKAN_COPY=1` 可启用实验性的 Turnip DMA-BUF copy engine：V4L2
 CAPTURE buffer 通过 `VIDIOC_EXPBUF` 导出，Vulkan 异步复制到 Chrome 已导入的
 稳定 surface，GPU 完成后才 signal surface fence 并回收 CAPTURE buffer。Vulkan
 不可用或提交失败时会自动回退 CPU `memcpy`。当前仍默认使用 CPU 路径，先完成
@@ -95,7 +108,7 @@ sudo ./install-system.sh
 
 ```sh
 cat /sys/module/qcom_iris/parameters/cached_capture
-LIBVA_DRIVER_NAME=iris vainfo
+LIBVA_DRIVER_NAME=vpu vainfo
 ```
 
 ## Chrome
@@ -103,7 +116,7 @@ LIBVA_DRIVER_NAME=iris vainfo
 确保浏览器 GPU 进程继承驱动选择：
 
 ```sh
-export LIBVA_DRIVER_NAME=iris
+export LIBVA_DRIVER_NAME=vpu
 google-chrome --enable-features=VaapiVideoDecoder
 ```
 
@@ -111,7 +124,7 @@ google-chrome --enable-features=VaapiVideoDecoder
 检查 Video Acceleration。Chrome 版本和发行版启动参数可能不同；驱动侧跟踪可用：
 
 ```sh
-IRIS_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
+VPU_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
 ```
 
 ## 测试
@@ -184,8 +197,8 @@ Turnip 路径令 RSS 约增加 64 MiB；限定 Freedreno ICD 后本机增量约�
   V4L2 测试程序不受此限制；
 - 默认 stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
   `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；可用
-  `IRIS_VULKAN_COPY=1` 改为实验性的异步 GPU 复制，但会增加 Turnip 内存开销；
-- `IRIS_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
+  `VPU_VULKAN_COPY=1` 改为实验性的异步 GPU 复制，但会增加 Turnip 内存开销；
+- `VPU_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
 - 非正常终止旧内核会话可能使固件超时，需要重载 `qcom_iris`；
 - 需要与本仓库功能匹配的 `nabu-iris` 内核模块，单独替换用户态驱动不够。
 

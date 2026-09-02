@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* End-to-end VP9 decode test through the iris-vaapi driver.
+/* End-to-end VP9 decode test through the vpu-vaapi driver.
  * Feeds frames of an IVF file (each frame is one VASliceDataBufferType),
  * then syncs a frame and exports it.
  */

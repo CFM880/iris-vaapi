@@ -7,7 +7,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "v4l2_dec.h"
+#include "platform/qcom/v4l2_decoder.h"
 
 struct au { const unsigned char *data; size_t len; };
 

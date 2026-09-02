@@ -71,14 +71,14 @@ def ffmpeg_command(sample: Sample, build_dir: Path) -> tuple[list[str], dict[str
     if sample.decoder == "v4l2":
         command += ["-c:v", f"{sample.codec}_v4l2m2m"]
     else:
-        environment.pop("IRIS_VULKAN_COPY", None)
+        environment.pop("VPU_VULKAN_COPY", None)
         environment.update(
-            LIBVA_DRIVER_NAME="iris",
+            LIBVA_DRIVER_NAME="vpu",
             LIBVA_DRIVERS_PATH=str(build_dir.resolve()),
         )
         if sample.decoder == "vaapi-vulkan":
             environment.update(
-                IRIS_VULKAN_COPY="1",
+                VPU_VULKAN_COPY="1",
                 VK_DRIVER_FILES="/usr/share/vulkan/icd.d/freedreno_icd.json",
             )
         command += [
@@ -159,7 +159,7 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cooldown", type=float, default=1.0)
     parser.add_argument("--include-vulkan-copy", action="store_true",
-                        help="also benchmark VA-API with IRIS_VULKAN_COPY=1")
+                        help="also benchmark VA-API with VPU_VULKAN_COPY=1")
     parser.add_argument("--warmup", action="store_true",
                         help="run every path once without recording it")
     args = parser.parse_args()

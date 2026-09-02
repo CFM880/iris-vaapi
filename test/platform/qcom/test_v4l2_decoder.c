@@ -9,7 +9,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "v4l2_dec.h"
+#include "platform/qcom/v4l2_decoder.h"
 
 /* ---- Annex-B parsing helpers ---- */
 
