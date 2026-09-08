@@ -6,6 +6,18 @@ descriptive CSV file. Run timestamps remain inside the CSV/report metadata.
 
 Tracked files:
 
+- `fluster-extended.md`, `fluster-extended.json`,
+  `fluster-extended-metadata.json`, `extended-4k.json`: seven additional
+  conformance vectors and first-120-frame comparisons for five 4K clips,
+  including unresolved mismatches and out-of-range dimensions.
+- `fluster-driver-vaapi.md`, `fluster-driver-vaapi.json`,
+  `fluster-driver-vaapi-metadata.json`: regression after kernel and VA-API
+  fixes; software 5/5, both hardware paths 4/5, with the original unsupported
+  160x90 VP9 vector retained as failed.
+- `fluster-baseline.md`, `fluster-baseline.json`, `fluster-baseline-metadata.json`:
+  pinned Fluster smoke baseline comparing software, V4L2 M2M and VA-API,
+  including failures and reproducibility metadata. See `../docs/fluster.md`.
+- `fluster-smoke.md`, `fluster-smoke.json`: earlier software/VA-API pilot.
 - `h264-hevc8-v4l2-vaapi.csv`: H.264 High and HEVC Main 8-bit raw runs.
 - `vp9-profile0-v4l2-vaapi.csv`: VP9 Profile 0 raw runs.
 - `p010-v4l2-vaapi.csv`: HEVC Main10 and VP9 Profile 2 P010 raw runs.

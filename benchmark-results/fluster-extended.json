@@ -1,0 +1,360 @@
+{
+  "system_info": {
+    "os": "Linux 6.14.11-nabu-audio1",
+    "cpu": "Qualcomm Kryo 4XX Silver x4, Qualcomm Kryo 4XX Gold x4",
+    "gpu": [
+      "Unknown GPU"
+    ],
+    "ram": "11.1 GB",
+    "backends": {
+      "VA-API": "vpu-vaapi: Qualcomm Iris stateful V4L2 M2M (qcom-iris) 0.2.0 (runtime 1.23)",
+      "V4L2 M2M": "Iris Decoder (/dev/video0)"
+    }
+  },
+  "test_suites": {
+    "JVT-AVC_V1": {
+      "decoders": {
+        "FFmpeg-H.264": {
+          "decoder_name": "FFmpeg-H.264",
+          "total_tests": 2,
+          "passed": 2,
+          "failed_error": 0,
+          "total_time": 0.44,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 2,
+              "total": 2
+            }
+          },
+          "vectors": {
+            "cabac_mot_frm0_full": {
+              "result": "Success",
+              "time": 0.203,
+              "profile": "MAIN"
+            },
+            "HCMP1_HHI_A": {
+              "result": "Success",
+              "time": 0.184,
+              "profile": "MAIN"
+            }
+          }
+        },
+        "FFmpeg-H.264-VAAPI": {
+          "decoder_name": "FFmpeg-H.264-VAAPI",
+          "total_tests": 2,
+          "passed": 2,
+          "failed_error": 0,
+          "total_time": 0.438,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 2,
+              "total": 2
+            }
+          },
+          "vectors": {
+            "cabac_mot_frm0_full": {
+              "result": "Success",
+              "time": 0.2,
+              "profile": "MAIN"
+            },
+            "HCMP1_HHI_A": {
+              "result": "Success",
+              "time": 0.22,
+              "profile": "MAIN"
+            }
+          }
+        },
+        "FFmpeg-H.264-v4l2m2m": {
+          "decoder_name": "FFmpeg-H.264-v4l2m2m",
+          "total_tests": 2,
+          "passed": 2,
+          "failed_error": 0,
+          "total_time": 0.386,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 2,
+              "total": 2
+            }
+          },
+          "vectors": {
+            "cabac_mot_frm0_full": {
+              "result": "Success",
+              "time": 0.2,
+              "profile": "MAIN"
+            },
+            "HCMP1_HHI_A": {
+              "result": "Success",
+              "time": 0.172,
+              "profile": "MAIN"
+            }
+          }
+        }
+      }
+    },
+    "JCT-VC-HEVC_V1": {
+      "decoders": {
+        "FFmpeg-H.265": {
+          "decoder_name": "FFmpeg-H.265",
+          "total_tests": 3,
+          "passed": 3,
+          "failed_error": 0,
+          "total_time": 1.994,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 2,
+              "total": 2
+            },
+            "MAIN_10": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "TILES_A_Cisco_2": {
+              "result": "Success",
+              "time": 0.937,
+              "profile": "MAIN"
+            },
+            "WPP_A_ericsson_MAIN10_2": {
+              "result": "Success",
+              "time": 0.117,
+              "profile": "MAIN_10"
+            },
+            "PICSIZE_A_Bossen_1": {
+              "result": "Success",
+              "time": 0.903,
+              "profile": "MAIN"
+            }
+          }
+        },
+        "FFmpeg-H.265-VAAPI": {
+          "decoder_name": "FFmpeg-H.265-VAAPI",
+          "total_tests": 3,
+          "passed": 2,
+          "failed_error": 1,
+          "total_time": 1.909,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 1,
+              "total": 2
+            },
+            "MAIN_10": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "TILES_A_Cisco_2": {
+              "result": "Success",
+              "time": 0.862,
+              "profile": "MAIN"
+            },
+            "WPP_A_ericsson_MAIN10_2": {
+              "result": "Success",
+              "time": 0.133,
+              "profile": "MAIN_10"
+            },
+            "PICSIZE_A_Bossen_1": {
+              "result": "Error",
+              "time": 0.877,
+              "profile": "MAIN"
+            }
+          }
+        },
+        "FFmpeg-H.265-v4l2m2m": {
+          "decoder_name": "FFmpeg-H.265-v4l2m2m",
+          "total_tests": 3,
+          "passed": 2,
+          "failed_error": 1,
+          "total_time": 1.213,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 1,
+              "total": 2
+            },
+            "MAIN_10": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "TILES_A_Cisco_2": {
+              "result": "Success",
+              "time": 0.823,
+              "profile": "MAIN"
+            },
+            "WPP_A_ericsson_MAIN10_2": {
+              "result": "Success",
+              "time": 0.129,
+              "profile": "MAIN_10"
+            },
+            "PICSIZE_A_Bossen_1": {
+              "result": "Fail",
+              "time": 0.229,
+              "profile": "MAIN"
+            }
+          }
+        }
+      }
+    },
+    "VP9-TEST-VECTORS": {
+      "decoders": {
+        "FFmpeg-VP9": {
+          "decoder_name": "FFmpeg-VP9",
+          "total_tests": 2,
+          "passed": 1,
+          "failed_error": 1,
+          "total_time": 3.409,
+          "vectors": {
+            "vp90-2-02-size-lf-1920x1080.webm": {
+              "result": "Success",
+              "time": 3.172
+            },
+            "vp90-2-21-resize_inter_1280x720_5_1-2.webm": {
+              "result": "Fail",
+              "time": 0.201
+            }
+          }
+        },
+        "FFmpeg-VP9-VAAPI": {
+          "decoder_name": "FFmpeg-VP9-VAAPI",
+          "total_tests": 2,
+          "passed": 1,
+          "failed_error": 1,
+          "total_time": 5.202,
+          "vectors": {
+            "vp90-2-02-size-lf-1920x1080.webm": {
+              "result": "Success",
+              "time": 1.741
+            },
+            "vp90-2-21-resize_inter_1280x720_5_1-2.webm": {
+              "result": "Fail",
+              "time": 3.427
+            }
+          }
+        },
+        "FFmpeg-VP9-v4l2m2m": {
+          "decoder_name": "FFmpeg-VP9-v4l2m2m",
+          "total_tests": 2,
+          "passed": 1,
+          "failed_error": 1,
+          "total_time": 1.888,
+          "vectors": {
+            "vp90-2-02-size-lf-1920x1080.webm": {
+              "result": "Success",
+              "time": 1.59
+            },
+            "vp90-2-21-resize_inter_1280x720_5_1-2.webm": {
+              "result": "Fail",
+              "time": 0.261
+            }
+          }
+        }
+      }
+    }
+  },
+  "global_summary": {
+    "FFmpeg-H.264": {
+      "total_tests": 2,
+      "passed": 2,
+      "failed_error": 0,
+      "total_time": 0.44,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 2,
+          "total": 2
+        }
+      }
+    },
+    "FFmpeg-H.264-VAAPI": {
+      "total_tests": 2,
+      "passed": 2,
+      "failed_error": 0,
+      "total_time": 0.438,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 2,
+          "total": 2
+        }
+      }
+    },
+    "FFmpeg-H.264-v4l2m2m": {
+      "total_tests": 2,
+      "passed": 2,
+      "failed_error": 0,
+      "total_time": 0.386,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 2,
+          "total": 2
+        }
+      }
+    },
+    "FFmpeg-H.265": {
+      "total_tests": 3,
+      "passed": 3,
+      "failed_error": 0,
+      "total_time": 1.994,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 2,
+          "total": 2
+        },
+        "MAIN_10": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-H.265-VAAPI": {
+      "total_tests": 3,
+      "passed": 2,
+      "failed_error": 1,
+      "total_time": 1.909,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 1,
+          "total": 2
+        },
+        "MAIN_10": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-H.265-v4l2m2m": {
+      "total_tests": 3,
+      "passed": 2,
+      "failed_error": 1,
+      "total_time": 1.213,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 1,
+          "total": 2
+        },
+        "MAIN_10": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-VP9": {
+      "total_tests": 2,
+      "passed": 1,
+      "failed_error": 1,
+      "total_time": 3.409
+    },
+    "FFmpeg-VP9-VAAPI": {
+      "total_tests": 2,
+      "passed": 1,
+      "failed_error": 1,
+      "total_time": 5.202
+    },
+    "FFmpeg-VP9-v4l2m2m": {
+      "total_tests": 2,
+      "passed": 1,
+      "failed_error": 1,
+      "total_time": 1.888
+    }
+  }
+}

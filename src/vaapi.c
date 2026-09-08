@@ -74,6 +74,7 @@ struct vpu_config {
 struct vpu_engine {
 	VAContextID ctx_id;
 	struct vpu_decode_ctx *dec;
+	VASurfaceID target;
 };
 
 struct vpu_drv_data {
@@ -95,6 +96,8 @@ struct vpu_drv_data {
 	 * never share firmware DPB/queue state. */
 	struct vpu_engine engines[VPU_MAX_ENGINES];
 	int n_engines;
+	struct vpu_decode_ctx *retired_vp9[VPU_MAX_ENGINES];
+	int n_retired_vp9;
 	int n_bufs;
 	unsigned int buf_ids[256];
 	VABufferType buf_types[256];
@@ -236,6 +239,8 @@ vpu_vaTerminate(VADriverContextP ctx)
 		for (i = 0; i < dd->n_engines; i++)
 			vpu_decode_destroy(dd->engines[i].dec);
 		dd->n_engines = 0;
+		for (i = 0; i < dd->n_retired_vp9; i++)
+			vpu_decode_destroy(dd->retired_vp9[i]);
 		vpu_surfaces_destroy(dd->surfs);
 		dd->surfs = NULL;
 		vpu_platform_destroy(dd->platform);
@@ -473,12 +478,9 @@ vpu_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_widt
 	if (dd->n_engines >= VPU_MAX_ENGINES)
 		return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 
-	/* One fresh engine (V4L2 session) per context: Chrome recreates the
-	 * context for every stream and on resolution changes.  Reusing a
-	 * session across streams leaks firmware DPB state and queued buffers,
-	 * and a codec switch would feed the wrong pixfmt into a live OUTPUT
-	 * queue; either way decoding breaks and Chrome falls back to
-	 * software. */
+	/* Begin with a fresh engine. VP9 RenderPicture may later establish an
+	 * explicit dependency on a retired engine through reference surfaces.
+	 */
 	eng = vpu_decode_create(dd->platform);
 	if (!eng)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -498,6 +500,7 @@ vpu_vaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_widt
 	dd->height = picture_height;
 	dd->engines[dd->n_engines].ctx_id = ++dd->context_id;
 	dd->engines[dd->n_engines].dec = eng;
+	dd->engines[dd->n_engines].target = VA_INVALID_SURFACE;
 	dd->n_engines++;
 	*context_id = dd->context_id;
 	return VA_STATUS_SUCCESS;
@@ -514,10 +517,15 @@ vpu_vaDestroyContext(VADriverContextP ctx, VAContextID context_id)
 	for (i = 0; i < dd->n_engines; i++) {
 		if (dd->engines[i].ctx_id != context_id)
 			continue;
-		/* Clean teardown between streams; sessions killed mid-flight
-		 * are what wedges the firmware (SESSION_INIT timeouts until
-		 * rmmod). */
-		vpu_decode_destroy(dd->engines[i].dec);
+		/* VP9 inter-resolution changes can reference surviving surfaces.
+		 * Keep a bounded set of their engines until the references disappear
+		 * or a new context explicitly takes ownership.
+		 */
+		if (dd->n_retired_vp9 < VPU_MAX_ENGINES &&
+		    vpu_decode_retain_vp9(dd->engines[i].dec))
+			dd->retired_vp9[dd->n_retired_vp9++] = dd->engines[i].dec;
+		else
+			vpu_decode_destroy(dd->engines[i].dec);
 		dd->engines[i] = dd->engines[dd->n_engines - 1];
 		dd->n_engines--;
 		return VA_STATUS_SUCCESS;
@@ -627,6 +635,14 @@ vpu_vaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 			dd->derived_n--;
 		}
 		vpu_surfaces_free(dd->surfs, surface_list[i]);
+	}
+	for (i = 0; i < dd->n_retired_vp9;) {
+		if (vpu_decode_retain_vp9(dd->retired_vp9[i])) {
+			i++;
+			continue;
+		}
+		vpu_decode_destroy(dd->retired_vp9[i]);
+		dd->retired_vp9[i] = dd->retired_vp9[--dd->n_retired_vp9];
 	}
 	return VA_STATUS_SUCCESS;
 }
@@ -766,6 +782,7 @@ vpu_vaBeginPicture(VADriverContextP ctx, VAContextID context_id,
 	eng = vpu_context_engine(dd, context_id);
 	if (!eng)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	vpu_context(dd, context_id)->target = render_target;
 	return vpu_decode_begin(eng, render_target) ?
 		VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
@@ -792,6 +809,26 @@ vpu_vaRenderPicture(VADriverContextP ctx, VAContextID context_id,
 
 		if (idx < 0)
 			return VA_STATUS_ERROR_INVALID_BUFFER;
+		if (dd->buf_types[idx] == VAPictureParameterBufferType &&
+		    dd->buf_sizes[idx] == sizeof(VADecPictureParameterBufferVP9)) {
+			struct vpu_decode_ctx *old = vpu_decode_vp9_predecessor(
+				eng, dd->buf_data[idx]);
+
+			for (int j = 0; old && j < dd->n_retired_vp9; j++) {
+				if (dd->retired_vp9[j] != old)
+					continue;
+				/* Only explicit references to a retired context permit
+				 * continuation. Active contexts never share sessions.
+				 */
+				vpu_decode_destroy(eng);
+				engine->dec = eng = old;
+				dd->retired_vp9[j] = dd->retired_vp9[--dd->n_retired_vp9];
+				if (vpu_decode_begin(eng, engine->target))
+					return VA_STATUS_ERROR_OPERATION_FAILED;
+				DBG("[vp9] resumed reference owner for context %u\n", context_id);
+				break;
+			}
+		}
 		ret = vpu_decode_render(eng, dd->buf_types[idx],
 			dd->buf_data[idx], dd->buf_sizes[idx],
 			dd->buf_num_elements[idx]);

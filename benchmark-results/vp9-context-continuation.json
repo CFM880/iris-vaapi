@@ -1,0 +1,41 @@
+{
+  "command": [
+    "/home/cfm880/.local/opt/ffmpeg-iris-8.0.1/bin/ffmpeg",
+    "-nostdin",
+    "-v",
+    "info",
+    "-hwaccel",
+    "vaapi",
+    "-threads",
+    "1",
+    "-i",
+    "benchmark-results/logs/fluster/resources/VP9-TEST-VECTORS/vp90-2-21-resize_inter_1280x720_5_1-2.webm/vp90-2-21-resize_inter_1280x720_5_1-2.webm",
+    "-fps_mode",
+    "passthrough",
+    "-vf",
+    "format=yuv420p",
+    "-noautoscale",
+    "-f",
+    "md5",
+    "-"
+  ],
+  "results": [
+    {
+      "iteration": 0,
+      "returncode": 0,
+      "matches_upstream": true
+    },
+    {
+      "iteration": 1,
+      "returncode": 0,
+      "matches_upstream": true
+    },
+    {
+      "iteration": 2,
+      "returncode": 0,
+      "matches_upstream": true
+    }
+  ],
+  "vaapi_sha256": "4617d2e6434d5cb59eb195eae136b8746fe64c650b41bfd3daa321dc7b609fcc",
+  "kernel_sha256": "23856cfc4daac457c3c24255b4d480c8529eaeca167ab350bb1bd84085f52d72"
+}

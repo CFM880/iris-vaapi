@@ -1,0 +1,252 @@
+{
+  "system_info": {
+    "os": "Linux 6.14.11-nabu-audio1",
+    "cpu": "Qualcomm Kryo 4XX Silver x4, Qualcomm Kryo 4XX Gold x4",
+    "gpu": [
+      "Unknown GPU"
+    ],
+    "ram": "11.1 GB",
+    "backends": {
+      "VA-API": "vpu-vaapi: Qualcomm Iris stateful V4L2 M2M (qcom-iris) 0.2.0 (runtime 1.23)",
+      "V4L2 M2M": "Iris Decoder (/dev/video0)"
+    }
+  },
+  "test_suites": {
+    "JVT-AVC_V1": {
+      "decoders": {
+        "FFmpeg-H.264": {
+          "decoder_name": "FFmpeg-H.264",
+          "total_tests": 1,
+          "passed": 1,
+          "failed_error": 0,
+          "total_time": 0.153,
+          "profile_stats": {
+            "CONSTRAINED_BASELINE": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "AUD_MW_E": {
+              "result": "Success",
+              "time": 0.127,
+              "profile": "CONSTRAINED_BASELINE"
+            }
+          }
+        },
+        "FFmpeg-H.264-VAAPI": {
+          "decoder_name": "FFmpeg-H.264-VAAPI",
+          "total_tests": 1,
+          "passed": 0,
+          "failed_error": 1,
+          "total_time": 0.052,
+          "profile_stats": {
+            "CONSTRAINED_BASELINE": {
+              "passed": 0,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "AUD_MW_E": {
+              "result": "Timeout",
+              "time": 30.02,
+              "profile": "CONSTRAINED_BASELINE"
+            }
+          }
+        }
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH": {
+      "decoders": {
+        "FFmpeg-VP9": {
+          "decoder_name": "FFmpeg-VP9",
+          "total_tests": 1,
+          "passed": 1,
+          "failed_error": 0,
+          "total_time": 0.124,
+          "vectors": {
+            "vp92-2-20-10bit-yuv420.webm": {
+              "result": "Success",
+              "time": 0.108
+            }
+          }
+        },
+        "FFmpeg-VP9-VAAPI": {
+          "decoder_name": "FFmpeg-VP9-VAAPI",
+          "total_tests": 1,
+          "passed": 0,
+          "failed_error": 1,
+          "total_time": 0.135,
+          "vectors": {
+            "vp92-2-20-10bit-yuv420.webm": {
+              "result": "Error",
+              "time": 0.106
+            }
+          }
+        }
+      }
+    },
+    "JCT-VC-HEVC_V1": {
+      "decoders": {
+        "FFmpeg-H.265": {
+          "decoder_name": "FFmpeg-H.265",
+          "total_tests": 2,
+          "passed": 2,
+          "failed_error": 0,
+          "total_time": 0.777,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 1,
+              "total": 1
+            },
+            "MAIN_10": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "AMP_A_Samsung_7": {
+              "result": "Success",
+              "time": 0.619,
+              "profile": "MAIN"
+            },
+            "DBLK_A_MAIN10_VIXS_4": {
+              "result": "Success",
+              "time": 0.104,
+              "profile": "MAIN_10"
+            }
+          }
+        },
+        "FFmpeg-H.265-VAAPI": {
+          "decoder_name": "FFmpeg-H.265-VAAPI",
+          "total_tests": 2,
+          "passed": 1,
+          "failed_error": 1,
+          "total_time": 0.596,
+          "profile_stats": {
+            "MAIN": {
+              "passed": 0,
+              "total": 1
+            },
+            "MAIN_10": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "vectors": {
+            "AMP_A_Samsung_7": {
+              "result": "Error",
+              "time": 0.426,
+              "profile": "MAIN"
+            },
+            "DBLK_A_MAIN10_VIXS_4": {
+              "result": "Success",
+              "time": 0.128,
+              "profile": "MAIN_10"
+            }
+          }
+        }
+      }
+    },
+    "VP9-TEST-VECTORS": {
+      "decoders": {
+        "FFmpeg-VP9": {
+          "decoder_name": "FFmpeg-VP9",
+          "total_tests": 1,
+          "passed": 1,
+          "failed_error": 0,
+          "total_time": 0.158,
+          "vectors": {
+            "vp90-2-00-quantizer-00.webm": {
+              "result": "Success",
+              "time": 0.145
+            }
+          }
+        },
+        "FFmpeg-VP9-VAAPI": {
+          "decoder_name": "FFmpeg-VP9-VAAPI",
+          "total_tests": 1,
+          "passed": 1,
+          "failed_error": 0,
+          "total_time": 0.225,
+          "vectors": {
+            "vp90-2-00-quantizer-00.webm": {
+              "result": "Success",
+              "time": 0.197
+            }
+          }
+        }
+      }
+    }
+  },
+  "global_summary": {
+    "FFmpeg-H.264": {
+      "total_tests": 1,
+      "passed": 1,
+      "failed_error": 0,
+      "total_time": 0.153,
+      "profile_stats": {
+        "CONSTRAINED_BASELINE": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-H.264-VAAPI": {
+      "total_tests": 1,
+      "passed": 0,
+      "failed_error": 1,
+      "total_time": 0.052,
+      "profile_stats": {
+        "CONSTRAINED_BASELINE": {
+          "passed": 0,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-VP9": {
+      "total_tests": 2,
+      "passed": 2,
+      "failed_error": 0,
+      "total_time": 0.282
+    },
+    "FFmpeg-VP9-VAAPI": {
+      "total_tests": 2,
+      "passed": 1,
+      "failed_error": 1,
+      "total_time": 0.36
+    },
+    "FFmpeg-H.265": {
+      "total_tests": 2,
+      "passed": 2,
+      "failed_error": 0,
+      "total_time": 0.777,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 1,
+          "total": 1
+        },
+        "MAIN_10": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    },
+    "FFmpeg-H.265-VAAPI": {
+      "total_tests": 2,
+      "passed": 1,
+      "failed_error": 1,
+      "total_time": 0.596,
+      "profile_stats": {
+        "MAIN": {
+          "passed": 0,
+          "total": 1
+        },
+        "MAIN_10": {
+          "passed": 1,
+          "total": 1
+        }
+      }
+    }
+  }
+}

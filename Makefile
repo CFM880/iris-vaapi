@@ -1,4 +1,5 @@
 CC ?= gcc
+.DEFAULT_GOAL := all
 CFLAGS ?= -O2
 # VA driver callbacks intentionally leave some ABI parameters unused.
 CFLAGS += -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden
@@ -39,7 +40,17 @@ TEST_SURFACE_FENCE = $(BUILD)/test_surface_fence
 TEST_PLATFORM = $(BUILD)/test_platform
 TEST_CODEC = $(BUILD)/test_codec
 
-.PHONY: all check clean install uninstall
+.PHONY: all check check-fluster check-fluster-full clean install uninstall
+
+PYTHON ?= python3
+FLUSTER_ARGS ?=
+
+# Hardware conformance is opt-in; ordinary check remains hardware-independent.
+check-fluster: $(DRIVER)
+	$(PYTHON) benchmarks/run_fluster.py $(FLUSTER_ARGS)
+
+check-fluster-full: $(DRIVER)
+	$(PYTHON) benchmarks/run_fluster.py --suite full $(FLUSTER_ARGS)
 
 DRIVERDIR ?= $(shell pkg-config --variable=driverdir libva 2>/dev/null)
 DESTDIR ?=
@@ -157,12 +168,17 @@ $(TEST_CODEC): test/codec/test_codec.c $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(H
 clean:
 	rm -rf $(BUILD)
 
-check: $(TEST_H264) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) $(TEST_PLATFORM) $(TEST_CODEC)
+$(BUILD)/test_vp9_continuation: test/test_vp9_continuation.c src/decode.c src/decode.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $< $(LDLIBS)
+
+check: $(TEST_H264) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) $(TEST_PLATFORM) $(TEST_CODEC) $(BUILD)/test_vp9_continuation
 	./$(TEST_H264)
 	./$(TEST_HEVC_PARAMS)
 	./$(TEST_HEVC_REWRITE)
 	./$(TEST_PLATFORM)
 	./$(TEST_CODEC)
+	./$(BUILD)/test_vp9_continuation
 
 install: $(DRIVER)
 	test -n "$(DRIVERDIR)"

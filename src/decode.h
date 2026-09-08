@@ -7,8 +7,8 @@
  * - Surfaces live in a display-level registry (vpu_surfaces) and may outlive
  *   the decode context that produced them.
  * - Each VA context owns its own vpu_decode_ctx (its own VPU session), so
- *   concurrent videos do not share engine state and switching codec or
- *   resolution always starts from a clean firmware session.
+ *   concurrent videos do not share engine state. A resized VP9 context may
+ *   inherit a retired session only through explicit reference surfaces.
  */
 
 #ifndef VPU_VAAPI_DECODE_H
@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <va/va.h>
+#include <va/va_dec_vp9.h>
 
 struct vpu_decode_ctx;
 struct vpu_surfaces;
@@ -56,6 +57,9 @@ int vpu_surfaces_peek_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
 /* ---- Per-context decode engines ---- */
 struct vpu_decode_ctx *vpu_decode_create(const struct vpu_platform *platform);
 void vpu_decode_destroy(struct vpu_decode_ctx *ctx);
+int vpu_decode_retain_vp9(struct vpu_decode_ctx *ctx);
+struct vpu_decode_ctx *vpu_decode_vp9_predecessor(
+	struct vpu_decode_ctx *ctx, const VADecPictureParameterBufferVP9 *pic);
 
 int vpu_decode_setup(struct vpu_decode_ctx *ctx, unsigned int width,
 		      unsigned int height, VAProfile profile);

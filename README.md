@@ -132,6 +132,19 @@ VPU_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
 
 ## 测试
 
+使用 [Fluster](https://github.com/fluendo/fluster) 作为标准码流测试基准，统一比较
+FFmpeg 软件、V4L2 M2M 与 VA-API 三条路径的输出 MD5 和端到端耗时。
+固定上游版本，自动下载测试资源，保存每次运行的日志和环境元数据：
+
+```sh
+make check-fluster       # 五个向量、三条路径，串行冒烟测试
+make check-fluster-full  # 四套完整上游测试集
+```
+
+使用方法与性能统计边界见 [Fluster 测试指南](docs/fluster.md)，
+三路径实测结果见 [Fluster 测试报告](benchmark-results/fluster-baseline.md)。
+目前仍存在超时和解码错误，之前的完整码流/吞吐验证不代表标准符合性测试通过。
+
 纯参数重建测试不需要硬件：
 
 ```sh
