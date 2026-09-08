@@ -9,6 +9,8 @@ struct vpu_platform_ops {
 	const char *name;
 	const char *description;
 	const char *default_device;
+	/* Return an allocated device path, or NULL if no decoder is available. */
+	char *(*discover_device)(void);
 	uint32_t quirks;
 
 	int (*supports)(const char *device, enum vpu_codec_id codec,

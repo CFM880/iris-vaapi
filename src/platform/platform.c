@@ -39,20 +39,35 @@ static struct vpu_platform *create_platform(const struct vpu_platform_ops *ops,
 					  const char *device)
 {
 	struct vpu_platform *platform;
+	char *discovered = NULL;
+
+	if (!device || !*device) {
+		if (ops->discover_device) {
+			discovered = ops->discover_device();
+			if (!discovered)
+				return NULL;
+			device = discovered;
+		} else {
+			device = ops->default_device;
+		}
+	}
 
 	platform = calloc(1, sizeof(*platform));
-	if (!platform)
+	if (!platform) {
+		free(discovered);
 		return NULL;
+	}
 	platform->device = strdup(device);
+	free(discovered);
 	if (!platform->device) {
 		free(platform);
 		return NULL;
 	}
 	platform->ops = ops;
 	for (int codec = VPU_CODEC_H264; codec <= VPU_CODEC_VP9; codec++) {
-		platform->support[codec][0] = ops->supports(device, codec,
+		platform->support[codec][0] = ops->supports(platform->device, codec,
 			VPU_PIXEL_FORMAT_NV12) != 0;
-		platform->support[codec][1] = ops->supports(device, codec,
+		platform->support[codec][1] = ops->supports(platform->device, codec,
 			VPU_PIXEL_FORMAT_P010) != 0;
 	}
 	return platform;
@@ -86,15 +101,13 @@ struct vpu_platform *vpu_platform_create(const char *name, const char *device)
 				name);
 			return NULL;
 		}
-		return create_platform(ops, device && *device ? device :
-				      ops->default_device);
+		return create_platform(ops, device);
 	}
 
 	/* Auto-selection probes in registration order.  Retain the first platform
 	 * as a diagnostic fallback when no device is currently available. */
 	for (i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++) {
-		struct vpu_platform *candidate = create_platform(platforms[i],
-			device && *device ? device : platforms[i]->default_device);
+		struct vpu_platform *candidate = create_platform(platforms[i], device);
 
 		if (!candidate)
 			continue;

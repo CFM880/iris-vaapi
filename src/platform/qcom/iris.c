@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <linux/videodev2.h>
 
@@ -27,6 +33,67 @@ static int qcom_iris_supports(const char *device, enum vpu_codec_id codec,
 	return v4l2_dec_supports_output_format(device,
 					       v4l2_codec_format(codec)) &&
 	       v4l2_dec_supports_capture_format(device, (unsigned int)format);
+}
+
+static char *qcom_iris_discover_device(void)
+{
+	glob_t devices = {0};
+	char *device = NULL;
+
+	if (glob("/dev/video[0-9]*", 0, NULL, &devices)) {
+		globfree(&devices);
+		return NULL;
+	}
+	for (size_t i = 0; i < devices.gl_pathc; i++) {
+		struct v4l2_capability cap = {0};
+		char path[256], name[128];
+		FILE *sysfs;
+		unsigned int caps;
+		int ret, fd;
+
+		/* Opening a camera can power up its pipeline. Filter by the
+		 * sysfs node name before touching any V4L2 device. */
+		snprintf(path, sizeof(path), "/sys/class/video4linux/%s/name",
+			 strrchr(devices.gl_pathv[i], '/') + 1);
+		sysfs = fopen(path, "r");
+		if (!sysfs)
+			continue;
+		ret = fgets(name, sizeof(name), sysfs) != NULL;
+		fclose(sysfs);
+		if (!ret)
+			continue;
+		name[strcspn(name, "\n")] = '\0';
+		if (strcmp(name, "qcom-iris-decoder") && strcmp(name, "Iris Decoder"))
+			continue;
+		fd = open(devices.gl_pathv[i], O_RDWR | O_NONBLOCK | O_CLOEXEC);
+
+		if (fd < 0)
+			continue;
+		do {
+			ret = ioctl(fd, VIDIOC_QUERYCAP, &cap);
+		} while (ret < 0 && errno == EINTR);
+		close(fd);
+		if (ret < 0 || strcmp((char *)cap.driver, "iris_driver"))
+			continue;
+		caps = cap.capabilities & V4L2_CAP_DEVICE_CAPS ?
+			cap.device_caps : cap.capabilities;
+		if (!(caps & V4L2_CAP_VIDEO_M2M_MPLANE) ||
+		    !(caps & V4L2_CAP_STREAMING))
+			continue;
+		/* Compressed OUTPUT + raw CAPTURE distinguishes the decoder
+		 * from the Iris encoder, which shares the same driver name. */
+		for (int codec = VPU_CODEC_H264; codec <= VPU_CODEC_VP9; codec++) {
+			if (qcom_iris_supports(devices.gl_pathv[i], codec, VPU_PIXEL_FORMAT_NV12) ||
+			    qcom_iris_supports(devices.gl_pathv[i], codec, VPU_PIXEL_FORMAT_P010)) {
+				device = strdup(devices.gl_pathv[i]);
+				break;
+			}
+		}
+		if (device)
+			break;
+	}
+	globfree(&devices);
+	return device;
 }
 
 static void *qcom_iris_session_create(void)
@@ -179,7 +246,7 @@ static void qcom_iris_capture_layout(const void *session,
 const struct vpu_platform_ops qcom_vpu_platform_ops = {
 	.name = "qcom-iris",
 	.description = "Qualcomm Iris stateful V4L2 M2M",
-	.default_device = "/dev/video0",
+	.discover_device = qcom_iris_discover_device,
 	.quirks = VPU_PLATFORM_QUIRK_HEVC_CAPTURE_FIFO |
 		  VPU_PLATFORM_QUIRK_VP9_RELEASE_AU,
 	.supports = qcom_iris_supports,

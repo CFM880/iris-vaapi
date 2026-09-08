@@ -57,7 +57,10 @@ make -j"$(nproc)"
 LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 ```
 
-默认选择 `qcom-iris` 平台和 `/dev/video0`。多 VPU 系统或调试时可以显式选择：
+默认自动选择平台，并扫描 `/dev/video*`，根据 Iris 驱动标识、M2M 能力及
+压缩输入/原始输出格式识别解码器，跳过摄像头和编码器，不依赖设备编号。
+没有可用解码设备时初始化失败。多 VPU 系统或调试时可以显式选择
+（`VPU_DEVICE` 优先于自动探测）：
 
 ```sh
 VPU_PLATFORM=qcom-iris VPU_DEVICE=/dev/video1 \
@@ -70,7 +73,7 @@ LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 预期能看到 H.264、HEVC Main/Main10 和 VP9 Profile 0/Profile 2 的
 `VAEntrypointVLD`。
 
-驱动会按 `/dev/video0` 实际枚举的 CAPTURE 格式公布能力。若内核模块尚未更新、
+驱动会按所选解码设备实际枚举的 CAPTURE 格式公布能力。若内核模块尚未更新、
 未提供 P010，Main10 和 Profile 2 会被隐藏，避免客户端逐帧尝试失败后再回退软件
 解码；此时应先更新并重载配套的 `nabu-iris` 模块。
 

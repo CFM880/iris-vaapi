@@ -37,7 +37,8 @@ enum vpu_platform_quirk {
 };
 
 /* Select a platform. NULL arguments use VPU_PLATFORM/VPU_DEVICE,
- * then fall back to the first registered platform and its default device. */
+ * then probe registered platforms and discover their decoder devices.
+ * An explicit device bypasses discovery. */
 struct vpu_platform *vpu_platform_create(const char *name,
 				       const char *device);
 void vpu_platform_destroy(struct vpu_platform *platform);
