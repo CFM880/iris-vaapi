@@ -54,11 +54,13 @@ git clone https://gitlab.postmarketos.org/soc/qualcomm-sm8150/linux.git linux
 git -C linux checkout 5181e1358ddd6ea8028e841d928942373e6aebc8
 
 git clone https://github.com/CFM880/nabu-iris.git
-./nabu-iris/scripts/apply-overlay.sh ./linux
+git clone https://github.com/CFM880/nabu-main.git
+(cd nabu-main && make apply)   # reset linux 并应用 nabu-iris 覆盖层
 ```
 
-`apply-overlay.sh` 复制 65 个直接源码文件，不应用 patch。脚本会拒绝错误的基线或
-不干净的目标工作树。
+`nabu-main apply` 会 reset 到基线提交，并依据各模块的 `nabu-module.toml` 应用
+overlay/patch；基线不匹配时会停止。`nabu-main` 同样提供 config/build/collect/
+package 阶段，可以统一完成内核与模块构建。
 
 ### 2.2 配置内核
 

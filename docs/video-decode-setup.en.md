@@ -57,11 +57,14 @@ git clone https://gitlab.postmarketos.org/soc/qualcomm-sm8150/linux.git linux
 git -C linux checkout 5181e1358ddd6ea8028e841d928942373e6aebc8
 
 git clone https://github.com/CFM880/nabu-iris.git
-./nabu-iris/scripts/apply-overlay.sh ./linux
+git clone https://github.com/CFM880/nabu-main.git
+(cd nabu-main && make apply)   # reset linux and apply the nabu-iris overlay
 ```
 
-`apply-overlay.sh` copies 65 kernel source files directly. It does not apply patches and
-refuses to overwrite a dirty tree or a tree at the wrong base commit.
+`nabu-main apply` resets the kernel to the base commit and installs every module's
+overlay/patches from its `nabu-module.toml`; it stops on a mismatched baseline.
+`nabu-main` also provides the config/build/collect/package stages, so it can build the
+kernel and modules in one place.
 
 ### 2.2 Configure the kernel
 

@@ -8,7 +8,7 @@
 
 需要 Python 3、Git、带 VA-API 和 V4L2 M2M 解码器的 FFmpeg，以及本项目支持的
 Iris 内核、固件和设备访问权限。首次运行需要网络，自动下载固定版 Fluster
-与五个测试向量；后续复用下载缓存。
+与五个测试向量；后续若本地存在缓存则默认复用，或用 `--force-download` 强制重下。
 
 ```sh
 make check-fluster
@@ -42,6 +42,9 @@ make check-fluster FLUSTER_ARGS='--suite extended'
 
 # 仅复查某条路径；使用下载缓存，每个向量最多等待 60 秒。
 make check-fluster FLUSTER_ARGS='--paths v4l2 --no-download --timeout 60'
+
+# 缓存丢失或需要完整校验时，可强制重下测试集
+make check-fluster FLUSTER_ARGS='--force-download'
 
 # 自定义输出目录，也可直接运行 Python 脚本。
 python3 benchmarks/run_fluster.py --suite smoke --output-dir /tmp/iris-conformance
