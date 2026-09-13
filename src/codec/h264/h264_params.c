@@ -284,6 +284,7 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	unsigned int cfi;
 	unsigned int coded_width, coded_height;
 	unsigned int frame_factor;
+	unsigned int map_units_minus1;
 	int high_profile;
 
 	if (!out || !pic || pic->seq_fields.bits.pic_order_cnt_type == 1)
@@ -291,9 +292,16 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	cfi = pic->seq_fields.bits.chroma_format_idc;
 	high_profile = profile_idc(profile) >= 100;
 	frame_factor = 2U - pic->seq_fields.bits.frame_mbs_only_flag;
+	/*
+	 * VA reports the frame height in macroblocks.  For a field-coded
+	 * (interlaced) sequence the SPS carries PicHeightInMapUnits, which is
+	 * the height of one field, so halve the frame height before writing it.
+	 */
+	map_units_minus1 = pic->picture_height_in_mbs_minus1;
+	if (!pic->seq_fields.bits.frame_mbs_only_flag)
+		map_units_minus1 = (map_units_minus1 + 1) / 2 - 1;
 	coded_width = (pic->picture_width_in_mbs_minus1 + 1) * 16;
-	coded_height = (pic->picture_height_in_mbs_minus1 + 1) * 16 *
-		frame_factor;
+	coded_height = (map_units_minus1 + 1) * 16 * frame_factor;
 	if (!display_width)
 		display_width = coded_width;
 	if (!display_height)
@@ -333,7 +341,7 @@ int h264_build_sps(uint8_t *out, size_t out_size,
 	bs_put(&b, pic->seq_fields.bits.gaps_in_frame_num_value_allowed_flag,
 	       1);
 	bs_ue(&b, pic->picture_width_in_mbs_minus1);
-	bs_ue(&b, pic->picture_height_in_mbs_minus1);
+	bs_ue(&b, map_units_minus1);
 	bs_put(&b, pic->seq_fields.bits.frame_mbs_only_flag, 1);
 	if (!pic->seq_fields.bits.frame_mbs_only_flag)
 		bs_put(&b, pic->seq_fields.bits.mb_adaptive_frame_field_flag, 1);
