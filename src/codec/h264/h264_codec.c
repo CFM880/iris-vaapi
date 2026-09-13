@@ -32,6 +32,8 @@ struct h264_codec {
 	int last_pps_length;
 	int pps_refs_l0;
 	int pps_refs_l1;
+	int cur_field_pic;
+	int last_field_pic;
 };
 
 static int h264_supports_profile(VAProfile profile)
@@ -105,6 +107,15 @@ static void h264_finish_picture(void *private)
 
 	codec->slice_length = 0;
 	codec->have_picture = 0;
+	codec->last_field_pic = codec->cur_field_pic;
+}
+
+static int h264_field_state(void *private)
+{
+	struct h264_codec *codec = private;
+
+	return (codec->cur_field_pic ? 1 : 0) |
+	       (codec->last_field_pic ? 2 : 0);
 }
 
 static int h264_render(void *private, VABufferType type, const void *data,
@@ -118,6 +129,8 @@ static int h264_render(void *private, VABufferType type, const void *data,
 		if (size < sizeof(codec->picture))
 			return -EINVAL;
 		memcpy(&codec->picture, data, sizeof(codec->picture));
+		codec->cur_field_pic =
+			codec->picture.pic_fields.bits.field_pic_flag;
 		codec->have_picture = 1;
 		return 0;
 	case VASliceParameterBufferType:
@@ -331,4 +344,5 @@ const struct vpu_codec_ops vpu_h264_codec_ops = {
 	.finish_picture = h264_finish_picture,
 	.render = h264_render,
 	.build_access_unit = h264_build_access_unit,
+	.field_state = h264_field_state,
 };

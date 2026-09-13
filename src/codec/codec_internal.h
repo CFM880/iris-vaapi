@@ -24,6 +24,14 @@ struct vpu_codec_ops {
 				 struct vpu_codec_access_unit *unit);
 	int (*build_release_access_unit)(void *private, uint8_t data[2],
 					 size_t *size);
+	/*
+	 * H.264 field coding: bit 0 is set when the picture being decoded is a
+	 * field, bit 1 when the previously finished picture was a field.  The
+	 * scheduler uses this to fold the two fields of one frame, which share
+	 * a render target, into a single pending frame.  Codecs without field
+	 * coding leave the hook NULL.
+	 */
+	int (*field_state)(void *private);
 };
 
 extern const struct vpu_codec_ops vpu_h264_codec_ops;

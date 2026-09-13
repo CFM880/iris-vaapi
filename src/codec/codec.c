@@ -157,6 +157,13 @@ int vpu_codec_build_release_access_unit(struct vpu_codec *codec,
 	return codec->ops->build_release_access_unit(codec->private, data, size);
 }
 
+int vpu_codec_field_state(const struct vpu_codec *codec)
+{
+	if (!codec || !codec->ops->field_state)
+		return 0;
+	return codec->ops->field_state(codec->private);
+}
+
 int vpu_codec_has_start_code(const uint8_t *data, size_t size)
 {
 	if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 &&

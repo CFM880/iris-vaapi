@@ -263,6 +263,17 @@ struct vpu_decode_ctx {
 	struct vpu_surfaces *surfs;	/* not owned */
 	VASurfaceID current_target;
 	uint64_t current_generation;
+	/*
+	 * H.264 PAFF renders both fields of a frame into the same render target
+	 * with two BeginPicture/EndPicture pairs.  field_open tracks a first
+	 * field whose second field is still to come, second_field marks the
+	 * current picture as that second field, and field_ts keeps the
+	 * timestamp shared by the pair so one firmware frame maps back to the
+	 * target ring entry created for the first field.
+	 */
+	int field_open;
+	int second_field;
+	uint64_t field_ts;
 
 	/* Map decode sequence numbers back to target surfaces so frame
 	 * matching does not depend on the (possibly non-contiguous) VASurfaceID
@@ -692,6 +703,9 @@ reset_decoder_session_state(struct vpu_decode_ctx *ctx)
 	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
 	target_ring_reset(ctx);
 	ctx->seq = 0;
+	ctx->field_open = 0;
+	ctx->second_field = 0;
+	ctx->field_ts = 0;
 	ctx->last_submit_ns = 0;
 	ctx->vp9_seek_barrier = 0;
 	vpu_codec_reset_session(ctx->codec_adapter);
@@ -1712,6 +1726,8 @@ vpu_decode_begin_impl(struct vpu_decode_ctx *ctx, VASurfaceID target)
 	struct vpu_surface *s = find_surface(ctx, target);
 	int direct_index = ctx->direct_capture ?
 		direct_surface_index(ctx, target) : -1;
+	VASurfaceID prev_target = ctx->current_target;
+	int field_state;
 
 	if (ctx->direct_error)
 		return ctx->direct_error;
@@ -1744,14 +1760,28 @@ vpu_decode_begin_impl(struct vpu_decode_ctx *ctx, VASurfaceID target)
 	DBG("[begin] target=%u decoded=%d queued=%d generation=%llu\n",
 	    target, s ? s->decoded : -1, s ? s->queued : -1,
 	    (unsigned long long)(s ? s->generation : 0));
+	/*
+	 * PAFF renders the second field of a frame into the same render target
+	 * as the first field, right after the first EndPicture.  Do not treat
+	 * that as target reuse: keep the generation and the pending frame so
+	 * the single firmware frame still matches the first field's ring entry.
+	 */
+	field_state = vpu_codec_field_state(ctx->codec_adapter);
+	if (ctx->field_open && (field_state & 2) && target == prev_target) {
+		ctx->second_field = 1;
+	} else {
+		ctx->second_field = 0;
+		ctx->field_open = 0;
+		/* VA clients reuse render targets.  A surface that held an
+		 * earlier picture must become pending again, otherwise
+		 * vaSyncSurface can return the stale backing before the newly
+		 * decoded picture is copied into it. */
+		s->generation++;
+		ctx->current_generation = s->generation;
+		s->decoded = 0;
+		s->queued = 0;
+	}
 	ctx->current_target = target;
-	/* VA clients reuse render targets.  A surface that held an earlier
-	 * picture must become pending again, otherwise vaSyncSurface can return
-	 * the stale backing before the newly decoded picture is copied into it. */
-	s->generation++;
-	ctx->current_generation = s->generation;
-	s->decoded = 0;
-	s->queued = 0;
 	vpu_codec_begin_picture(ctx->codec_adapter);
 	return 0;
 }
@@ -1876,38 +1906,46 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 	}
 
 	{
-		uint64_t ts = (ctx->seq + 1000) * 1000000000ULL;
+		uint64_t ts;
 
-		ctx->last_target = ctx->current_target;
-		{
-			struct vpu_surface *qt = find_surface(ctx,
-							       ctx->current_target);
+		if (ctx->second_field) {
+			/* Second PAFF field: reuse the first field's timestamp and
+			 * keep its target ring entry and pending fence; the pair
+			 * is one firmware frame. */
+			ts = ctx->field_ts;
+		} else {
+			ts = (ctx->seq + 1000) * 1000000000ULL;
+			ctx->last_target = ctx->current_target;
+			{
+				struct vpu_surface *qt = find_surface(ctx,
+								       ctx->current_target);
 
-			if (qt) {
-				uint64_t token = ctx->seq + 1;
+				if (qt) {
+					uint64_t token = ctx->seq + 1;
 
-				qt->queued = 1;
-				qt->owner = ctx;
-				if (ctx->direct_capture ||
-				    (ctx->vk_copy && !ctx->vk_copy_failed))
-					surface_begin_device_write(ctx->session, qt, token);
-				else
-					surface_begin_write(ctx->session, qt, token);
+					qt->queued = 1;
+					qt->owner = ctx;
+					if (ctx->direct_capture ||
+					    (ctx->vk_copy && !ctx->vk_copy_failed))
+						surface_begin_device_write(ctx->session, qt, token);
+					else
+						surface_begin_write(ctx->session, qt, token);
+				}
 			}
-		}
-		/* Ring mapping: only a handful of frames (bounded by the
-		 * CAPTURE buffer count) are ever in flight, so a slot is
-		 * reused long after its previous frame was dequeued.  seq
-		 * itself keeps growing so timestamps stay unique. */
-		{
-			unsigned int slot = (unsigned int)(ctx->seq %
-				ARRAY_SIZE(ctx->target_ring));
+			/* Ring mapping: only a handful of frames (bounded by the
+			 * CAPTURE buffer count) are ever in flight, so a slot is
+			 * reused long after its previous frame was dequeued.  seq
+			 * itself keeps growing so timestamps stay unique. */
+			{
+				unsigned int slot = (unsigned int)(ctx->seq %
+					ARRAY_SIZE(ctx->target_ring));
 
-			ctx->target_ring[slot].seq = ctx->seq;
-			ctx->target_ring[slot].target = ctx->current_target;
-			ctx->target_ring[slot].generation =
-				ctx->current_generation;
-			ctx->target_ring[slot].used = 1;
+				ctx->target_ring[slot].seq = ctx->seq;
+				ctx->target_ring[slot].target = ctx->current_target;
+				ctx->target_ring[slot].generation =
+					ctx->current_generation;
+				ctx->target_ring[slot].used = 1;
+			}
 		}
 
 		if (!ctx->dec_started) {
@@ -1952,7 +1990,28 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 					 codec_unit.picture_order_count,
 					 ctx->current_target,
 					 ctx->current_generation);
-		ctx->seq++;
+		/*
+		 * Track PAFF field pairs.  The first field opens the pair and
+		 * owns the target entry and fence; the second field closes it.
+		 * The pair shares one sequence number, so a frame advances seq
+		 * exactly once.
+		 */
+		{
+			int field_state = vpu_codec_field_state(ctx->codec_adapter);
+
+			if (field_state & 1) {
+				if (ctx->second_field) {
+					ctx->field_open = 0;
+				} else {
+					ctx->field_open = 1;
+					ctx->field_ts = ts;
+				}
+			} else {
+				ctx->field_open = 0;
+			}
+		}
+		if (!ctx->second_field)
+			ctx->seq++;
 	}
 	/* Legacy VPU5 retains the current VP9 picture until another access unit
 	 * arrives.  Chrome may present an exported key-frame target immediately
@@ -2054,8 +2113,12 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 							   ctx->current_target);
 		int wait_exported_codec = ctx->codec == VPU_CODEC_H264 ||
 			ctx->codec == VPU_CODEC_HEVC;
+		int first_field = (vpu_codec_field_state(ctx->codec_adapter) & 1) &&
+			!ctx->second_field;
+		/* The first field of a pair cannot complete until the second is
+		 * submitted, so never block on an exported target here. */
 		int exported_wait = wait_exported_codec && target &&
-			target->exported;
+			target->exported && !first_field;
 		int forced_wait = ctx->codec == VPU_CODEC_H264 &&
 			ctx->force_h264_sync_end;
 

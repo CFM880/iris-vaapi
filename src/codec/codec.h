@@ -51,6 +51,9 @@ int vpu_codec_render(struct vpu_codec *codec, VABufferType type,
 		      const void *data, size_t size, unsigned int elements);
 int vpu_codec_build_access_unit(struct vpu_codec *codec,
 				 struct vpu_codec_access_unit *unit);
+/* H.264 field state: bit 0 current picture is a field, bit 1 the previous
+ * finished picture was a field.  Zero for codecs without field coding. */
+int vpu_codec_field_state(const struct vpu_codec *codec);
 /* unit->data remains valid until the next render/begin/finish operation on
  * the same codec instance; platform submission must consume it synchronously. */
 
