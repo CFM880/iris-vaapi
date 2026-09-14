@@ -192,6 +192,148 @@ python3 benchmarks/seek_harness/analyze.py /tmp/opencode/seq.log
 sudo modprobe -r qcom_iris && sudo modprobe qcom_iris
 # 诊断开关
 export VPU_VAAPI_DEBUG=1        # 每帧 begin/end/assign 日志
-export VPU_FRAME_STAMP=1        # 帧号叠加 + present 日志（诊断用，已回退）
+export VPU_FRAME_STAMP=1        # 顶部 16-bit 帧号条码（见第 8 节）
 export VPU_STREAM_IDLE_MS=50    # 收紧 seek 空闲阈值
 ```
+
+---
+
+## 8. 帧号级定位与“驱动侧无解”论证（2026-09-14）
+
+第 1–7 节的结论是“根因在 Chromium 合成器，驱动无法单方面修复”，但当时缺少
+**帧级证据**，也留有一个未验证的假设：能不能在驱动侧于呈现时刻拦截 stale
+backing。本节用帧号戳把这一点做实，并逐个否证所有驱动侧方案。
+
+### 8.1 新增工具
+
+1. **驱动帧号戳（`VPU_FRAME_STAMP=1`）**
+   每个成功解码并写入 backing 的帧，在 luma 平面顶部 `sh/8` 行画一个 16 格
+   条码：第 `i` 格覆盖 `[i·sw/16, (i+1)·sw/16)`，bit=1 画 Y=235，bit=0 画
+   Y=16。串号来自全局原子计数器，随解码单调递增，**唯一标识驱动解的每一帧**。
+   代码位置：`src/decode.c` 的 `surface_stamp()` / `surfaces_mark_decoded()`。
+
+2. **页面读回条码**
+   `seek_test.html` 把视频缩放到 48×27 后，在第 1 行按格中心采样 16 个 bit，
+   还原串号并随 `sn=` 上报；`analyze.py` 解析 `sn`。
+
+3. **修正 harness 的一个真 bug**
+   原页面写的是
+   `ctx.drawImage(v, 0,0,W,H, 0,0,W,H)`（9 参数形式），即只取视频**左上角
+   48×27 裁剪**再放大，并非降采样。因此第 4 节所有基于 hash 的“重复率”都在
+   看一个角落，只能当粗指标。已改为 `ctx.drawImage(v, 0, 0, W, H)`。
+
+4. **验证**：一次运行中页面读回 118 个 `sn`，其中 **116 个与驱动打印的
+   `[stamp] serial=N` 精确相等**，其余 2 个是初始未解码帧。条码可信。
+
+### 8.2 关键观测：seek 后合成器被钉死在单一 surface
+
+`VPU_FRAME_STAMP=1`，无改写（`off`），一次 seek 前后的显示串号：
+
+```
+pre-seek : 0 4 15 19 23 32 37 44 49 53 60 65 71 76 81 88 ...   (单调递增)
+seek     -> 300
+post-seek: 237 237 237 237 239 243 236 235 236 247 244 240 241 242 239 247
+           235 244 237 224 323 232 244 224 221 243 247 240 239 370 244 240
+           389 393 236 403 239 237 239 425 ...
+```
+
+现象：
+- seek 后显示串号停在旧区间（约 227–250 的一张固定帧），并**在后续每个
+  seek 分段里反复出现同一张**（seg2..seg5 仍是 236–248）。
+- 期间驱动仍在正常解新帧（323/370/389/403/425… 都是新串号），但只在画面
+  上闪现一两帧，随后又回到被钉的那张。
+- 驱动日志无任何错误：没有 `readiness wait failed`、没有 `fatal`；
+  `vaEndPicture` 对导出 target 的 backpressure 保证 target 已在本 epoch 解出。
+
+`chrome://media-internals` 侧 `tf`（totalVideoFrames）持续增长，说明
+Chromium 解码器确实在输出新帧——**是合成器不切换，而不是驱动不解码**。
+
+### 8.3 A/B 实验结果
+
+`VPU_EPOCH_REWRITE` 是本次加的驱动侧实验开关：在 stream epoch 切换时对上一
+epoch 的 backing 做不同处理。**该开关已在实验后移除（结果保留如下）**，以免把
+无效路径留在数据面。
+
+| 模式 | epoch 切换时的动作 | seek 后串号序列 | 结果 |
+|---|---|---|---|
+| `off` | 不动作 | `237 237 237 237 239 243 236 … 323 … 370 …` | 反复回退旧帧 |
+| `black` | 全部 stale backing 涂黑 | `237 237 237 237 0 0 0 0 …` | **永久黑，不再前进** |
+| `last` | 全部 stale backing 填最后一帧 | `237 237 237 237 0 250 250 0 250 …` | **冻结在最后一帧** |
+| `mirror` | 每解一帧把新帧拷进被钉 surface | 基本停在 `227`；16s 仅 9 次解码 | 管线停摆，无新帧可 mirror |
+
+其中：
+- `black` 精确复现了 4.6 的“涂黑后卡死”：驱动**能**改被钉 backing 的内容
+  （串号立刻变 0），但改了之后合成器**永远显示这张**，不再前进。
+- `mirror` 本意是“既然钉住了，就让钉住的那张一直跟着最新帧走”。但实测
+  16s 内只发生 9 次解码——说明合成器不释放那张 frame，Chromium 的
+  `DmabufVideoFramePool` 被占死，解码管线几乎停摆，根本没有新帧可镜像。
+
+> 注：`VPU_EPOCH_REWRITE` 必须通过 `export` 传给启动 shell 才会进入 GPU 进程；
+> 早期用 `env VAR=… timeout … chrome` 的写法未生效，导致一组“三模式完全相同”
+> 的假数据，已由 `export` 复测纠正。
+
+### 8.4 逐条否证驱动侧方案
+
+| 方案 | 为什么无效 |
+|---|---|
+| `vaSyncSurface` 时回填 stale backing | Chromium 的 Linux VA-API 路径**几乎不调 `vaSyncSurface`**。整场仅 24 次，全部是建池时对新 surface 的探测（`decoded=0 queued=0 init=0`）。解码帧不走 sync。 |
+| `vaEndPicture` 加 backpressure | 已有。它只保证**当前 target** 已解出；出问题的是合成器呈现的那张旧 frame，不是 target。 |
+| 主动涂黑 stale backing | 见 8.3：改内容有效，但合成器就此停在黑帧。 |
+| 主动填最后一帧 | 同上，冻结在最后一帧。 |
+| 每帧镜像到被钉 surface | 合成器不释放 frame → pool 占死 → 解码停摆。 |
+| 跨 session 持久 reservation fence（4.5） | 合成器/ANGLE 对**已导入**的 surface 不再检查该 fence。 |
+| 重新导入 surface | Chromium 按 `VASurfaceID` 缓存 EGLImage，`Reset()` 不失效、不重导；驱动无法迫使它重导。 |
+
+### 8.5 它到底是不是“无解”
+
+**不是物理上无解，而是在“不动 Chromium、不动 player、只改通用 VA 驱动/内核”这
+个约束下无解。** 精确地说：
+
+1. 失败发生在 Chromium 的 **frame 选择/释放状态机**里：seek 后合成器持续呈现
+   一张旧 `VideoFrame`，且不释放它，同时解码器仍在产出新帧。驱动拿不到
+   “当前正在扫描哪张 frame”“让 Chromium 释放/切换”的任何接口。
+2. 驱动唯一能影响显示的杠杆是**改 backing 内容**（已被帧号戳证明有效）。但
+   内容一改，合成器只是显示新内容并继续停在同一张上——对“旧帧回退”而言，
+   黑化和填最后一帧都只是把回退换成冻结（4.6 及 8.3）。
+3. 标准隐式同步本可让 GPU/合成器等待，但内核没有“用户态给 dma-heap buffer
+   挂标准 `dma_resv` fence”的通用接口；iris 自定义 ioctl fence 不被 Adreno
+   读取。
+4. 把 V4L2 CAPTURE buffer 直接导出给 Chromium（去掉稳定 backing 拷贝）本可
+   吃到标准 V4L2 同步，但 stateful 固件会复用 CAPTURE，无法预导出，且 frame
+   选择仍在 Chromium。
+
+**让它可解的条件**（任一条）：
+- Chromium 在 `Reset()`/seek 时失效或重建 frame pool、或对已导入 surface 重新
+  绑定 backing（`media/gpu/vaapi/vaapi_video_decoder.cc`）；
+- 或改走 Chromium 原生 stateful V4L2 解码器
+  （`media/gpu/v4l2/v4l2_stateful_video_decoder.cc`，其 `Reset()` 按 V4L2
+  spec 做 `STREAMOFF/STREAMON`，seek 语义由 Chromium 自己维护）；
+- 或合成/显示路径在 surface backing 变化时重新导入 EGLImage；
+- 或内核提供通用的 dma-buf 导出 fence 语义并被 Adreno 合成路径遵守。
+
+在这些之外，继续在驱动里换写法（更早/更晚回填、阻塞 sync、返回错误等）都不会
+改变“合成器选择哪张 frame”这一事实。
+
+### 8.6 代码状态与复现
+
+本次改动（`make check` 全绿）：
+- **保留**：帧号戳诊断（`VPU_FRAME_STAMP`）、harness 的 `drawImage` 修正、
+  `analyze.py` 的 `sn` 统计、epoch 兜底（`surfs_backfill_stale`，在
+  `vaSyncSurface` 上对被判为 stale 的 surface 重复当前 epoch 最新帧或涂黑，
+  对 Chromium 实际路径不触发，作为安全网保留）。
+- **已移除**：实验分支 `VPU_EPOCH_REWRITE=black|last|mirror` 及
+  `surfaces_mark_decoded` 里的 mirror 逻辑（8.3 的结论已证明其无效）。
+
+复现（设备为 nabu，Chrome 在已运行的 Wayland 会话里被远程拉起）：
+
+```sh
+make
+# 帧号戳 + 条码读回
+LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH=$PWD/build VPU_FRAME_STAMP=1 \
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+  timeout 40 google-chrome-stable --ozone-platform=wayland \
+  --user-data-dir=/tmp/chrome-seek --start-fullscreen \
+  --enable-features=VaapiVideoDecoder http://127.0.0.1:8756/
+python3 benchmarks/seek_harness/analyze.py /tmp/opencode/seq.log
+```
+

@@ -172,13 +172,18 @@ $(BUILD)/test_vp9_continuation: test/test_vp9_continuation.c src/decode.c src/de
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $< $(LDLIBS)
 
-check: $(TEST_H264) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) $(TEST_PLATFORM) $(TEST_CODEC) $(BUILD)/test_vp9_continuation
+$(BUILD)/test_surfaces_epoch: test/test_surfaces_epoch.c src/decode.c src/decode.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $< $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDLIBS)
+
+check: $(TEST_H264) $(TEST_HEVC_PARAMS) $(TEST_HEVC_REWRITE) $(TEST_PLATFORM) $(TEST_CODEC) $(BUILD)/test_vp9_continuation $(BUILD)/test_surfaces_epoch
 	./$(TEST_H264)
 	./$(TEST_HEVC_PARAMS)
 	./$(TEST_HEVC_REWRITE)
 	./$(TEST_PLATFORM)
 	./$(TEST_CODEC)
 	./$(BUILD)/test_vp9_continuation
+	./$(BUILD)/test_surfaces_epoch
 
 install: $(DRIVER)
 	test -n "$(DRIVERDIR)"

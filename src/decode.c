@@ -84,6 +84,10 @@ surface_pitch(unsigned int width, unsigned int fourcc)
  * is slow.  Opt in with VPU_VAAPI_DEBUG=1. */
 static int g_dbg = -1;
 static uint64_t g_buffer_serial;
+/* Diagnostic frame counter for VPU_FRAME_STAMP: every decoded frame written
+ * into a backing gets a unique serial painted as a barcode so the seek
+ * harness can prove which driver frame the compositor is displaying. */
+static uint64_t g_frame_stamp;
 
 static int dbg_enabled(void)
 {
@@ -191,6 +195,7 @@ struct vpu_surface {
 	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
 	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
 	uint64_t generation;	/* render-target reuse generation */
+	uint64_t epoch;		/* stream epoch of the last valid backing content */
 	uint64_t backing_serial;	/* unique identity for Vulkan import cache */
 	struct vpu_decode_ctx *owner;	/* engine that queued the picture */
 };
@@ -251,6 +256,15 @@ struct vpu_surfaces {
 	struct vpu_surface s[VPU_MAX_SURFACES];
 	int n;
 	struct vpu_vk_copy *vk_copy;
+	/* Stream epoch: bumped whenever the decoder abandons a stream (seek /
+	 * context recreation).  A surface whose backing was last written in an
+	 * older epoch still holds pre-seek pixels and must not be presented.
+	 * last_frame/last_frame_epoch track the newest frame decoded in the
+	 * current epoch so a stale surface can be backfilled (repeat last
+	 * frame) instead of revealing the old picture. */
+	uint64_t epoch;
+	VASurfaceID last_frame;
+	uint64_t last_frame_epoch;
 };
 
 struct vpu_decode_ctx {
@@ -356,6 +370,69 @@ struct vpu_decode_ctx {
 	int force_h264_sync_end;
 };
 
+static void surface_stamp(struct vpu_surface *s, uint64_t serial);
+
+/* Record that @s now holds a valid frame decoded in the current stream epoch.
+ * Every successful decode path must call this so the registry knows both that
+ * the surface is presentable and which surface to repeat when a stale surface
+ * is later handed to the compositor. */
+static void
+surfaces_mark_decoded(struct vpu_decode_ctx *ctx, struct vpu_surface *s)
+{
+	s->decoded = 1;
+	s->queued = 1;
+	s->owner = ctx;
+	if (ctx->surfs) {
+		uint64_t serial = __atomic_add_fetch(&g_frame_stamp, 1,
+						     __ATOMIC_RELAXED) + 1;
+
+		s->epoch = ctx->surfs->epoch;
+		ctx->surfs->last_frame = s->id;
+		ctx->surfs->last_frame_epoch = ctx->surfs->epoch;
+		surface_stamp(s, serial);
+		DBG("[stamp] serial=%llu target=%u epoch=%llu\n",
+		    (unsigned long long)serial, s->id,
+		    (unsigned long long)ctx->surfs->epoch);
+	}
+}
+
+static int
+frame_stamp_enabled(void)
+{
+	static int value = -1;
+
+	if (value < 0)
+		value = getenv("VPU_FRAME_STAMP") != NULL;
+	return value;
+}
+
+/* Diagnostic: paint the low 16 bits of @serial as a barcode across the top
+ * eighth of the luma plane (16 cells, bit 1 -> Y=235, bit 0 -> Y=16) so the
+ * seek harness can read back which driver frame the compositor displays. */
+static void
+surface_stamp(struct vpu_surface *s, uint64_t serial)
+{
+	unsigned int cell = s->sw / 16;
+	unsigned int rows = s->sh / 8 ? s->sh / 8 : 1;
+	unsigned int pitch = surface_pitch(s->sw, s->fourcc);
+	int sync;
+
+	if (!cell || !frame_stamp_enabled())
+		return;
+	sync = dma_buf_cpu_sync(s->bfd,
+			       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
+	for (unsigned int b = 0; b < 16; b++) {
+		uint8_t val = (serial >> b) & 1 ? 235 : 16;
+
+		for (unsigned int y = 0; y < rows; y++)
+			memset((uint8_t *)s->bmap + (size_t)y * pitch + b * cell,
+			       val, cell);
+	}
+	if (sync)
+		(void)dma_buf_cpu_sync(s->bfd,
+				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+}
+
 static struct vpu_surface *
 find_surface(struct vpu_decode_ctx *ctx, VASurfaceID id);
 
@@ -443,10 +520,8 @@ finish_vk_copy(struct vpu_decode_ctx *ctx, unsigned int index, int wait)
 	if (s && s->generation == pending->generation &&
 	    s->fence_token == pending->fence_token) {
 		finish_ret = surface_finish_write(ctx->session, s);
-		s->decoded = 1;
 		s->initialized = 1;
-		s->queued = 1;
-		s->owner = ctx;
+		surfaces_mark_decoded(ctx, s);
 	} else if (pending->fence_token) {
 		/* The VA client should not destroy/recycle an in-flight target,
 		 * but never leave its reservation fence permanently unsignalled if
@@ -669,6 +744,78 @@ find_surface(struct vpu_decode_ctx *ctx, VASurfaceID id)
 	return surfs_find(ctx->surfs, id);
 }
 
+/* Copy one backing into another (same linear layout).  Both mappings are
+ * cache-synchronised for the transfer; memfd fallbacks reject the ioctl and
+ * are simply coherent CPU mappings. */
+static int
+surface_backing_copy(struct vpu_surface *dst, struct vpu_surface *src)
+{
+	size_t size = (size_t)surface_pitch(dst->sw, dst->fourcc) *
+		      ALIGN_TO(dst->sh, 32) * 3 / 2;
+	int src_sync, dst_sync;
+
+	if (size > dst->bsize || size > src->bsize)
+		return 0;
+	src_sync = dma_buf_cpu_sync(src->bfd,
+				   DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ) == 0;
+	dst_sync = dma_buf_cpu_sync(dst->bfd,
+				   DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
+	memcpy(dst->bmap, src->bmap, size);
+	if (dst_sync)
+		(void)dma_buf_cpu_sync(dst->bfd,
+				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+	if (src_sync)
+		(void)dma_buf_cpu_sync(src->bfd,
+				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+	return 1;
+}
+
+/* Abandon the current stream: bump the display-level epoch and drop the
+ * repeat-last-frame source.  Surfaces written in the old epoch are now stale
+ * and will be backfilled lazily if the client presents them without decoding
+ * into them first. */
+static void
+surfs_begin_epoch(struct vpu_surfaces *t)
+{
+	if (!t)
+		return;
+	t->epoch++;
+	if (!t->epoch)
+		t->epoch = 1;
+	t->last_frame = 0;
+	t->last_frame_epoch = 0;
+	DBG("[epoch] begin -> %llu\n", (unsigned long long)t->epoch);
+}
+
+/* Make a stale surface presentable: repeat the newest frame of the current
+ * epoch when one exists, otherwise neutral black.  This is the last line of
+ * defence against a client (Chrome reusing its frame pool across per-seek
+ * context recreation) sampling pre-seek pixels. */
+static void
+surfs_backfill_stale(struct vpu_surfaces *t, struct vpu_surface *dst)
+{
+	struct vpu_surface *src = NULL;
+	unsigned int pitch = surface_pitch(dst->sw, dst->fourcc);
+	int copied = 0;
+
+	if (t->last_frame_epoch == t->epoch) {
+		src = surfs_find(t, t->last_frame);
+		if (src && src != dst && src->epoch == t->epoch && src->decoded &&
+		    src->fourcc == dst->fourcc && src->bsize == dst->bsize &&
+		    surface_pitch(src->sw, src->fourcc) == pitch &&
+		    ALIGN_TO(src->sh, 32) == ALIGN_TO(dst->sh, 32))
+			copied = surface_backing_copy(dst, src);
+	}
+	if (!copied)
+		surface_fill_black(dst->bfd, dst->bmap, pitch,
+				   ALIGN_TO(dst->sh, 32), dst->fourcc);
+	dst->epoch = t->epoch;
+	dst->decoded = 1;
+	dst->initialized = 1;
+	DBG("[stale] backfill id=%u %s\n", dst->id,
+	    copied ? "last-frame" : "black");
+}
+
 static void
 target_ring_reset(struct vpu_decode_ctx *ctx)
 {
@@ -795,6 +942,15 @@ vpu_decode_destroy(struct vpu_decode_ctx *ctx)
 		finish_pending_writes(ctx);
 		vpu_platform_session_close(ctx->session);
 	}
+	/* Chromium destroys and recreates the VAContext on every seek while
+	 * keeping the surface pool.  Abandon the stream epoch *after* the final
+	 * drain so the pictures it just completed cannot become the repeat-last-
+	 * frame source, and surfaces not re-decoded by the replacement context
+	 * cannot leak their pre-seek contents.  VP9 is excluded (retired
+	 * predecessor contexts and show_existing_frame rely on cross-context
+	 * surfaces). */
+	if (ctx->codec != VPU_CODEC_VP9)
+		surfs_begin_epoch(ctx->surfs);
 	/* Release this context's CAPTURE imports from the display-level Vulkan
 	 * cache.  Surfaces outlive their decode context and their destination
 	 * buffers are still referenced, but the per-session source keys are not:
@@ -1085,6 +1241,7 @@ vpu_surfaces_alloc(struct vpu_surfaces *t, VASurfaceID id,
 	s->write_started = 0;
 	s->fence_token = 0;
 	s->generation = 0;
+	s->epoch = t->epoch;
 	s->backing_serial = __atomic_add_fetch(&g_buffer_serial, 1,
 					       __ATOMIC_RELAXED);
 	s->owner = NULL;
@@ -1179,6 +1336,13 @@ vpu_surfaces_sync(struct vpu_surfaces *t, VASurfaceID id)
 	 * before exporting them and must not get spurious timeouts. */
 	if (!s)
 		return -EINVAL;
+	/* A surface that has not been decoded into during the current stream
+	 * epoch still holds pre-seek pixels.  Backfill it with the newest frame
+	 * of this epoch (or black) before the client can present it. */
+	if (s->epoch != t->epoch) {
+		surfs_backfill_stale(t, s);
+		return 0;
+	}
 	if (!s->queued || s->decoded)
 		return 0;
 	/* Drain whichever engine queued this picture; with one engine per
@@ -1489,10 +1653,8 @@ assign_frame(struct vpu_decode_ctx *ctx, const struct vpu_decoded_frame *frame)
 			return -1;
 		}
 		surface_finish_write(ctx->session, s);
-		s->decoded = 1;
 		s->initialized = 1;
-		s->queued = 1;
-		s->owner = ctx;
+		surfaces_mark_decoded(ctx, s);
 		ctx->stats_direct_frames++;
 		return id;
 	}
@@ -1542,9 +1704,7 @@ assign_frame(struct vpu_decode_ctx *ctx, const struct vpu_decoded_frame *frame)
 		if (ret)
 			return ret;
 	}
-	s->decoded = 1;
-	s->queued = 1;
-	s->owner = ctx;
+	surfaces_mark_decoded(ctx, s);
 	return id;
 }
 
@@ -1688,6 +1848,11 @@ stream_boundary_restart(struct vpu_decode_ctx *ctx)
 	}
 	restart_decoder_session(ctx);
 	ctx->seq = next_seq;
+	/* VP9 presents already-decoded surfaces through show_existing_frame after
+	 * a seek, so it keeps the display epoch.  H.264/HEVC abandon the old
+	 * backings: any surface not re-decoded in the new epoch is stale. */
+	if (ctx->codec != VPU_CODEC_VP9)
+		surfs_begin_epoch(ctx->surfs);
 	ctx->vp9_seek_barrier = ctx->codec == VPU_CODEC_VP9 &&
 		(ctx->platform_quirks & VPU_PLATFORM_QUIRK_VP9_RELEASE_AU);
 	DBG("[seek] old session complete codec=0x%x; restart at seq=%llu\n",
@@ -1817,6 +1982,11 @@ vpu_decode_begin_impl(struct vpu_decode_ctx *ctx, VASurfaceID target)
 		ctx->current_generation = s->generation;
 		s->decoded = 0;
 		s->queued = 0;
+		/* Do NOT claim the epoch here: a surface only becomes valid for the
+		 * current stream when a decoded frame actually lands in it
+		 * (surfaces_mark_decoded).  A picture whose CAPTURE frame is dropped
+		 * as STALE must stay invalid so vaSyncSurface backfills it instead of
+		 * exposing the pre-seek pixels still in the backing. */
 	}
 	ctx->current_target = target;
 	vpu_codec_begin_picture(ctx->codec_adapter);
