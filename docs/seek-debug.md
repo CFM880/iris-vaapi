@@ -272,7 +272,37 @@ epoch 的 backing 做不同处理。**该开关已在实验后移除（结果保
 > 早期用 `env VAR=… timeout … chrome` 的写法未生效，导致一组“三模式完全相同”
 > 的假数据，已由 `export` 复测纠正。
 
-### 8.4 逐条否证驱动侧方案
+### 8.4 对照实验：mpv 在同一驱动上不回退
+
+用第三方 stateful VA-API 客户端 mpv 0.41（`--hwdec=vaapi --vo=gpu-next
+--gpu-context=wayland`）在同一真机、同一驱动、同一素材上，经 IPC 按 harness
+相同的时刻表自动 seek，并从 mpv 自己的截图中读回驱动帧号条码：
+
+```
+seg0(播放中)  54 300 737 985
+seg1(seek)   1424 1749 1951 1951
+seg2(seek)   1958 1958 1958 1958
+seg3(seek)   1963 1963 1963 1963
+seg4(seek)   1968 1968 1968 1968
+seg5(seek)   1976 1976 1976 1976
+seg6(seek)   1984 1984 1984 1984
+```
+
+- 帧号**单调递增，跨 seek 0 次下降**（段内重复只是同一帧被连续截到）。
+- 驱动日志：5 次 `stream boundary`、`[assign] STALE=0`、无
+  `readiness wait failed`/`fatal`，确认用的是本驱动
+  （`Using hardware decoding (vaapi)`、`VO: [gpu-next] 3840x2160 vaapi[nv12]`、
+  1987 次 `[stamp]`）。
+
+结论：**同一个驱动、同样的稳定 surface/backing 模型，mpv 在 seek 后帧号只前进
+不回退**。这直接排除“驱动把 stale backing 交给客户端”，把问题锁定在 Chromium
+的合成器/frame-pool 行为上，与 8.2 的帧号观测互相印证。
+
+> 说明：mpv 的 `screenshot-to-file` 取的是它自己 VO 渲染的帧，严格说不是
+> Wayland 合成器扫描出的画面；但“驱动串号连续 + `STALE=0`”足以证明驱动侧输入
+> 正确，Chromium 是唯一变量。
+
+### 8.5 逐条否证驱动侧方案
 
 | 方案 | 为什么无效 |
 |---|---|
@@ -284,7 +314,7 @@ epoch 的 backing 做不同处理。**该开关已在实验后移除（结果保
 | 跨 session 持久 reservation fence（4.5） | 合成器/ANGLE 对**已导入**的 surface 不再检查该 fence。 |
 | 重新导入 surface | Chromium 按 `VASurfaceID` 缓存 EGLImage，`Reset()` 不失效、不重导；驱动无法迫使它重导。 |
 
-### 8.5 它到底是不是“无解”
+### 8.6 它到底是不是“无解”
 
 **不是物理上无解，而是在“不动 Chromium、不动 player、只改通用 VA 驱动/内核”这
 个约束下无解。** 精确地说：
@@ -314,7 +344,7 @@ epoch 的 backing 做不同处理。**该开关已在实验后移除（结果保
 在这些之外，继续在驱动里换写法（更早/更晚回填、阻塞 sync、返回错误等）都不会
 改变“合成器选择哪张 frame”这一事实。
 
-### 8.6 代码状态与复现
+### 8.7 代码状态与复现
 
 本次改动（`make check` 全绿）：
 - **保留**：帧号戳诊断（`VPU_FRAME_STAMP`）、harness 的 `drawImage` 修正、
