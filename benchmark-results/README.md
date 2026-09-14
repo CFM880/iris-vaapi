@@ -10,6 +10,10 @@ Tracked files:
   `fluster-extended-metadata.json`, `extended-4k.json`: seven additional
   conformance vectors and first-120-frame comparisons for five 4K clips,
   including unresolved mismatches and out-of-range dimensions.
+- `fluster-full.md`, `fluster-full.json`, `fluster-full-metadata.json`: full
+  four-suite run with the stock distribution FFmpeg (not the patched
+  `ffmpeg-iris` build), per-suite pass counts, and why the hardware numbers
+  differ from the earlier wedge-contaminated run.
 - `fluster-driver-vaapi.md`, `fluster-driver-vaapi.json`,
   `fluster-driver-vaapi-metadata.json`: regression after kernel and VA-API
   fixes; software 5/5, both hardware paths 4/5, with the original unsupported

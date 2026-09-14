@@ -74,6 +74,14 @@ make check-fluster FLUSTER_ARGS='/tmp/iris-fluster --no-download'
 MD5 对照，支持最小高度限制的判断。原向量仍保留且计为失败。
 详见 [修复后结果](../benchmark-results/fluster-driver-vaapi.md)。
 
+2026-09-14 用**发行版 stock FFmpeg（`/usr/bin/ffmpeg`，不用自编译的
+`ffmpeg-iris-8.0.1`）**跑完整四套：H.264 130/116/97、HEVC 141/130/130、
+VP9 242/176\*/174、VP9 High 6/0/2（软件/V4L2/VA-API）。VP9 V4L2 仍是下界，
+因为极小尺寸（8×8）会 `VIDIOC_REQBUFS` 失败并楔死固件、yuv444 让 ffmpeg 以
+69 退出而中止该 pass。更早一次完整运行的硬件数字被同类楔死严重污染（VP9
+V4L2 0/305），且使用自编译 FFmpeg，两者不可直接比较。完整结果、差异归因与
+失败分类见 [完整套件结果](../benchmark-results/fluster-full.md)。
+
 ## 结果与退出码
 
 默认 checkout 位于 `benchmark-results/logs/fluster-checkout/`；下载资源位于
