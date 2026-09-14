@@ -17,6 +17,10 @@ struct vpu_codec_access_unit {
 	const uint8_t *data;
 	size_t size;
 	int random_access;
+	/* Set when this access unit carries a new coded-video sequence
+	 * (parameter-set content changed).  The scheduler uses it to restart
+	 * the stateful firmware session even when no client reset is visible. */
+	int new_sequence;
 	int32_t picture_order_count;
 	int refs_l0;
 	int refs_l1;

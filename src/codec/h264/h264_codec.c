@@ -259,6 +259,7 @@ static int h264_build_access_unit(void *private,
 	const uint8_t *data;
 	size_t capacity;
 	size_t length = 0;
+	int sps_changed = 0;
 	int bytes;
 	int ret;
 
@@ -294,6 +295,7 @@ static int h264_build_access_unit(void *private,
 		memcpy(codec->access_unit, start_code, 4);
 		memcpy(codec->last_sps, codec->access_unit + 4, bytes);
 		codec->last_sps_length = bytes;
+		sps_changed = 1;
 		length = 4 + bytes;
 	}
 
@@ -326,6 +328,7 @@ static int h264_build_access_unit(void *private,
 	unit->data = data;
 	unit->size = length;
 	unit->random_access = h264_random_access(codec);
+	unit->new_sequence = sps_changed;
 	unit->refs_l0 = codec->refs_l0;
 	unit->refs_l1 = codec->refs_l1;
 	return 0;

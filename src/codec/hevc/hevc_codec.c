@@ -39,6 +39,8 @@ struct hevc_codec {
 	int raw_sps_length;
 	uint8_t raw_pps[1024];
 	int raw_pps_length;
+	uint8_t last_raw_sps[1024];
+	int last_raw_sps_length;
 	int pps_id;
 	int rewritten;
 	uint64_t rewrite_ns;
@@ -76,6 +78,7 @@ static void hevc_reset_session(void *private)
 	codec->raw_vps_length = 0;
 	codec->raw_sps_length = 0;
 	codec->raw_pps_length = 0;
+	codec->last_raw_sps_length = 0;
 }
 
 static void hevc_begin_picture(void *private)
@@ -374,6 +377,7 @@ static int hevc_build_access_unit(void *private,
 	size_t capacity;
 	size_t length = 0;
 	int raw_in_unit;
+	int sps_changed = 0;
 	int bytes;
 	int ret;
 
@@ -394,6 +398,15 @@ static int hevc_build_access_unit(void *private,
 
 	raw_in_unit = codec->rewritten ? 0 :
 		hevc_cache_raw_parameter_sets(codec);
+	if ((raw_in_unit & 2) && !codec->rewritten) {
+		if (codec->raw_sps_length != codec->last_raw_sps_length ||
+		    memcmp(codec->raw_sps, codec->last_raw_sps,
+			   codec->raw_sps_length))
+			sps_changed = 1;
+		memcpy(codec->last_raw_sps, codec->raw_sps,
+		       codec->raw_sps_length);
+		codec->last_raw_sps_length = codec->raw_sps_length;
+	}
 	if (raw_in_unit == 7 && !codec->rewritten) {
 		data = codec->slice_data;
 		length = codec->slice_length;
@@ -442,6 +455,7 @@ static int hevc_build_access_unit(void *private,
 		memcpy(codec->last_sps, codec->access_unit + length + 4,
 		       bytes);
 		codec->last_sps_length = bytes;
+		sps_changed = 1;
 		length += 4 + bytes;
 	}
 	bytes = hevc_build_pps_id(codec->access_unit + length + 4,
@@ -473,6 +487,7 @@ complete:
 	unit->data = data;
 	unit->size = length;
 	unit->random_access = hevc_random_access(codec);
+	unit->new_sequence = sps_changed;
 	unit->picture_order_count = codec->picture.CurrPic.pic_order_cnt;
 	unit->refs_l0 = codec->refs_l0;
 	unit->refs_l1 = codec->refs_l1;

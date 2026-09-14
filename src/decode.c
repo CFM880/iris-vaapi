@@ -24,12 +24,40 @@
  * changes, so the registry must hold several pools at once. */
 #define VPU_MAX_SURFACES	128
 #define VPU_MAX_PENDING_COPIES	32
-/* VA-API has no decoder-reset callback.  A random-access picture following a
- * user-visible pause is the best signal that a client reused its VAContext
- * across a seek.  Every codec drains and reopens its firmware session at this
- * boundary while preserving the monotonically increasing private timestamp
- * epoch across the restart. */
-#define VPU_SEEK_GAP_NS		100000000ULL
+/* VA-API has no decoder-reset callback (modern libva has no vaFlush), and
+ * Chromium's Reset() neither sends EOS nor recreates the VAContext.  A
+ * random-access picture is therefore only treated as a stream boundary when
+ * another signal proves the discontinuity:
+ *   - the private session already saw EOS (client synced the last target), or
+ *   - the codec adapter reports a new coded-video sequence (parameter sets
+ *     changed), or
+ *   - the client was idle long enough that a user seek is the likely cause.
+ * Every boundary drains and reopens the firmware session while preserving the
+ * monotonically increasing private timestamp epoch across the restart. */
+#define VPU_STREAM_IDLE_NS	100000000ULL
+
+/* Idle threshold before a random-access picture is suspected to be a seek.
+ * Configurable in milliseconds with VPU_STREAM_IDLE_MS for tuning or tests. */
+static uint64_t
+stream_idle_ns(void)
+{
+	static uint64_t value;
+	static int initialized;
+
+	if (!initialized) {
+		const char *env = getenv("VPU_STREAM_IDLE_MS");
+		long ms = env && *env ? strtol(env, NULL, 10) :
+			(long)(VPU_STREAM_IDLE_NS / 1000000ULL);
+
+		if (ms < 0)
+			ms = 0;
+		value = (uint64_t)ms * 1000000ULL;
+		if (!value)
+			value = 1;
+		initialized = 1;
+	}
+	return value;
+}
 
 #ifndef ALIGN_TO
 #define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -701,6 +729,9 @@ reset_decoder_session_state(struct vpu_decode_ctx *ctx)
 	ctx->fatal_error = 0;
 	ctx->vk_capture_generation = 0;
 	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
+	/* A new firmware session gets a fresh GPU-copy attempt even if the
+	 * previous session hit a transient Vulkan import/submit failure. */
+	ctx->vk_copy_failed = 0;
 	target_ring_reset(ctx);
 	ctx->seq = 0;
 	ctx->field_open = 0;
@@ -764,6 +795,12 @@ vpu_decode_destroy(struct vpu_decode_ctx *ctx)
 		finish_pending_writes(ctx);
 		vpu_platform_session_close(ctx->session);
 	}
+	/* Release this context's CAPTURE imports from the display-level Vulkan
+	 * cache.  Surfaces outlive their decode context and their destination
+	 * buffers are still referenced, but the per-session source keys are not:
+	 * leaking them fills the bounded cache and permanently disables the GPU
+	 * copy path after enough seeks/navigations. */
+	forget_vk_capture_buffers(ctx);
 	if (ctx->stats_enabled) {
 		double copy_sec = ctx->stats_copy_ns / 1e9;
 		double vk_copy_sec = ctx->stats_vk_copy_ns / 1e9;
@@ -1621,16 +1658,16 @@ vpu_decode_flush_impl(struct vpu_decode_ctx *ctx)
 	return -ETIMEDOUT;
 }
 
-/* Establish a strict stream boundary for Chromium seeks.  Chromium does
- * not forward Decoder::Reset() through VA-API, so the first post-seek key frame
- * is the earliest point where the driver can act.  Finish the complete old
+/* Establish a strict stream boundary.  Chromium does not forward
+ * Decoder::Reset() through VA-API, so the first post-seek key frame is the
+ * earliest point where the driver can act.  Finish the complete old
  * OUTPUT/CAPTURE pipeline and observe LAST before closing it; only then may the
- * already assembled seek key frame be submitted to a fresh firmware session.
+ * already assembled key frame be submitted to a fresh firmware session.
  * Preserve the private sequence epoch across every codec restart; legacy VPU5
  * VP9 has proved sensitive to a timestamp rewind across a context reused by
  * Chromium. */
 static int
-drain_and_restart_seek(struct vpu_decode_ctx *ctx)
+stream_boundary_restart(struct vpu_decode_ctx *ctx)
 {
 	uint64_t next_seq = ctx->seq;
 	unsigned int pending = 0, i;
@@ -1841,23 +1878,31 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 
 	/* Stateful firmware may retain pictures from before a Chromium seek because
 	 * decoder Reset() has no libva counterpart.  At the first safe random-access
-	 * picture, drain every codec's old session through LAST before reopening it,
-	 * so old and new access units never coexist in VPU.  Keep the driver's private
-	 * timestamp sequence monotonic across the restart. */
+	 * picture that also carries an independent discontinuity signal, drain the
+	 * old session through LAST before reopening it, so old and new access units
+	 * never coexist in VPU.  Keep the driver's private timestamp sequence
+	 * monotonic across the restart. */
 	if (ctx->dec_started && random_access) {
 		uint64_t now = monotonic_ns();
 		uint64_t gap = ctx->last_submit_ns ? now - ctx->last_submit_ns : 0;
-		int seek_boundary = ctx->eos_sent || gap >= VPU_SEEK_GAP_NS;
+		const char *reason = NULL;
 
 		/* Do not restart on normal in-stream IDRs: some content has a key
-		 * frame every few hundred milliseconds.  EOS is unambiguous; without
-		 * EOS, the pause before the random-access picture distinguishes a seek
-		 * from normal frame cadence. */
-		if (seek_boundary) {
-			DBG("[end] seek boundary gap=%llums codec=0x%x: draining old session\n",
-			    (unsigned long long)(gap / 1000000ULL),
+		 * frame every few hundred milliseconds.  EOS and a new coded-video
+		 * sequence are unambiguous; otherwise the pause before the
+		 * random-access picture distinguishes a seek from normal cadence. */
+		if (ctx->eos_sent)
+			reason = "eos";
+		else if (codec_unit.new_sequence)
+			reason = "new-sequence";
+		else if (gap >= stream_idle_ns())
+			reason = "idle";
+
+		if (reason) {
+			DBG("[end] stream boundary (%s) gap=%llums codec=0x%x: draining old session\n",
+			    reason, (unsigned long long)(gap / 1000000ULL),
 			    ctx->codec);
-			ret = drain_and_restart_seek(ctx);
+			ret = stream_boundary_restart(ctx);
 			if (ret)
 				return ret;
 			/* Session reset invalidates parameter-set caches.  Rebuild so the
@@ -1868,6 +1913,7 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 				return ret;
 			au = codec_unit.data;
 			au_len = codec_unit.size;
+			random_access = codec_unit.random_access;
 		}
 	}
 

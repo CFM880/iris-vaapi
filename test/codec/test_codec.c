@@ -69,6 +69,17 @@ static void test_h264_dispatch(void)
 	vpu_codec_destroy(codec);
 }
 
+static void render_hevc_picture(struct vpu_codec *codec,
+				const VAPictureParameterBufferHEVC *picture,
+				const uint8_t *irap, size_t irap_size)
+{
+	vpu_codec_begin_picture(codec);
+	assert(vpu_codec_render(codec, VAPictureParameterBufferType, picture,
+				 sizeof(*picture), 1) == 0);
+	assert(vpu_codec_render(codec, VASliceDataBufferType, irap,
+				 irap_size, 1) == 0);
+}
+
 static void test_hevc_access_unit(void)
 {
 	static const uint8_t irap[] = { 0, 0, 1, 0x26, 0x01, 0x80 };
@@ -82,13 +93,27 @@ static void test_hevc_access_unit(void)
 	picture.pic_fields.bits.chroma_format_idc = 1;
 	codec = vpu_codec_create(VAProfileHEVCMain, 320, 240);
 	assert(codec);
-	assert(vpu_codec_render(codec, VAPictureParameterBufferType, &picture,
-				 sizeof(picture), 1) == 0);
-	assert(vpu_codec_render(codec, VASliceDataBufferType, irap,
-				 sizeof(irap), 1) == 0);
+
+	/* The first access unit establishes the parameter sets. */
+	render_hevc_picture(codec, &picture, irap, sizeof(irap));
 	assert(vpu_codec_build_access_unit(codec, &unit) == 0);
 	assert(unit.size > sizeof(irap));
 	assert(unit.random_access);
+	assert(unit.new_sequence);
+
+	/* Identical parameters must not be mistaken for a new sequence. */
+	vpu_codec_finish_picture(codec);
+	render_hevc_picture(codec, &picture, irap, sizeof(irap));
+	assert(vpu_codec_build_access_unit(codec, &unit) == 0);
+	assert(!unit.new_sequence);
+
+	/* A parameter-set change is a genuine boundary signal. */
+	picture.pic_width_in_luma_samples = 640;
+	vpu_codec_finish_picture(codec);
+	render_hevc_picture(codec, &picture, irap, sizeof(irap));
+	assert(vpu_codec_build_access_unit(codec, &unit) == 0);
+	assert(unit.new_sequence);
+
 	vpu_codec_destroy(codec);
 }
 
