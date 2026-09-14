@@ -409,6 +409,34 @@ export VPU_VAAPI_DEBUG=1
 
 注意：压力测试中途被杀（Ctrl-C/timeout）会 wedge 固件，先重载模块再继续调试。
 
+### Seek 流边界重构（v0.3）
+
+旧的实现把判定拆成两层互不相干的启发式：用户态在 `vaEndPicture` 里用
+“随机访问帧 + (`eos_sent` 或墙钟间隔 ≥100ms)”猜测 seek；内核又用压缩输入
+时间戳跳变（1s 阈值、5s 窗口、`seek_hold_frames=30`）过滤旧输出。两者时钟
+不同、可能互相矛盾，而且内核过滤在用户态已经 close/reopen 整个 V4L2
+session 时是冗余的。
+
+现在以用户态为唯一的流边界决策点，`stream_boundary_restart()` 是唯一的
+drain→close→reset 入口，保留 surface backing 和单调私有 timestamp epoch。
+只有在**随机访问帧**上，且至少满足以下一个独立信号时才重开会话：
+
+1. 私有 session 已因 `vaSyncSurface` 收到 EOS（`eos_sent`）；
+2. codec adapter 报告新的 coded-video sequence（`codec_unit.new_sequence`，
+   H.264/HEVC 的 SPS 内容变化）；
+3. 距上次提交的墙钟间隔超过 `VPU_STREAM_IDLE_NS`（默认 100ms，可用
+   `VPU_STREAM_IDLE_MS` 覆盖），用于 Chromium 的 `Reset()` 路径。
+
+普通流内 IDR 不再误触发重开。内核侧只保留与功耗/时钟投票相关的输入速率
+窗口重置，不再根据时间戳丢弃任何输出帧——因为用户的 seek 一定会重开
+V4L2 session。VP9 的 superframe/prime 与 `show_existing_frame` 屏障逻辑
+不变。
+
+> Chrome 播放 4K HEVC 时 seek 后仍会偶发回到 seek 前的旧帧。该问题的完整
+> 排查、自动化测量工具与结论（根因在 Chromium 的 context 重建/frame pool
+> 复用，内核/驱动无法单方面修复）见
+> [`seek-debug.md`](seek-debug.md)。
+
 ### 构建与测试命令
 ```sh
 make                                          # 构建驱动 + 测试工具

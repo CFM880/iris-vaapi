@@ -1,0 +1,54 @@
+<!doctype html><meta charset=utf-8>
+<!-- Seek measurement page.  Plays /video.mp4, seeks on a fixed schedule, and
+     POSTs a downscaled-frame hash plus playback counters to the harness
+     server.  A stale (pre-seek) frame reappears as a hash already seen before
+     a SEEK marker.  See docs/seek-debug.md. -->
+<body style="margin:0;background:#000">
+<video id="v" muted src="/video.mp4"
+  style="width:100vw;height:100vh;object-fit:contain"></video>
+<script>
+const v = document.getElementById('v');
+const W = 48, H = 27;
+const cv = document.createElement('canvas');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+
+function fnv(a) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < a.length; i++) { h ^= a[i]; h = (h * 0x01000193) >>> 0; }
+  return h.toString(16);
+}
+
+let lastPost = 0;
+function tick(ts) {
+  if (ts - lastPost >= 80) {
+    lastPost = ts;
+    try {
+      ctx.drawImage(v, 0, 0, W, H, 0, 0, W, H);
+      const d = ctx.getImageData(0, 0, W, H).data;
+      const g = new Uint8Array(W * H);
+      for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = d[i];
+      const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+      fetch('/seq', { method: 'POST', body: ts.toFixed(0) +
+        ' ct=' + v.currentTime.toFixed(3) +
+        ' h=' + fnv(g) +
+        ' tf=' + (q ? q.totalVideoFrames : -1) +
+        ' df=' + (q ? q.droppedVideoFrames : -1) });
+    } catch (e) {}
+  }
+  requestAnimationFrame(tick);
+}
+
+const times = [300, 60, 900, 120, 1500, 30, 600];
+let n = 0;
+v.addEventListener('loadedmetadata', () => {
+  v.play();
+  setInterval(() => {
+    if (n < times.length) {
+      fetch('/seq', { method: 'POST', body: 'SEEK -> ' + times[n] });
+      v.currentTime = times[n++] % Math.max(1, v.duration - 2);
+    }
+  }, 4000);
+});
+requestAnimationFrame(tick);
+</script>
