@@ -24,7 +24,7 @@ seek 前旧帧（残留帧）** 的完整排查过程、自动化测量方法、
 
 驱动架构要点（见 `docs/architecture.md`）：
 
-- surface 属于 display 级注册表（`src/decode.c` 的 `struct vpu_surfaces`），
+- surface 属于 display 级注册表（`src/decode/surface.c` 的 `struct vpu_surfaces`），
   **会跨 VA context 生命周期存活**，backing 是稳定的 DMA-BUF。
 - 每个 VA context 有自己的 `vpu_decode_ctx` 和一个 V4L2 stateful session。
 
@@ -147,7 +147,7 @@ Chrome/ANGLE 对**已导入**的 surface 不再检查 reservation fence。
 保留（已验证）：
 
 - 用户态 seek 边界重构：第一个随机访问帧 + `eos`/`new-sequence`/`idle` 三信号触发
-  `stream_boundary_restart()`（`src/decode.c`，`VPU_STREAM_IDLE_MS` 可调）。
+  `stream_boundary_restart()`（`src/decode/stream.c`，`VPU_STREAM_IDLE_MS` 可调）。
 - Vulkan 拷贝泄漏修复（见 4.1）。
 - 内核移除基于输入时间戳的 seek 过滤（`nabu-iris`，时间戳由用户态合成，本就不
   可用；输出过滤交给用户态边界）。
@@ -210,7 +210,7 @@ backing。本节用帧号戳把这一点做实，并逐个否证所有驱动侧�
    每个成功解码并写入 backing 的帧，在 luma 平面顶部 `sh/8` 行画一个 16 格
    条码：第 `i` 格覆盖 `[i·sw/16, (i+1)·sw/16)`，bit=1 画 Y=235，bit=0 画
    Y=16。串号来自全局原子计数器，随解码单调递增，**唯一标识驱动解的每一帧**。
-   代码位置：`src/decode.c` 的 `surface_stamp()` / `surfaces_mark_decoded()`。
+   代码位置：`src/decode/surface.c` 的 `surface_stamp()` / `surfaces_mark_decoded()`。
 
 2. **页面读回条码**
    `seek_test.html` 把视频缩放到 48×27 后，在第 1 行按格中心采样 16 个 bit，

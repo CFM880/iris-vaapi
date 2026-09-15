@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "../src/decode_internal.h"
+#include "../src/decode/decode_internal.h"
 
 void vpu_platform_session_capture_layout(const struct vpu_platform_session *session,
 	unsigned int *pitch, unsigned int *width, unsigned int *height)

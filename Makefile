@@ -60,32 +60,32 @@ all: $(DRIVER) $(TEST_VA) $(TEST_V4L2) $(TEST_H264) $(TEST_VADEC) \
 	$(TEST_VA_STRESS) $(TEST_SURFACE_FENCE) $(TEST_PLATFORM) $(TEST_CODEC)
 
 DECODE_OBJ = $(BUILD)/decode.o
-SURFACE_OBJ = $(BUILD)/surface.o
-VK_CAPTURE_OBJ = $(BUILD)/vk_capture.o
-STREAM_OBJ = $(BUILD)/stream.o
+SURFACE_OBJ = $(BUILD)/decode_surface.o
+VK_CAPTURE_OBJ = $(BUILD)/decode_vk_capture.o
+STREAM_OBJ = $(BUILD)/decode_stream.o
 DECODE_OBJS = $(DECODE_OBJ) $(SURFACE_OBJ) $(VK_CAPTURE_OBJ) $(STREAM_OBJ)
-DECODE_DEPS = src/decode.h src/decode_internal.h src/codec/types.h \
+DECODE_DEPS = src/decode/decode.h src/decode/decode_internal.h src/codec/types.h \
 	src/platform/platform.h src/codec/codec.h src/vk_copy.h
 
 $(DRIVER): src/vaapi.c $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDFLAGS) $(LDLIBS)
 
-$(DECODE_OBJ): src/decode.c $(DECODE_DEPS)
+$(DECODE_OBJ): src/decode/decode.c $(DECODE_DEPS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/decode.c
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/decode/decode.c
 
-$(SURFACE_OBJ): src/surface.c $(DECODE_DEPS)
+$(SURFACE_OBJ): src/decode/surface.c $(DECODE_DEPS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/surface.c
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/decode/surface.c
 
-$(VK_CAPTURE_OBJ): src/vk_capture.c $(DECODE_DEPS)
+$(VK_CAPTURE_OBJ): src/decode/vk_capture.c $(DECODE_DEPS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vk_capture.c
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/decode/vk_capture.c
 
-$(STREAM_OBJ): src/stream.c $(DECODE_DEPS)
+$(STREAM_OBJ): src/decode/stream.c $(DECODE_DEPS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/stream.c
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/decode/stream.c
 
 $(PLATFORM_CORE_OBJ): src/platform/platform.c src/platform/platform.h src/platform/platform_internal.h src/codec/types.h
 	@mkdir -p $(BUILD)
@@ -186,11 +186,11 @@ $(TEST_CODEC): test/codec/test_codec.c $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(H
 clean:
 	rm -rf $(BUILD)
 
-$(BUILD)/test_vp9_continuation: test/test_vp9_continuation.c src/decode.c src/surface.c src/decode_internal.h
+$(BUILD)/test_vp9_continuation: test/test_vp9_continuation.c src/decode/decode.c src/decode/surface.c src/decode/decode_internal.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ test/test_vp9_continuation.c src/decode.c src/surface.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ test/test_vp9_continuation.c src/decode/decode.c src/decode/surface.c $(LDLIBS)
 
-$(BUILD)/test_surfaces_epoch: test/test_surfaces_epoch.c $(DECODE_OBJS) src/decode_internal.h
+$(BUILD)/test_surfaces_epoch: test/test_surfaces_epoch.c $(DECODE_OBJS) src/decode/decode_internal.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ test/test_surfaces_epoch.c $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDLIBS)
 

@@ -42,7 +42,7 @@
 #define DRM_FORMAT_GR1616	0x32335247	/* 'GR32' */
 #endif
 
-#include "decode.h" 
+#include "decode/decode.h"
 #include "platform/platform.h"
 #include "codec/codec.h"
 

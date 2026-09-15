@@ -98,7 +98,7 @@ mplane 常见坑：
 | 组件 | 状态 |
 |---|---|
 | `src/codec/h264/h264_params.c` — SPS/PPS 重序列化 | ✅ 已验证（重建 NAL 解码像素级一致）|
-| `src/decode.c` — surface 管理 + slice 累积 + 异步解码 | ✅ |
+| `src/decode/` — surface 注册表 + slice 累积 + 异步解码 | ✅ |
 | `src/vaapi.c` — vtable 解码路径 | ✅ |
 | 端到端 `test/test_va_decode.c` | ✅ `DECODE OK` |
 
@@ -271,7 +271,7 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 
 | 卡点 | 修复 |
 |---|---|
-| 空 surface 的 `vaSyncSurface` 超时 | surface 从未入队解码时 sync 立即成功（`src/decode.c`：`queued` 标志）|
+| 空 surface 的 `vaSyncSurface` 超时 | surface 从未入队解码时 sync 立即成功（`src/decode/decode.c`：`queued` 标志）|
 | `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/vaapi.c`）；Chrome DCHECK 每层必须单平面 |
 | `drm_format_modifier` 缺失 | 填 `DRM_FORMAT_MOD_LINEAR`（Chrome 校验 modifier 一致性）|
 
@@ -340,7 +340,7 @@ Chrome 的 `VaapiVideoDecoder` 与 stateful 解码器存在**缓冲模型不匹�
 3. 已解决：surface 属性查询（`VASurfaceAttribMaxWidth/Height`）、
    `vaQueryConfigAttributes` 输出语义、profile 查询 lenient。
 4. 已实现：每个 surface 用 `/dev/dma_heap/system` 分配稳定 DMA-BUF 后备，
-   解码后拷贝进后备（`src/decode.c`）。**ffmpeg 已验证此模型可用**。
+   解码后拷贝进后备（`src/decode/decode.c` 与 `src/decode/surface.c`）。**ffmpeg 已验证此模型可用**。
    若 `/dev/dma_heap/system` 不可访问（root only，默认权限），驱动自动
    回退到 **memfd 后备**：本地测试与 ffmpeg CPU 读回路径仍可无 root 运行
    （输出与软解逐字节一致），但该 fd 不是 DRM buffer，**无法被 GPU/EGL
