@@ -15,7 +15,13 @@ codec 与 scheduler。
 libva client
     │
     ▼
-VA frontend                 src/vaapi.c
+VA frontend                 src/vaapi/vaapi.c
+    │                       src/vaapi/vaapi_internal.h  (driver state)
+    │                       src/vaapi/vaapi_config.c    (profiles/configs)
+    │                       src/vaapi/vaapi_surface.c   (surfaces/export)
+    │                       src/vaapi/vaapi_image.c     (images/derive)
+    │                       src/vaapi/vaapi_buffer.c    (buffers)
+    │                       src/vaapi/vaapi_decode.c    (contexts/pictures)
     │  VA objects / buffers / images
     ▼
 codec registry + adapters   src/codec/codec.c

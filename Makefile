@@ -67,9 +67,44 @@ DECODE_OBJS = $(DECODE_OBJ) $(SURFACE_OBJ) $(VK_CAPTURE_OBJ) $(STREAM_OBJ)
 DECODE_DEPS = src/decode/decode.h src/decode/decode_internal.h src/codec/types.h \
 	src/platform/platform.h src/codec/codec.h src/vk_copy.h
 
-$(DRIVER): src/vaapi.c $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ)
+VAAPI_CORE_OBJ = $(BUILD)/vaapi.o
+VAAPI_CONFIG_OBJ = $(BUILD)/vaapi_config.o
+VAAPI_SURFACE_OBJ = $(BUILD)/vaapi_surface.o
+VAAPI_IMAGE_OBJ = $(BUILD)/vaapi_image.o
+VAAPI_BUFFER_OBJ = $(BUILD)/vaapi_buffer.o
+VAAPI_DECODE_OBJ = $(BUILD)/vaapi_decode.o
+VAAPI_OBJS = $(VAAPI_CORE_OBJ) $(VAAPI_CONFIG_OBJ) $(VAAPI_SURFACE_OBJ) \
+	$(VAAPI_IMAGE_OBJ) $(VAAPI_BUFFER_OBJ) $(VAAPI_DECODE_OBJ)
+VAAPI_DEPS = src/vaapi/vaapi_internal.h src/decode/decode.h \
+	src/codec/codec.h src/platform/platform.h
+
+$(DRIVER): $(VAAPI_OBJS) $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $< $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -g -fPIC -shared $(CPPFLAGS) -Isrc -o $@ $(VAAPI_OBJS) $(DECODE_OBJS) $(PLATFORM_OBJS) $(CODEC_OBJS) $(H264_OBJ) $(HEVC_OBJ) $(HEVC_REWRITE_OBJ) $(VK_COPY_OBJ) $(LDFLAGS) $(LDLIBS)
+
+$(VAAPI_CORE_OBJ): src/vaapi/vaapi.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi.c
+
+$(VAAPI_CONFIG_OBJ): src/vaapi/vaapi_config.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi_config.c
+
+$(VAAPI_SURFACE_OBJ): src/vaapi/vaapi_surface.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi_surface.c
+
+$(VAAPI_IMAGE_OBJ): src/vaapi/vaapi_image.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi_image.c
+
+$(VAAPI_BUFFER_OBJ): src/vaapi/vaapi_buffer.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi_buffer.c
+
+$(VAAPI_DECODE_OBJ): src/vaapi/vaapi_decode.c $(VAAPI_DEPS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -fPIC $(CPPFLAGS) -Isrc -c -o $@ src/vaapi/vaapi_decode.c
 
 $(DECODE_OBJ): src/decode/decode.c $(DECODE_DEPS)
 	@mkdir -p $(BUILD)

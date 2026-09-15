@@ -40,7 +40,7 @@ VASurfaceID ← NV12 DMA buffer（timestamp 匹配）
 
 ### P0 — VA-API 驱动骨架（✅ 完成）
 
-`src/vaapi.c` 让 libva 能加载驱动并枚举解码能力：
+`src/vaapi/` 让 libva 能加载驱动并枚举解码能力：
 
 ```
 $ LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH=$PWD/build vainfo
@@ -99,7 +99,7 @@ mplane 常见坑：
 |---|---|
 | `src/codec/h264/h264_params.c` — SPS/PPS 重序列化 | ✅ 已验证（重建 NAL 解码像素级一致）|
 | `src/decode/` — surface 注册表 + slice 累积 + 异步解码 | ✅ |
-| `src/vaapi.c` — vtable 解码路径 | ✅ |
+| `src/vaapi/` — vtable 解码路径 | ✅ |
 | 端到端 `test/test_va_decode.c` | ✅ `DECODE OK` |
 
 关键实现要点：
@@ -272,7 +272,7 @@ Chrome 151（Wayland 原生）加载 iris 驱动并**流畅解码 H.264 视频**
 | 卡点 | 修复 |
 |---|---|
 | 空 surface 的 `vaSyncSurface` 超时 | surface 从未入队解码时 sync 立即成功（`src/decode/decode.c`：`queued` 标志）|
-| `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/vaapi.c`）；Chrome DCHECK 每层必须单平面 |
+| `vaExportSurfaceHandle` 的 `SEPARATE_LAYERS` 要求 | NV12 按 2 层、每层 1 平面返回（`src/vaapi/vaapi_surface.c`）；Chrome DCHECK 每层必须单平面 |
 | `drm_format_modifier` 缺失 | 填 `DRM_FORMAT_MOD_LINEAR`（Chrome 校验 modifier 一致性）|
 
 **运行方式**：Chrome GPU 进程需继承 `LIBVA_DRIVER_NAME=vpu`（用包装脚本
