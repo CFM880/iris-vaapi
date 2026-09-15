@@ -1,29 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+/* Per-context access-unit pipeline: reassembles complete AUs from
+ * vaRenderPicture buffers, feeds the platform session and maps decoded frames
+ * back to VA surfaces.  Session lifecycle, surface registry and the Vulkan
+ * copy ring live in stream.c, surface.c and vk_capture.c respectively.
+ *
+ * Threading/lifecycle model (matches how Chrome uses libva):
+ * - Surfaces live in a display-level registry (vpu_surfaces) and may outlive
+ *   the decode context that produced them.
+ * - Each VA context owns its own vpu_decode_ctx (its own VPU session), so
+ *   concurrent videos do not share engine state. A resized VP9 context may
+ *   inherit a retired session only through explicit reference surfaces.
+ */
 
 #include <errno.h>
 #include <stdio.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 #include <time.h>
-#include <unistd.h>
-#include <linux/dma-buf.h>
-#include <linux/dma-heap.h>
-#include <pthread.h>
 
-#include "decode.h"
-#include "codec/codec.h"
-#include "platform/platform.h"
-#include "vk_copy.h"
+#include "decode_internal.h"
 
-/* Chrome runs one VaapiVideoDecoder per video; every decoder owns a frame
- * pool of up to ~32 surfaces and pools coexist across tabs/resolution
- * changes, so the registry must hold several pools at once. */
-#define VPU_MAX_SURFACES	128
-#define VPU_MAX_PENDING_COPIES	32
 /* VA-API has no decoder-reset callback (modern libva has no vaFlush), and
  * Chromium's Reset() neither sends EOS nor recreates the VAContext.  A
  * random-access picture is therefore only treated as a stream boundary when
@@ -59,845 +55,23 @@ stream_idle_ns(void)
 	return value;
 }
 
-#ifndef ALIGN_TO
-#define ALIGN_TO(x, a) (((x) + (a) - 1) & ~((a) - 1))
-#endif
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#endif
-
-static unsigned int
-surface_pitch(unsigned int width, unsigned int fourcc)
-{
-	unsigned int bytes = fourcc == VPU_PIXEL_FORMAT_P010 ? 2 : 1;
-	unsigned int alignment = fourcc == VPU_PIXEL_FORMAT_P010 ? 256 : 128;
-
-	return ALIGN_TO(width * bytes, alignment);
-}
-
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC	0x0001U
-#endif
-
-/* Per-frame tracing is extremely chatty and the GPU process inherits this
- * stderr; unconditionally writing it stalls the decode loop when the terminal
- * is slow.  Opt in with VPU_VAAPI_DEBUG=1. */
 static int g_dbg = -1;
-static uint64_t g_buffer_serial;
-/* Diagnostic frame counter for VPU_FRAME_STAMP: every decoded frame written
- * into a backing gets a unique serial painted as a barcode so the seek
- * harness can prove which driver frame the compositor is displaying. */
-static uint64_t g_frame_stamp;
 
-static int dbg_enabled(void)
+int
+vpu_dbg_enabled(void)
 {
 	if (g_dbg < 0)
 		g_dbg = getenv("VPU_VAAPI_DEBUG") != NULL;
 	return g_dbg;
 }
 
-#define DBG(...)	do { if (dbg_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
-
-static uint64_t
-monotonic_ns(void)
+uint64_t
+vpu_monotonic_ns(void)
 {
 	struct timespec ts;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static int
-dma_heap_alloc(int heap_fd, unsigned int size)
-{
-	struct dma_heap_allocation_data data;
-
-	memset(&data, 0, sizeof(data));
-	data.len = size;
-	data.fd = 0;
-	data.fd_flags = O_RDWR | O_CLOEXEC;
-	if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) < 0)
-		return -1;
-	return data.fd;
-}
-
-/* Fallback backing for when /dev/dma_heap/system is not accessible (root
- * only): an anonymous memfd is mmappable and readable by local tests and the
- * ffmpeg CPU readback path, but is NOT a DRM buffer and cannot be imported by
- * EGL/GPU clients like Chrome. */
-static int
-memfd_alloc(unsigned int size)
-{
-	int fd = (int)syscall(SYS_memfd_create, "vpu-surface", MFD_CLOEXEC);
-
-	if (fd < 0)
-		return -1;
-	if (ftruncate(fd, size) < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
-}
-
-static int
-dma_buf_cpu_sync(int fd, uint64_t flags)
-{
-	struct dma_buf_sync sync = { .flags = flags };
-	int ret;
-
-	do {
-		ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-	} while (ret < 0 && errno == EINTR);
-	return ret;
-}
-
-static void
-surface_fill_black(int fd, void *map, unsigned int pitch,
-		   unsigned int height, unsigned int fourcc)
-{
-	size_t luma_size = (size_t)pitch * ALIGN_TO(height, 32);
-	size_t total_size = luma_size * 3 / 2;
-	int sync_started;
-
-	sync_started = dma_buf_cpu_sync(fd,
-		DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
-	if (fourcc == VPU_PIXEL_FORMAT_P010) {
-		uint16_t *pixels = map;
-		size_t i;
-
-		/* P010 stores limited-range 10-bit components in the high bits. */
-		for (i = 0; i < luma_size / sizeof(*pixels); i++)
-			pixels[i] = 64U << 6;
-		for (; i < total_size / sizeof(*pixels); i++)
-			pixels[i] = 512U << 6;
-	} else {
-		/* Limited-range NV12 black: Y=16, neutral interleaved UV=128. */
-		memset(map, 16, luma_size);
-		memset((uint8_t *)map + luma_size, 128, total_size - luma_size);
-	}
-	if (sync_started)
-		(void)dma_buf_cpu_sync(fd,
-			DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-}
-
-struct vpu_surface {
-	VASurfaceID id;
-	int bfd;		/* backing fd (DMA-heap, or memfd fallback) */
-	void *bmap;		/* mmap of the backing */
-	unsigned int bsize;
-	unsigned int sw, sh;	/* coded size the backing was created for */
-	unsigned int fourcc;	/* VA/V4L2 layout: NV12 or P010 */
-	int decoded;		/* a frame has been copied into the backing */
-	int queued;		/* some picture was decoded into this surface */
-	int exported;		/* backing has been exported to a DRM client */
-	int initialized;		/* backing has decoded or neutral-black pixels */
-	int own_layout;		/* visible rectangle copied into surface layout */
-	int write_started;	/* DMA_BUF_SYNC write access spans async decode */
-	uint64_t fence_token;	/* pending kernel reservation fence, or zero */
-	uint64_t generation;	/* render-target reuse generation */
-	uint64_t epoch;		/* stream epoch of the last valid backing content */
-	uint64_t backing_serial;	/* unique identity for Vulkan import cache */
-	struct vpu_decode_ctx *owner;	/* engine that queued the picture */
-};
-
-static int
-surface_finish_write(struct vpu_platform_session *session, struct vpu_surface *s)
-{
-	int ret = 0;
-
-	if (s->write_started &&
-	    dma_buf_cpu_sync(s->bfd,
-			     DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE) < 0)
-		ret = -errno;
-	s->write_started = 0;
-	if (s->fence_token) {
-		int signal_ret = vpu_platform_session_signal_surface_fence(session,
-							 s->fence_token);
-
-		s->fence_token = 0;
-		if (!ret && signal_ret)
-			ret = signal_ret;
-	}
-	return ret;
-}
-
-static void
-surface_begin_write(struct vpu_platform_session *session, struct vpu_surface *s,
-		    uint64_t token)
-{
-	if (s->write_started || s->fence_token)
-		surface_finish_write(session, s);
-	if (dma_buf_cpu_sync(s->bfd,
-			     DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) < 0)
-		return;
-	s->write_started = 1;
-	if (!vpu_platform_session_attach_surface_fence(session, s->bfd, token)) {
-		s->fence_token = token;
-	} else {
-		dma_buf_cpu_sync(s->bfd,
-				 DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-		s->write_started = 0;
-	}
-}
-
-static void
-surface_begin_device_write(struct vpu_platform_session *session, struct vpu_surface *s,
-			   uint64_t token)
-{
-	if (s->write_started || s->fence_token)
-		surface_finish_write(session, s);
-	if (!vpu_platform_session_attach_surface_fence(session, s->bfd, token))
-		s->fence_token = token;
-}
-
-/* Display-level registry: surfaces may outlive the engine that decodes into
- * them (Chrome destroys contexts on navigation while pool surfaces drain). */
-struct vpu_surfaces {
-	struct vpu_surface s[VPU_MAX_SURFACES];
-	int n;
-	struct vpu_vk_copy *vk_copy;
-	/* Stream epoch: bumped whenever the decoder abandons a stream (seek /
-	 * context recreation).  A surface whose backing was last written in an
-	 * older epoch still holds pre-seek pixels and must not be presented.
-	 * last_frame/last_frame_epoch track the newest frame decoded in the
-	 * current epoch so a stale surface can be backfilled (repeat last
-	 * frame) instead of revealing the old picture. */
-	uint64_t epoch;
-	VASurfaceID last_frame;
-	uint64_t last_frame_epoch;
-};
-
-struct vpu_decode_ctx {
-	pthread_mutex_t mutex;
-	struct vpu_platform_session *session;
-	struct vpu_codec *codec_adapter;
-	int dec_open;
-	int dec_started;
-	unsigned int width, height;
-	enum vpu_codec_id codec;
-	enum vpu_pixel_format pixel_format;
-	uint32_t platform_quirks;
-	int direct_capture;
-	int direct_error;
-	int fatal_error;
-	struct vpu_vk_copy *vk_copy;
-	int vk_copy_failed;
-	uint64_t vk_capture_generation;
-	uint64_t vk_capture_keys[VPU_MAX_SURFACES];
-	struct {
-		struct vpu_vk_job *job;
-		VASurfaceID id;
-		uint64_t generation;
-		uint64_t fence_token;
-		uint64_t start_ns;
-		size_t bytes;
-		unsigned int capture_index;
-		int used;
-	} pending_copies[VPU_MAX_PENDING_COPIES];
-	unsigned int direct_count;
-	unsigned int direct_requested_count;
-	struct {
-		VASurfaceID id;
-		int fd;
-		size_t size;
-	} direct[VPU_MAX_SURFACES];
-
-	struct vpu_surfaces *surfs;	/* not owned */
-	VASurfaceID current_target;
-	uint64_t current_generation;
-	/*
-	 * H.264 PAFF renders both fields of a frame into the same render target
-	 * with two BeginPicture/EndPicture pairs.  field_open tracks a first
-	 * field whose second field is still to come, second_field marks the
-	 * current picture as that second field, and field_ts keeps the
-	 * timestamp shared by the pair so one firmware frame maps back to the
-	 * target ring entry created for the first field.
-	 */
-	int field_open;
-	int second_field;
-	uint64_t field_ts;
-
-	/* Map decode sequence numbers back to target surfaces so frame
-	 * matching does not depend on the (possibly non-contiguous) VASurfaceID
-	 * values that the client happens to use.  The ring is indexed by
-	 * (seq & mask) and validated by the stored seq, so playback longer
-	 * than any fixed table just wraps instead of breaking. */
-#define VPU_TARGET_RING	1024	/* power of two */
-	uint64_t seq;
-	struct {
-		uint64_t seq;
-		VASurfaceID target;
-		uint64_t generation;
-		int used;
-	} target_ring[VPU_TARGET_RING];
-	VASurfaceID last_target;	/* most recently queued picture */
-	int eos_sent;			/* EOS (vpu_platform_session_flush) queued */
-	/* Platforms with HEVC_CAPTURE_FIFO do not propagate usable per-frame
-	 * timestamps and emit CAPTURE frames in display order, so retain POC-to-surface
-	 * state as a strict FIFO ring: pictures complete in the order they
-	 * were queued, and a ring can never overflow into a hard failure. */
-#define VPU_HEVC_RING	512
-	struct {
-		int32_t poc;
-		VASurfaceID target;
-		uint64_t generation;
-	} hevc_ring[VPU_HEVC_RING];
-	unsigned int hevc_ring_head, hevc_ring_len;
-
-	int stats_enabled;
-	uint64_t stats_copy_ns;
-	uint64_t stats_copy_bytes;
-	uint64_t stats_copy_frames;
-	uint64_t stats_vk_copy_ns;
-	uint64_t stats_vk_copy_bytes;
-	uint64_t stats_vk_copy_frames;
-	uint64_t stats_vk_copy_fallbacks;
-	uint64_t stats_capture_frames;
-	uint64_t stats_sync_ns;
-	uint64_t stats_rewrite_ns;
-	uint64_t stats_rewrite_bytes;
-	uint64_t stats_rewrites;
-	uint64_t stats_end_ns;
-	uint64_t stats_ends;
-	uint64_t stats_h264_wait_ns;
-	uint64_t stats_h264_waits;
-	uint64_t stats_h264_async;
-	uint64_t stats_direct_frames;
-	uint64_t last_submit_ns;
-	int vp9_seek_barrier;
-	uint8_t vp9_release_au[2];
-	size_t vp9_release_len;
-	int force_h264_sync_end;
-};
-
-static void surface_stamp(struct vpu_surface *s, uint64_t serial);
-
-/* Record that @s now holds a valid frame decoded in the current stream epoch.
- * Every successful decode path must call this so the registry knows both that
- * the surface is presentable and which surface to repeat when a stale surface
- * is later handed to the compositor. */
-static void
-surfaces_mark_decoded(struct vpu_decode_ctx *ctx, struct vpu_surface *s)
-{
-	s->decoded = 1;
-	s->queued = 1;
-	s->owner = ctx;
-	if (ctx->surfs) {
-		uint64_t serial = __atomic_add_fetch(&g_frame_stamp, 1,
-						     __ATOMIC_RELAXED) + 1;
-
-		s->epoch = ctx->surfs->epoch;
-		ctx->surfs->last_frame = s->id;
-		ctx->surfs->last_frame_epoch = ctx->surfs->epoch;
-		surface_stamp(s, serial);
-		DBG("[stamp] serial=%llu target=%u epoch=%llu\n",
-		    (unsigned long long)serial, s->id,
-		    (unsigned long long)ctx->surfs->epoch);
-	}
-}
-
-static int
-frame_stamp_enabled(void)
-{
-	static int value = -1;
-
-	if (value < 0)
-		value = getenv("VPU_FRAME_STAMP") != NULL;
-	return value;
-}
-
-/* Diagnostic: paint the low 16 bits of @serial as a barcode across the top
- * eighth of the luma plane (16 cells, bit 1 -> Y=235, bit 0 -> Y=16) so the
- * seek harness can read back which driver frame the compositor displays. */
-static void
-surface_stamp(struct vpu_surface *s, uint64_t serial)
-{
-	unsigned int cell = s->sw / 16;
-	unsigned int rows = s->sh / 8 ? s->sh / 8 : 1;
-	unsigned int pitch = surface_pitch(s->sw, s->fourcc);
-	int sync;
-
-	if (!cell || !frame_stamp_enabled())
-		return;
-	sync = dma_buf_cpu_sync(s->bfd,
-			       DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
-	for (unsigned int b = 0; b < 16; b++) {
-		uint8_t val = (serial >> b) & 1 ? 235 : 16;
-
-		for (unsigned int y = 0; y < rows; y++)
-			memset((uint8_t *)s->bmap + (size_t)y * pitch + b * cell,
-			       val, cell);
-	}
-	if (sync)
-		(void)dma_buf_cpu_sync(s->bfd,
-				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-}
-
-static struct vpu_surface *
-find_surface(struct vpu_decode_ctx *ctx, VASurfaceID id);
-
-static int
-surface_copy(struct vpu_decode_ctx *ctx, struct vpu_surface *s,
-	     const void *src, size_t size)
-{
-	int sync_started = s->write_started;
-	int ret = 0;
-	uint64_t start;
-	unsigned int pitch, width, height;
-	unsigned int dst_pitch = surface_pitch(s->sw, s->fourcc);
-	unsigned int row_bytes = s->sw * (s->fourcc == VPU_PIXEL_FORMAT_P010 ? 2 : 1);
-	int rectangular;
-
-	vpu_platform_session_capture_layout(ctx->session, &pitch, &width, &height);
-	rectangular = pitch != dst_pitch || ALIGN_TO(height, 32) != ALIGN_TO(s->sh, 32);
-	if (rectangular && (!src || s->sw > width || s->sh > height ||
-	    row_bytes > pitch || row_bytes > dst_pitch ||
-	    (size_t)pitch * ALIGN_TO(height, 32) * 3 / 2 > size ||
-	    (size_t)dst_pitch * ALIGN_TO(s->sh, 32) * 3 / 2 > s->bsize))
-		return -EINVAL;
-	if (!rectangular && size > s->bsize)
-		return -E2BIG;
-	/* The backing is imported by Chrome's GPU process while this process
-	 * updates it through an mmap.  DMA_BUF_IOCTL_SYNC supplies the required
-	 * ownership/cache transition on non-coherent ARM systems; without it,
-	 * 4K frames can be sampled with stale cache lines and appear torn or
-	 * partially corrupted.  memfd fallback buffers do not support this
-	 * ioctl and remain ordinary coherent CPU mappings. */
-	if (!sync_started && dma_buf_cpu_sync(s->bfd,
-				    DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0) {
-		s->write_started = 1;
-		sync_started = 1;
-	} else if (!sync_started && errno != ENOTTY && errno != EINVAL) {
-		return -errno;
-	}
-
-	start = ctx->stats_enabled ? monotonic_ns() : 0;
-	if (rectangular) {
-		const uint8_t *in = src;
-		uint8_t *out = s->bmap;
-
-		for (unsigned int y = 0; y < s->sh; y++)
-			memcpy(out + y * dst_pitch, in + y * pitch, row_bytes);
-		in += (size_t)pitch * ALIGN_TO(height, 32);
-		out += (size_t)dst_pitch * ALIGN_TO(s->sh, 32);
-		for (unsigned int y = 0; y < (s->sh + 1) / 2; y++)
-			memcpy(out + y * dst_pitch, in + y * pitch, row_bytes);
-	} else {
-		memcpy(s->bmap, src, size);
-	}
-	s->initialized = 1;
-	s->own_layout = rectangular;
-	if (ctx->stats_enabled) {
-		ctx->stats_copy_ns += monotonic_ns() - start;
-		ctx->stats_copy_bytes += size;
-		ctx->stats_copy_frames++;
-	}
-
-	if (sync_started) {
-		start = ctx->stats_enabled ? monotonic_ns() : 0;
-		ret = surface_finish_write(ctx->session, s);
-		if (ctx->stats_enabled)
-			ctx->stats_sync_ns += monotonic_ns() - start;
-	}
-	return ret;
-}
-
-static int
-finish_vk_copy(struct vpu_decode_ctx *ctx, unsigned int index, int wait)
-{
-	typeof(ctx->pending_copies[0]) *pending = &ctx->pending_copies[index];
-	struct vpu_surface *s;
-	int ret, finish_ret = 0;
-
-	if (!pending->used)
-		return 0;
-	ret = vpu_vk_copy_job_wait(ctx->vk_copy, pending->job,
-				    wait ? UINT64_MAX : 0);
-	if (ret <= 0)
-		return ret;
-
-	s = find_surface(ctx, pending->id);
-	if (s && s->generation == pending->generation &&
-	    s->fence_token == pending->fence_token) {
-		finish_ret = surface_finish_write(ctx->session, s);
-		s->initialized = 1;
-		surfaces_mark_decoded(ctx, s);
-	} else if (pending->fence_token) {
-		/* The VA client should not destroy/recycle an in-flight target,
-		 * but never leave its reservation fence permanently unsignalled if
-		 * it does. */
-		finish_ret = vpu_platform_session_signal_surface_fence(
-			ctx->session, pending->fence_token);
-	}
-	ret = vpu_platform_session_requeue_index(ctx->session, pending->capture_index);
-	if (!finish_ret && ret)
-		finish_ret = ret;
-	if (ctx->stats_enabled) {
-		ctx->stats_vk_copy_ns += monotonic_ns() - pending->start_ns;
-		ctx->stats_vk_copy_bytes += pending->bytes;
-		ctx->stats_vk_copy_frames++;
-	}
-	vpu_vk_copy_job_release(pending->job);
-	memset(pending, 0, sizeof(*pending));
-	return finish_ret ? finish_ret : 1;
-}
-
-static int
-reap_vk_copies(struct vpu_decode_ctx *ctx, int wait_all)
-{
-	unsigned int i;
-	int ret;
-
-	if (!ctx->vk_copy)
-		return 0;
-	for (i = 0; i < ARRAY_SIZE(ctx->pending_copies); i++) {
-		if (!ctx->pending_copies[i].used)
-			continue;
-		ret = finish_vk_copy(ctx, i, wait_all);
-		if (ret < 0)
-			return ret;
-	}
-	return 0;
-}
-
-static void
-forget_vk_capture_buffers(struct vpu_decode_ctx *ctx)
-{
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(ctx->vk_capture_keys); i++) {
-		if (ctx->vk_capture_keys[i])
-			vpu_vk_copy_forget(ctx->vk_copy,
-					    ctx->vk_capture_keys[i]);
-	}
-	ctx->vk_capture_generation = 0;
-	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
-}
-
-static int
-finish_vk_surface(struct vpu_decode_ctx *ctx, VASurfaceID id, int wait)
-{
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(ctx->pending_copies); i++) {
-		int ret;
-
-		if (!ctx->pending_copies[i].used ||
-		    ctx->pending_copies[i].id != id)
-			continue;
-		ret = finish_vk_copy(ctx, i, wait);
-		if (ret < 0)
-			return ret;
-		if (!ret)
-			return -EAGAIN;
-	}
-	return 0;
-}
-
-static int
-surface_vk_submit(struct vpu_decode_ctx *ctx, struct vpu_surface *s,
-		  const struct vpu_decoded_frame *frame)
-{
-	unsigned int pitch, source_size;
-	unsigned int slot;
-	struct vpu_vk_job *job;
-	int source_fd, ret, completed = 0;
-
-	if (!ctx->vk_copy || ctx->vk_copy_failed)
-		return -ENOTSUP;
-	if (frame->index >= ARRAY_SIZE(ctx->vk_capture_keys))
-		return -ERANGE;
-	if (ctx->vk_capture_generation != frame->capture_generation) {
-		ret = reap_vk_copies(ctx, 1);
-		if (ret)
-			return ret;
-		forget_vk_capture_buffers(ctx);
-		ctx->vk_capture_generation = frame->capture_generation;
-	}
-	if (!ctx->vk_capture_keys[frame->index])
-		ctx->vk_capture_keys[frame->index] = __atomic_add_fetch(
-			&g_buffer_serial, 1, __ATOMIC_RELAXED);
-	ret = vpu_platform_session_export_frame(ctx->session, frame->index, &source_fd, &pitch,
-			      &source_size);
-	if (ret)
-		return ret;
-	/* Chrome imports stable surfaces before decode.  Legacy ANGLE does not
-	 * reliably observe reservation fences attached after that import, so
-	 * finish the GPU copy before returning a dequeued exported surface.  The
-	 * decode-only path below remains fully asynchronous. */
-	if (s->exported) {
-		uint64_t start = ctx->stats_enabled ? monotonic_ns() : 0;
-
-		ret = vpu_vk_copy_dmabuf(ctx->vk_copy,
-					  ctx->vk_capture_keys[frame->index],
-					  source_fd, source_size,
-					  s->backing_serial, s->bfd, s->bsize,
-					  frame->bytesused);
-		if (!ret)
-			ret = surface_finish_write(ctx->session, s);
-		if (!ret) {
-			if (ctx->stats_enabled) {
-				ctx->stats_vk_copy_ns += monotonic_ns() - start;
-				ctx->stats_vk_copy_bytes += frame->bytesused;
-				ctx->stats_vk_copy_frames++;
-			}
-			completed = 1;
-		}
-		goto out;
-	}
-	for (slot = 0; slot < ARRAY_SIZE(ctx->pending_copies); slot++)
-		if (!ctx->pending_copies[slot].used)
-			break;
-	if (slot == ARRAY_SIZE(ctx->pending_copies)) {
-		ret = reap_vk_copies(ctx, 0);
-		if (ret)
-			goto out;
-		for (slot = 0; slot < ARRAY_SIZE(ctx->pending_copies); slot++)
-			if (!ctx->pending_copies[slot].used)
-				break;
-	}
-	if (slot == ARRAY_SIZE(ctx->pending_copies)) {
-		/* V4L2 currently has at most 20 CAPTURE buffers, so this is only
-		 * a defensive pressure valve. */
-		ret = finish_vk_copy(ctx, 0, 1);
-		if (ret < 0)
-			goto out;
-		slot = 0;
-	}
-
-	ret = vpu_vk_copy_submit(ctx->vk_copy,
-				 ctx->vk_capture_keys[frame->index],
-				 source_fd, source_size,
-				 s->backing_serial, s->bfd, s->bsize,
-				 frame->bytesused, &job);
-	if (!ret) {
-		ctx->pending_copies[slot].job = job;
-		ctx->pending_copies[slot].id = s->id;
-		ctx->pending_copies[slot].generation = s->generation;
-		ctx->pending_copies[slot].fence_token = s->fence_token;
-		ctx->pending_copies[slot].start_ns = monotonic_ns();
-		ctx->pending_copies[slot].bytes = frame->bytesused;
-		ctx->pending_copies[slot].capture_index = frame->index;
-		ctx->pending_copies[slot].used = 1;
-	}
-out:
-	close(source_fd);
-	if (ret) {
-		ctx->stats_vk_copy_fallbacks++;
-		if (!ctx->vk_copy_failed)
-			fprintf(stderr,
-				"vpu-vaapi: Vulkan DMA-BUF copy failed (%s); using CPU copy\n",
-				strerror(-ret));
-		ctx->vk_copy_failed = 1;
-		return ret;
-	}
-	return completed ? 1 : 0;
-}
-
-static void
-finish_pending_writes(struct vpu_decode_ctx *ctx)
-{
-	int i;
-
-	if (!ctx->surfs || !ctx->dec_open)
-		return;
-	(void)reap_vk_copies(ctx, 1);
-	for (i = 0; i < ctx->surfs->n; i++) {
-		struct vpu_surface *s = &ctx->surfs->s[i];
-
-		if (s->owner == ctx && (s->write_started || s->fence_token))
-			surface_finish_write(ctx->session, s);
-	}
-}
-
-static void
-detach_owned_surfaces(struct vpu_decode_ctx *ctx)
-{
-	int i;
-
-	if (!ctx->surfs)
-		return;
-	for (i = 0; i < ctx->surfs->n; i++) {
-		struct vpu_surface *s = &ctx->surfs->s[i];
-
-		if (s->owner == ctx)
-			s->owner = NULL;
-	}
-}
-
-static struct vpu_surface *
-surfs_find(struct vpu_surfaces *t, VASurfaceID id)
-{
-	int i;
-
-	if (!t)
-		return NULL;
-	for (i = 0; i < t->n; i++)
-		if (t->s[i].id == id)
-			return &t->s[i];
-	return NULL;
-}
-
-static struct vpu_surface *
-find_surface(struct vpu_decode_ctx *ctx, VASurfaceID id)
-{
-	return surfs_find(ctx->surfs, id);
-}
-
-/* Copy one backing into another (same linear layout).  Both mappings are
- * cache-synchronised for the transfer; memfd fallbacks reject the ioctl and
- * are simply coherent CPU mappings. */
-static int
-surface_backing_copy(struct vpu_surface *dst, struct vpu_surface *src)
-{
-	size_t size = (size_t)surface_pitch(dst->sw, dst->fourcc) *
-		      ALIGN_TO(dst->sh, 32) * 3 / 2;
-	int src_sync, dst_sync;
-
-	if (size > dst->bsize || size > src->bsize)
-		return 0;
-	src_sync = dma_buf_cpu_sync(src->bfd,
-				   DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ) == 0;
-	dst_sync = dma_buf_cpu_sync(dst->bfd,
-				   DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) == 0;
-	memcpy(dst->bmap, src->bmap, size);
-	if (dst_sync)
-		(void)dma_buf_cpu_sync(dst->bfd,
-				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-	if (src_sync)
-		(void)dma_buf_cpu_sync(src->bfd,
-				       DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-	return 1;
-}
-
-/* Abandon the current stream: bump the display-level epoch and drop the
- * repeat-last-frame source.  Surfaces written in the old epoch are now stale
- * and will be backfilled lazily if the client presents them without decoding
- * into them first. */
-static void
-surfs_begin_epoch(struct vpu_surfaces *t)
-{
-	if (!t)
-		return;
-	t->epoch++;
-	if (!t->epoch)
-		t->epoch = 1;
-	t->last_frame = 0;
-	t->last_frame_epoch = 0;
-	DBG("[epoch] begin -> %llu\n", (unsigned long long)t->epoch);
-}
-
-/* Make a stale surface presentable: repeat the newest frame of the current
- * epoch when one exists, otherwise neutral black.  This is the last line of
- * defence against a client (Chrome reusing its frame pool across per-seek
- * context recreation) sampling pre-seek pixels. */
-static void
-surfs_backfill_stale(struct vpu_surfaces *t, struct vpu_surface *dst)
-{
-	struct vpu_surface *src = NULL;
-	unsigned int pitch = surface_pitch(dst->sw, dst->fourcc);
-	int copied = 0;
-
-	if (t->last_frame_epoch == t->epoch) {
-		src = surfs_find(t, t->last_frame);
-		if (src && src != dst && src->epoch == t->epoch && src->decoded &&
-		    src->fourcc == dst->fourcc && src->bsize == dst->bsize &&
-		    surface_pitch(src->sw, src->fourcc) == pitch &&
-		    ALIGN_TO(src->sh, 32) == ALIGN_TO(dst->sh, 32))
-			copied = surface_backing_copy(dst, src);
-	}
-	if (!copied)
-		surface_fill_black(dst->bfd, dst->bmap, pitch,
-				   ALIGN_TO(dst->sh, 32), dst->fourcc);
-	dst->epoch = t->epoch;
-	dst->decoded = 1;
-	dst->initialized = 1;
-	DBG("[stale] backfill id=%u %s\n", dst->id,
-	    copied ? "last-frame" : "black");
-}
-
-static void
-target_ring_reset(struct vpu_decode_ctx *ctx)
-{
-	memset(ctx->target_ring, 0, sizeof(ctx->target_ring));
-}
-
-/* Retain only VP9 sessions whose reference surfaces still exist. */
-int vpu_decode_retain_vp9(struct vpu_decode_ctx *ctx)
-{
-	if (!ctx || ctx->codec != VPU_CODEC_VP9 || !ctx->dec_started ||
-	    ctx->eos_sent || ctx->fatal_error || ctx->direct_capture || !ctx->surfs)
-		return 0;
-	for (int i = 0; i < ctx->surfs->n; i++)
-		if (ctx->surfs->s[i].owner == ctx)
-			return 1;
-	return 0;
-}
-
-struct vpu_decode_ctx *vpu_decode_vp9_predecessor(
-	struct vpu_decode_ctx *ctx, const VADecPictureParameterBufferVP9 *pic)
-{
-	struct vpu_decode_ctx *owner = NULL;
-	unsigned int refs[] = { pic->pic_fields.bits.last_ref_frame,
-		pic->pic_fields.bits.golden_ref_frame, pic->pic_fields.bits.alt_ref_frame };
-
-	if (ctx->codec != VPU_CODEC_VP9 || ctx->dec_open || ctx->direct_capture ||
-	    !pic->pic_fields.bits.frame_type || pic->pic_fields.bits.intra_only)
-		return NULL;
-	for (unsigned int i = 0; i < ARRAY_SIZE(refs); i++) {
-		struct vpu_surface *s = find_surface(ctx, pic->reference_frames[refs[i]]);
-
-		if (!s || !s->owner || (owner && owner != s->owner))
-			return NULL;
-		owner = s->owner;
-	}
-	if (!vpu_decode_retain_vp9(owner) || owner->pixel_format != ctx->pixel_format ||
-	    ctx->width > owner->width || ctx->height > owner->height)
-		return NULL;
-	return owner;
-}
-
-/* Clear only state owned by one V4L2 firmware session.  Keep the picture that
- * may already have been collected between vaBeginPicture and vaEndPicture.
- *
- * This distinction matters after EOS: ensure_decoder() runs from
- * vaEndPicture, after the client has supplied the next picture.  Calling the
- * full reset_stream_state() there used to erase that picture's slice data and
- * parameters, so the first access unit after a seek/flush was incomplete. */
-static void
-reset_decoder_session_state(struct vpu_decode_ctx *ctx)
-{
-	ctx->dec_started = 0;
-	ctx->eos_sent = 0;
-	ctx->last_target = 0;
-	ctx->hevc_ring_head = 0;
-	ctx->hevc_ring_len = 0;
-	ctx->direct_error = 0;
-	ctx->fatal_error = 0;
-	ctx->vk_capture_generation = 0;
-	memset(ctx->vk_capture_keys, 0, sizeof(ctx->vk_capture_keys));
-	/* A new firmware session gets a fresh GPU-copy attempt even if the
-	 * previous session hit a transient Vulkan import/submit failure. */
-	ctx->vk_copy_failed = 0;
-	target_ring_reset(ctx);
-	ctx->seq = 0;
-	ctx->field_open = 0;
-	ctx->second_field = 0;
-	ctx->field_ts = 0;
-	ctx->last_submit_ns = 0;
-	ctx->vp9_seek_barrier = 0;
-	vpu_codec_reset_session(ctx->codec_adapter);
-}
-
-/* Clear all per-stream decode state: parameter-set caches, the sequence to
- * surface mapping and EOS bookkeeping.  Surfaces and their backings are
- * preserved so clients may keep exporting them. */
-static void
-reset_stream_state(struct vpu_decode_ctx *ctx)
-{
-	reset_decoder_session_state(ctx);
-	if (ctx->codec_adapter)
-		vpu_codec_begin_picture(ctx->codec_adapter);
 }
 
 struct vpu_decode_ctx *
@@ -925,6 +99,21 @@ vpu_decode_create(const struct vpu_platform *platform)
 			getenv("VPU_H264_SYNC_END") != NULL;
 	}
 	return ctx;
+}
+
+static void
+detach_owned_surfaces(struct vpu_decode_ctx *ctx)
+{
+	int i;
+
+	if (!ctx->surfs)
+		return;
+	for (i = 0; i < ctx->surfs->n; i++) {
+		struct vpu_surface *s = &ctx->surfs->s[i];
+
+		if (s->owner == ctx)
+			s->owner = NULL;
+	}
 }
 
 void
@@ -1010,28 +199,6 @@ vpu_decode_set_surfaces(struct vpu_decode_ctx *ctx, struct vpu_surfaces *t)
 {
 	ctx->surfs = t;
 	ctx->vk_copy = t ? t->vk_copy : NULL;
-}
-
-static unsigned int
-direct_collect_surfaces(struct vpu_decode_ctx *ctx)
-{
-	unsigned int i, count = 0;
-
-	for (i = 0; i < (unsigned int)ctx->surfs->n &&
-	     count < ARRAY_SIZE(ctx->direct); i++) {
-		struct vpu_surface *s = &ctx->surfs->s[i];
-
-		if (s->sw != ctx->width || s->sh != ctx->height ||
-		    s->fourcc != ctx->pixel_format || s->bfd < 0 ||
-		    (s->owner && s->owner != ctx))
-			continue;
-		ctx->direct[count].id = s->id;
-		ctx->direct[count].fd = s->bfd;
-		ctx->direct[count].size = s->bsize;
-		count++;
-	}
-	ctx->direct_count = count;
-	return count;
 }
 
 int
@@ -1124,419 +291,6 @@ vpu_decode_reconfigure(struct vpu_decode_ctx *ctx, unsigned int width,
 	vpu_codec_reconfigure(ctx->codec_adapter, width, height);
 }
 
-/* Tear down the firmware session and all stream state (Chrome Flush/Reset,
- * seeks).  Surfaces and their backings are preserved so frames already
- * exported to the client stay valid. */
-void
-vpu_decode_reset(struct vpu_decode_ctx *ctx)
-{
-	if (!ctx)
-		return;
-	pthread_mutex_lock(&ctx->mutex);
-	if (ctx->dec_open) {
-		finish_pending_writes(ctx);
-		forget_vk_capture_buffers(ctx);
-		vpu_platform_session_close(ctx->session);
-		ctx->dec_open = 0;
-	}
-	reset_stream_state(ctx);
-	pthread_mutex_unlock(&ctx->mutex);
-}
-
-/* ---- Display-level surface registry ---- */
-
-struct vpu_surfaces *
-vpu_surfaces_create(void)
-{
-	struct vpu_surfaces *t = calloc(1, sizeof(*t));
-
-	if (t && getenv("VPU_VULKAN_COPY"))
-		t->vk_copy = vpu_vk_copy_create();
-	return t;
-}
-
-void
-vpu_surfaces_destroy(struct vpu_surfaces *t)
-{
-	int i;
-
-	if (!t)
-		return;
-	for (i = 0; i < t->n; i++) {
-		struct vpu_surface *s = &t->s[i];
-
-		if (s->owner)
-			pthread_mutex_lock(&s->owner->mutex);
-		if (s->owner)
-			(void)finish_vk_surface(s->owner, s->id, 1);
-		if (s->owner)
-			vpu_vk_copy_forget(s->owner->vk_copy,
-					    s->backing_serial);
-		if (s->owner && s->owner->dec_open &&
-		    (s->write_started || s->fence_token))
-			surface_finish_write(s->owner->session, s);
-		munmap(t->s[i].bmap, t->s[i].bsize);
-		close(t->s[i].bfd);
-		if (s->owner)
-			pthread_mutex_unlock(&s->owner->mutex);
-	}
-	vpu_vk_copy_destroy(t->vk_copy);
-	free(t);
-}
-
-int
-vpu_surfaces_alloc(struct vpu_surfaces *t, VASurfaceID id,
-		 unsigned int width, unsigned int height, unsigned int fourcc)
-{
-	struct vpu_surface *s;
-	unsigned int size;
-	int heap, bfd;
-	void *map;
-
-	if (!t || t->n >= VPU_MAX_SURFACES)
-		return -1;
-
-	/* Stable, exportable backing buffer independent of any V4L2 session.
-	 * Prefer a real DMA-heap buffer so the exported fd can be imported by
-	 * GPU clients (Chrome/EGL); fall back to a plain memfd when the heap
-	 * node is root-only, which keeps local tests and CPU readback working.
-	 * Size with the negotiated linear NV12/P010 layout (128-byte
-	 * NV12 stride, 256-byte P010 stride, 32-aligned luma height). */
-	size = surface_pitch(width, fourcc) * ALIGN_TO(height, 32) * 3 / 2;
-	DBG("[surf] id=%u size=%u w=%u h=%u fourcc=%#x\n",
-	    id, size, width, height, fourcc);
-	heap = open("/dev/dma_heap/system", O_RDWR);
-	if (heap >= 0) {
-		bfd = dma_heap_alloc(heap, size);
-		close(heap);
-	} else {
-		fprintf(stderr, "[surf] dma_heap unavailable (%s); "
-			"using memfd backing (not GPU-importable)\n",
-			strerror(errno));
-		bfd = memfd_alloc(size);
-	}
-	if (bfd < 0) {
-		perror("[surf] alloc backing");
-		return -1;
-	}
-	map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0);
-	if (map == MAP_FAILED) {
-		perror("[surf] mmap");
-		close(bfd);
-		return -1;
-	}
-
-	s = &t->s[t->n++];
-	s->id = id;
-	s->bfd = bfd;
-	s->bmap = map;
-	s->bsize = size;
-	s->sw = width;
-	s->sh = height;
-	s->fourcc = fourcc;
-	s->decoded = 0;
-	s->queued = 0;
-	s->exported = 0;
-	s->initialized = 0;
-	s->write_started = 0;
-	s->fence_token = 0;
-	s->generation = 0;
-	s->epoch = t->epoch;
-	s->backing_serial = __atomic_add_fetch(&g_buffer_serial, 1,
-					       __ATOMIC_RELAXED);
-	s->owner = NULL;
-	return 0;
-}
-
-void
-vpu_surfaces_free(struct vpu_surfaces *t, VASurfaceID id)
-{
-	int i;
-
-	if (!t)
-		return;
-	for (i = 0; i < t->n; i++) {
-		struct vpu_surface *s = &t->s[i];
-
-		if (s->id != id)
-			continue;
-		if (s->owner)
-			pthread_mutex_lock(&s->owner->mutex);
-		if (s->owner)
-			(void)finish_vk_surface(s->owner, s->id, 1);
-		if (s->owner)
-			vpu_vk_copy_forget(s->owner->vk_copy,
-					    s->backing_serial);
-		if (s->owner && s->owner->dec_open &&
-		    (s->write_started || s->fence_token))
-			surface_finish_write(s->owner->session, s);
-		munmap(s->bmap, s->bsize);
-		close(s->bfd);
-		if (s->owner)
-			pthread_mutex_unlock(&s->owner->mutex);
-		t->s[i] = t->s[t->n - 1];
-		t->n--;
-		return;
-	}
-}
-
-/* Actual NV12 layout of @s: what its owning engine negotiated for CAPTURE,
- * or the aligned coded size before a session exists.  Export/derive must
- * describe buffers with these values, never with assumptions, or clients
- * read garbled rows. */
-static void
-surface_layout(const struct vpu_surface *s, unsigned int *pitch,
-	       unsigned int *width, unsigned int *height)
-{
-	unsigned int p = surface_pitch(s->sw, s->fourcc);
-	unsigned int w = s->sw;
-	unsigned int h = ALIGN_TO(s->sh, 32);
-
-	if (!s->own_layout && s->owner && s->owner->dec_open) {
-		unsigned int negotiated_pitch = 0;
-		unsigned int negotiated_width = 0;
-		unsigned int negotiated_height = 0;
-
-		vpu_platform_session_capture_layout(s->owner->session, &negotiated_pitch,
-					   &negotiated_width,
-					   &negotiated_height);
-		if (negotiated_pitch && negotiated_width && negotiated_height) {
-			p = negotiated_pitch;
-			w = negotiated_width;
-			h = negotiated_height;
-		}
-	}
-	*pitch = p;
-	*width = w;
-	*height = h;
-}
-
-static void
-surface_initialize(struct vpu_surface *s)
-{
-	unsigned int pitch, width, height;
-
-	if (s->initialized)
-		return;
-	surface_layout(s, &pitch, &width, &height);
-	surface_fill_black(s->bfd, s->bmap, pitch, height, s->fourcc);
-	s->initialized = 1;
-}
-
-static int
-vpu_decode_surface_ready(struct vpu_decode_ctx *ctx, VASurfaceID id);
-
-int
-vpu_surfaces_sync(struct vpu_surfaces *t, VASurfaceID id)
-{
-	struct vpu_surface *s = surfs_find(t, id);
-
-	/* Never-queued and already-decoded surfaces succeed without
-	 * draining anything: Chrome syncs freshly allocated pool surfaces
-	 * before exporting them and must not get spurious timeouts. */
-	if (!s)
-		return -EINVAL;
-	/* A surface that has not been decoded into during the current stream
-	 * epoch still holds pre-seek pixels.  Backfill it with the newest frame
-	 * of this epoch (or black) before the client can present it. */
-	if (s->epoch != t->epoch) {
-		surfs_backfill_stale(t, s);
-		return 0;
-	}
-	if (!s->queued || s->decoded)
-		return 0;
-	/* Drain whichever engine queued this picture; with one engine per
-	 * context that is exactly the context still holding the stream. */
-	if (s->owner) {
-		int r = vpu_decode_sync(s->owner, id);
-
-		DBG("[surfs_sync] id=%u -> engine sync r=%d\n", id, r);
-		return r;
-	}
-	return 0;
-}
-
-int
-vpu_surfaces_ready(struct vpu_surfaces *t, VASurfaceID id)
-{
-	struct vpu_surface *s = surfs_find(t, id);
-
-	return s ? s->decoded : 0;
-}
-
-int
-vpu_surfaces_valid(struct vpu_surfaces *t, VASurfaceID id)
-{
-	return surfs_find(t, id) != NULL;
-}
-
-int
-vpu_surfaces_export(struct vpu_surfaces *t, VASurfaceID id, int *fd,
-		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height,
-		  unsigned int *fourcc)
-{
-	struct vpu_surface *s = surfs_find(t, id);
-	int exported_fd;
-	unsigned int p, w, h;
-
-	if (!s)
-		return -1;
-	/* VA surface contents are not observable until export/derive/get-image.
-	 * Keep decode-only pools lazy so allocating dozens of 4K P010 surfaces
-	 * does not write gigabytes of neutral-black pixels that no client reads. */
-	surface_initialize(s);
-	surface_layout(s, &p, &w, &h);
-	/* vaExportSurfaceHandle transfers ownership of every returned object
-	 * fd to the caller.  Keep the driver's backing fd private: Chrome
-	 * closes the exported fd after importing it, and returning s->bfd
-	 * directly caused a double-close/FD-reuse crash in the GPU process. */
-	exported_fd = fcntl(s->bfd, F_DUPFD_CLOEXEC, 0);
-	if (exported_fd < 0)
-		return -1;
-	/* If this backing is reused for a later picture, legacy Adreno may have
-	 * imported it before the new reservation fence was attached. */
-	s->exported = 1;
-	*fd = exported_fd;
-	*pitch = p;
-	*size = s->bsize;
-	*width = w;
-	*height = h;
-	*fourcc = s->fourcc;
-	return 0;
-}
-
-static int
-surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
-		unsigned int *pitch, unsigned int *size,
-		unsigned int *width, unsigned int *height,
-		unsigned int *fourcc, int initialize)
-{
-	struct vpu_surface *s = surfs_find(t, id);
-	unsigned int p, w, h;
-
-	if (!s)
-		return -1;
-	if (initialize)
-		surface_initialize(s);
-	surface_layout(s, &p, &w, &h);
-	*mem = s->bmap;
-	*pitch = p;
-	*size = s->bsize;
-	*width = w;
-	*height = h;
-	*fourcc = s->fourcc;
-	return 0;
-}
-
-int
-vpu_surfaces_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
-		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height,
-		  unsigned int *fourcc)
-{
-	return surfaces_buffer(t, id, mem, pitch, size, width, height, fourcc, 1);
-}
-
-int
-vpu_surfaces_peek_buffer(struct vpu_surfaces *t, VASurfaceID id, void **mem,
-		  unsigned int *pitch, unsigned int *size,
-		  unsigned int *width, unsigned int *height,
-		  unsigned int *fourcc)
-{
-	return surfaces_buffer(t, id, mem, pitch, size, width, height, fourcc, 0);
-}
-
-static int
-ensure_decoder(struct vpu_decode_ctx *ctx)
-{
-	int ret;
-
-	if (ctx->dec_open) {
-		/* After an EOS flush the firmware is done; a client that keeps
-		 * decoding (Chrome flush/reset, looped playback) needs a fresh
-		 * session.  Preserve the picture already collected for this
-		 * vaEndPicture call while clearing the old firmware bookkeeping. */
-		if (ctx->eos_sent) {
-			finish_pending_writes(ctx);
-			forget_vk_capture_buffers(ctx);
-			vpu_platform_session_close(ctx->session);
-			ctx->dec_open = 0;
-			reset_decoder_session_state(ctx);
-		} else {
-			return 0;
-		}
-	}
-	ret = vpu_platform_session_open(ctx->session, ctx->width, ctx->height,
-			       ctx->codec, ctx->pixel_format);
-	if (ret)
-		return ret;
-	if (ctx->direct_capture) {
-		int fds[VPU_MAX_SURFACES];
-		size_t sizes[VPU_MAX_SURFACES];
-		unsigned int i;
-
-		direct_collect_surfaces(ctx);
-		if (ctx->direct_count < ctx->direct_requested_count) {
-			vpu_platform_session_close(ctx->session);
-			return -EINVAL;
-		}
-		ctx->direct_count = ctx->direct_requested_count;
-		for (i = 0; i < ctx->direct_count; i++) {
-			fds[i] = ctx->direct[i].fd;
-			sizes[i] = ctx->direct[i].size;
-		}
-		ret = vpu_platform_session_set_capture_dmabufs(ctx->session, fds, sizes,
-						     ctx->direct_count);
-		if (ret) {
-			vpu_platform_session_close(ctx->session);
-			return ret;
-		}
-	}
-	ctx->dec_open = 1;
-	return 0;
-}
-
-/* Drop a live firmware session at a random-access boundary without touching
- * the picture currently being assembled.  Chromium's decoder Reset() does
- * not issue any VA-API operation, so a seek otherwise leaves old DPB and
- * CAPTURE work in the stateful V4L2 session until the first post-seek frame
- * arrives. */
-static void
-restart_decoder_session(struct vpu_decode_ctx *ctx)
-{
-	int i;
-
-	if (!ctx->dec_open)
-		return;
-	finish_pending_writes(ctx);
-	forget_vk_capture_buffers(ctx);
-	vpu_platform_session_close(ctx->session);
-	ctx->dec_open = 0;
-	/* Pending pictures from the abandoned stream keep their stable backing,
-	 * but no longer have firmware work that a later vaSyncSurface can drain. */
-	if (ctx->surfs) {
-		for (i = 0; i < ctx->surfs->n; i++) {
-			struct vpu_surface *s = &ctx->surfs->s[i];
-
-			if (s->owner == ctx && s->queued && !s->decoded)
-				s->queued = 0;
-		}
-	}
-	reset_decoder_session_state(ctx);
-}
-
-static int
-direct_surface_index(struct vpu_decode_ctx *ctx, VASurfaceID id)
-{
-	unsigned int i;
-
-	for (i = 0; i < ctx->direct_count; i++)
-		if (ctx->direct[i].id == id)
-			return (int)i;
-	return -1;
-}
-
 static void
 hevc_pending_add(struct vpu_decode_ctx *ctx, int32_t poc, VASurfaceID target,
 		 uint64_t generation)
@@ -1576,7 +330,7 @@ hevc_pending_take(struct vpu_decode_ctx *ctx, VASurfaceID *target,
  * propagated by firmware. HEVC_CAPTURE_FIFO platforms instead match
  * display-order CAPTURE frames against pending picture POCs.
  * Returns the surface id, or -1 if unknown. */
-static int
+int
 assign_frame(struct vpu_decode_ctx *ctx, const struct vpu_decoded_frame *frame)
 {
 	VASurfaceID id;
@@ -1708,220 +462,6 @@ assign_frame(struct vpu_decode_ctx *ctx, const struct vpu_decoded_frame *frame)
 	return id;
 }
 
-static int drain_available(struct vpu_decode_ctx *ctx);
-
-/* Wait for one already-submitted render target without flushing the stream.
- * The V4L2 session requests decode-order output, so firmware can complete the
- * current target without needing another picture to be queued.
- * This is used before vaEndPicture returns: the ANGLE/GL import path on legacy
- * Adreno does not reliably wait for reservation fences attached after the
- * DMA-BUF was imported, and can otherwise sample that surface's old pixels. */
-static int
-wait_surface_ready(struct vpu_decode_ctx *ctx, VASurfaceID id, int deadline)
-{
-	while (deadline-- > 0) {
-		struct vpu_surface *s;
-		struct vpu_decoded_frame frame;
-		int changed, ret;
-
-		ret = drain_available(ctx);
-		if (ret)
-			return ret;
-		ret = finish_vk_surface(ctx, id, 1);
-		if (ret && ret != -EAGAIN)
-			return ret;
-		s = find_surface(ctx, id);
-		if (s && s->decoded)
-			return 0;
-
-		ret = vpu_platform_session_poll_capture(ctx->session, 20);
-		if (ret < 0)
-			return ret;
-		if (!ret)
-			continue;
-		ret = vpu_platform_session_handle_events(ctx->session, &changed);
-		if (ret)
-			return ret;
-		while (vpu_platform_session_dequeue_input(ctx->session) == 0)
-			;
-		ret = vpu_platform_session_dequeue_frame(ctx->session, &frame);
-		if (ret == -EAGAIN)
-			continue;
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		ret = assign_frame(ctx, &frame);
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-	}
-	return -ETIMEDOUT;
-}
-
-/* Force the firmware to release the picture it is holding.  The stateful
- * decoder keeps the most recent picture until the next access unit (or an
- * EOS marker) arrives; without this, vaSyncSurface on the last picture
- * always times out. */
-static int
-vpu_decode_flush_impl(struct vpu_decode_ctx *ctx)
-{
-	struct vpu_decoded_frame frame;
-	int ret, deadline = 100;
-
-	if (!ctx->dec_open || !ctx->dec_started || ctx->eos_sent)
-		return ctx->fatal_error;
-
-	ret = vpu_platform_session_flush(ctx->session);
-	if (ret)
-		return ret;
-	ctx->eos_sent = 1;
-
-	/* Drain decoded pictures until the empty V4L2_BUF_FLAG_LAST marker is
-	 * dequeued.  Pictures preceding that marker are assigned normally. */
-	while (deadline-- > 0) {
-		int changed;
-
-		ret = vpu_platform_session_poll_capture(ctx->session, 20);
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		if (!ret)
-			continue;
-		ret = vpu_platform_session_handle_events(ctx->session, &changed);
-		if (ret)
-			return ret;
-		while (vpu_platform_session_dequeue_input(ctx->session) == 0)
-			;
-		ret = vpu_platform_session_dequeue_frame(ctx->session, &frame);
-		if (ret == -EAGAIN)
-			continue;
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		DBG("[flush] got ts=%llu flags=0x%x\n",
-		    (unsigned long long)frame.timestamp, frame.flags);
-		if (frame.bytesused && assign_frame(ctx, &frame) < 0) {
-			ctx->fatal_error = -EIO;
-			return ctx->fatal_error;
-		}
-		if (ret == 1)
-			break;
-	}
-	if (vpu_platform_session_eos(ctx->session)) {
-		ret = reap_vk_copies(ctx, 1);
-		return ret;
-	}
-	return -ETIMEDOUT;
-}
-
-/* Establish a strict stream boundary.  Chromium does not forward
- * Decoder::Reset() through VA-API, so the first post-seek key frame is the
- * earliest point where the driver can act.  Finish the complete old
- * OUTPUT/CAPTURE pipeline and observe LAST before closing it; only then may the
- * already assembled key frame be submitted to a fresh firmware session.
- * Preserve the private sequence epoch across every codec restart; legacy VPU5
- * VP9 has proved sensitive to a timestamp rewind across a context reused by
- * Chromium. */
-static int
-stream_boundary_restart(struct vpu_decode_ctx *ctx)
-{
-	uint64_t next_seq = ctx->seq;
-	unsigned int pending = 0, i;
-	int ret;
-
-	for (i = 0; i < ARRAY_SIZE(ctx->target_ring); i++)
-		pending += ctx->target_ring[i].used != 0;
-	if (ctx->codec == VPU_CODEC_HEVC &&
-	    (ctx->platform_quirks & VPU_PLATFORM_QUIRK_HEVC_CAPTURE_FIFO))
-		pending = ctx->hevc_ring_len;
-	DBG("[seek] draining %u pre-seek mappings codec=0x%x\n",
-	    pending, ctx->codec);
-	ret = vpu_decode_flush_impl(ctx);
-	if (ret) {
-		DBG("[seek] pre-seek drain failed codec=0x%x: %d\n",
-		    ctx->codec, ret);
-		return ret;
-	}
-	restart_decoder_session(ctx);
-	ctx->seq = next_seq;
-	/* VP9 presents already-decoded surfaces through show_existing_frame after
-	 * a seek, so it keeps the display epoch.  H.264/HEVC abandon the old
-	 * backings: any surface not re-decoded in the new epoch is stale. */
-	if (ctx->codec != VPU_CODEC_VP9)
-		surfs_begin_epoch(ctx->surfs);
-	ctx->vp9_seek_barrier = ctx->codec == VPU_CODEC_VP9 &&
-		(ctx->platform_quirks & VPU_PLATFORM_QUIRK_VP9_RELEASE_AU);
-	DBG("[seek] old session complete codec=0x%x; restart at seq=%llu\n",
-	    ctx->codec, (unsigned long long)ctx->seq);
-	return 0;
-}
-
-int
-vpu_decode_flush(struct vpu_decode_ctx *ctx)
-{
-	int ret;
-
-	pthread_mutex_lock(&ctx->mutex);
-	ret = vpu_decode_flush_impl(ctx);
-	pthread_mutex_unlock(&ctx->mutex);
-	return ret;
-}
-
-/* Non-blocking drain of whatever frames are ready. */
-static int
-drain_available(struct vpu_decode_ctx *ctx)
-{
-	int copy_ret;
-
-	if (ctx->fatal_error)
-		return ctx->fatal_error;
-	copy_ret = reap_vk_copies(ctx, 0);
-	if (copy_ret < 0)
-		return copy_ret;
-	if (ctx->eos_sent)
-		return 0;
-
-	for (;;) {
-		struct vpu_decoded_frame frame;
-		int changed, ret;
-
-		ret = vpu_platform_session_poll(ctx->session, 0);
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		if (!ret)
-			break;
-		ret = vpu_platform_session_handle_events(ctx->session, &changed);
-		if (ret)
-			return ret;
-		while (vpu_platform_session_dequeue_input(ctx->session) == 0)
-			;
-		ret = vpu_platform_session_dequeue_frame(ctx->session, &frame);
-		if (ret == -EAGAIN)
-			break;
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		ret = assign_frame(ctx, &frame);
-		if (ret < 0) {
-			ctx->fatal_error = ret;
-			return ret;
-		}
-		if (ctx->direct_error)
-			return ctx->direct_error;
-		ret = reap_vk_copies(ctx, 0);
-		if (ret < 0)
-			return ret;
-	}
-	return 0;
-}
-
 static int
 vpu_decode_begin_impl(struct vpu_decode_ctx *ctx, VASurfaceID target)
 {
@@ -2025,7 +565,7 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 	const uint8_t *au;
 	int random_access;
 	int vp9_barrier_submitted = 0;
-	uint64_t end_start = ctx->stats_enabled ? monotonic_ns() : 0;
+	uint64_t end_start = ctx->stats_enabled ? vpu_monotonic_ns() : 0;
 	size_t au_len;
 	int ret;
 
@@ -2053,7 +593,7 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 	 * never coexist in VPU.  Keep the driver's private timestamp sequence
 	 * monotonic across the restart. */
 	if (ctx->dec_started && random_access) {
-		uint64_t now = monotonic_ns();
+		uint64_t now = vpu_monotonic_ns();
 		uint64_t gap = ctx->last_submit_ns ? now - ctx->last_submit_ns : 0;
 		const char *reason = NULL;
 
@@ -2339,14 +879,14 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 			ctx->force_h264_sync_end;
 
 		if (exported_wait || forced_wait) {
-			uint64_t wait_start = ctx->stats_enabled ? monotonic_ns() : 0;
+			uint64_t wait_start = ctx->stats_enabled ? vpu_monotonic_ns() : 0;
 
 			DBG("[end] waiting exported target=%u codec=0x%x\n",
 			    ctx->current_target, ctx->codec);
 			ret = wait_surface_ready(ctx, ctx->current_target, 100);
 			if (ctx->stats_enabled &&
 			    ctx->codec == VPU_CODEC_H264) {
-				ctx->stats_h264_wait_ns += monotonic_ns() - wait_start;
+				ctx->stats_h264_wait_ns += vpu_monotonic_ns() - wait_start;
 				ctx->stats_h264_waits++;
 			}
 			if (ret) {
@@ -2362,12 +902,12 @@ vpu_decode_end_impl(struct vpu_decode_ctx *ctx)
 		}
 	}
 	vpu_codec_finish_picture(ctx->codec_adapter);
-	ctx->last_submit_ns = monotonic_ns();
+	ctx->last_submit_ns = vpu_monotonic_ns();
 	if (ctx->stats_enabled) {
 		ctx->stats_rewrite_ns += codec_unit.rewrite_ns;
 		ctx->stats_rewrite_bytes += codec_unit.rewrite_bytes;
 		ctx->stats_rewrites += codec_unit.rewrites;
-		ctx->stats_end_ns += monotonic_ns() - end_start;
+		ctx->stats_end_ns += vpu_monotonic_ns() - end_start;
 		ctx->stats_ends++;
 	}
 	DBG("[end] done rv=0\n");
@@ -2383,6 +923,20 @@ vpu_decode_end(struct vpu_decode_ctx *ctx)
 	ret = vpu_decode_end_impl(ctx);
 	pthread_mutex_unlock(&ctx->mutex);
 	return ret;
+}
+
+static int
+vpu_decode_surface_ready(struct vpu_decode_ctx *ctx, VASurfaceID id)
+{
+	if (drain_available(ctx))
+		return 0;
+	if (finish_vk_surface(ctx, id, 0) < 0)
+		return 0;
+	{
+		struct vpu_surface *s = find_surface(ctx, id);
+
+		return s ? s->decoded : 0;
+	}
 }
 
 static int
@@ -2501,18 +1055,4 @@ vpu_decode_sync(struct vpu_decode_ctx *ctx, VASurfaceID id)
 	ret = vpu_decode_sync_impl(ctx, id);
 	pthread_mutex_unlock(&ctx->mutex);
 	return ret;
-}
-
-static int
-vpu_decode_surface_ready(struct vpu_decode_ctx *ctx, VASurfaceID id)
-{
-	if (drain_available(ctx))
-		return 0;
-	if (finish_vk_surface(ctx, id, 0) < 0)
-		return 0;
-	{
-		struct vpu_surface *s = find_surface(ctx, id);
-
-		return s ? s->decoded : 0;
-	}
 }

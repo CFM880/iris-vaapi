@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Exercise reference ownership and strided surface copies without a VPU. */
 #include <assert.h>
-#include "../src/decode.c"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../src/decode_internal.h"
 
 void vpu_platform_session_capture_layout(const struct vpu_platform_session *session,
 	unsigned int *pitch, unsigned int *width, unsigned int *height)

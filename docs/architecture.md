@@ -22,7 +22,11 @@ codec registry + adapters   src/codec/codec.c
     │                       src/codec/{h264,hevc,vp9}/
     │  access unit + random-access/POC metadata
     ▼
-decode + surface scheduler  src/decode.c
+decode scheduler            src/decode.c
+    │                       src/decode_internal.h  (shared ctx/surface state)
+    │                       src/surface.c          (display-level registry)
+    │                       src/vk_capture.c       (GPU copy ring)
+    │                       src/stream.c           (session/seek boundaries)
     │  codec id, pixel format, timestamp, decoded frame
     ▼
 platform contract           src/platform/platform.[ch]

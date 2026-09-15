@@ -4,7 +4,11 @@
  * backfills stale surfaces with the newest frame of the current epoch (repeat
  * last frame) or neutral black when no such frame exists yet. */
 #include <assert.h>
-#include "../src/decode.c"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../src/decode_internal.h"
 
 int main(void)
 {
