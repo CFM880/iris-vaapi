@@ -109,12 +109,33 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 
 ## 5. 结果记录表
 
-| 机器/核显 | Chrome | 硬解 | feature 开 stale | feature 关 stale | `ApplyResolutionChange` 次数（开/关） |
+2026-09-15 实测：
+
+| 平台 | 会话 | 素材 | feature 开 stale | feature 关 stale | `ApplyResolutionChange` 开/关 |
 |---|---|---|---|---|---|
-| SM8150/Adreno640（nabu） | 153.0.8010.36 | VA-API | 74–87% | 0% | 6 / 1 |
-| i9-10th/UHD630 或 Iris Plus | 153.0.8010.36 | VA-API | ? | ? | ? |
+| SM8150/Adreno640（nabu，iris-vaapi） | Wayland | 4K Jellyfin | 74–87% | **0%** | 6 / 1 |
+| SM8150/Adreno640（nabu） | Wayland | 1080p 闭GOP 转码 | 87.8% | **0%** | — |
+| Intel CometLake-H UHD（iHD 26.3.2） | X11 | 4K Jellyfin | 6.1% | 5.0% | **8 / 1** |
+| Intel CometLake-H UHD | X11 | 1080p 闭GOP 转码 | 9.6% | 7.7% | **14 / 2** |
+
+结论（重要）：
+- **缺陷平台无关**：两平台 feature 开时每次 seek 都触发 `ApplyResolutionChange`
+  （Intel 上 8/1、14/2 也证实了）。
+- **可见旧帧症状是路径相关的**：只在 nabu（Qualcomm iris-vaapi 的 stable
+  surface 复用 + Wayland/ANGLE）明显；本台 Intel/X11/iHD 上不出现。
 
 （nabu 的 Chrome 152 为 0%，H.264 硬/软解均 0%。）
+
+### Intel 实测注意
+
+- 这台 Intel 上 Chrome 默认拿不到 render node（`vaapi_wrapper.cc GetHandle()
+  ... failed to find a suitable render node`），HEVC 直接不支持。加
+  `--render-node-override=/dev/dri/renderD128` 后才能用 VA-API/HEVC。`mpv
+  --hwdec=vaapi` 正常。
+- 转码素材要用**闭 GOP + 每 IRAP 重复参数集**：
+  `ffmpeg -i 4K.mp4 -vf scale=1920:1080 -c:v libx265 -preset ultrafast \
+   -x265-params keyint=60:min-keyint=60:open-gop=0:repeat-headers=1 -an out.mp4`
+  默认 open-GOP(CRA) 的转码在 seek 后会卡死（`ct` 不前进），不能用来判断。
 
 ---
 

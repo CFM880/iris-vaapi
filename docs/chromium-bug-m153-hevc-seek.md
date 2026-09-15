@@ -1,10 +1,12 @@
 # [M153 regression] HEVC hardware decode: seeking repeatedly displays stale pre-seek frames
 
-> Ready-to-submit Chromium bug report. Numbers produced on Xiaomi Pad 5
-> (SM8150 / Adreno 640), but the root cause is in shared Chromium H.265 code,
-> so it should reproduce on any hardware HEVC backend that uses `H265Decoder`
-> (VA-API, D3D11; likely VideoToolbox). See `hevc-seek-validation.md` for the
-> reproduction/verification procedure on other platforms.
+> Ready-to-submit Chromium bug report. Primary measurement on Xiaomi Pad 5
+> (SM8150 / Adreno 640, iris-vaapi, Wayland). The spurious configuration change
+> was independently confirmed on a second VA-API platform, Intel Comet Lake-H
+> UHD (iHD, X11). The root cause is in shared Chromium H.265 code
+> (`H265Decoder`), used by the VA-API, D3D11 and VideoToolbox accelerators.
+> See `hevc-seek-validation.md` for the reproduction procedure and the
+> cross-platform result table.
 
 ## Summary
 
@@ -24,6 +26,14 @@ while configuration-change detection now uses
 first SPS after every seek is misdetected as a configuration change, producing a
 spurious `kConfigChange` → `ApplyResolutionChange()` / decoder+pool recreation
 on every seek, which manifests as stale frames.
+
+Cross-platform: the spurious configuration change is **platform-independent** and
+was confirmed on Intel Comet Lake-H UHD (iHD, X11): `ApplyResolutionChange()`
+runs on every seek with the feature on (8/1 for the 4K clip, 14/2 for a 1080p
+clip) and only once with it off. On that Intel setup the *visible* stale-frame
+symptom did not reproduce (stale repeats ~6–10% both ways), so the severity of
+the visible symptom additionally depends on the display / frame-pool path (it is
+clearly reproducible on the Qualcomm iris-vaapi + Wayland/ANGLE setup).
 
 ## Regression range
 
@@ -168,9 +178,11 @@ parse of the decoder's lifetime, via a flag that is not cleared by `Reset()`.
 - VideoToolbox accelerator implementations.
 
 So the spurious config-change defect is platform-independent and affects
-hardware HEVC on all these backends. The visible stale-frame symptom is
-demonstrated on VA-API; whether Windows/macOS also show stale frames is not yet
-verified. H.264/VP9/AV1 use different decoders and are unaffected.
+hardware HEVC on all these backends. It was confirmed on two VA-API setups:
+Qualcomm SM8150 (iris-vaapi) and Intel Comet Lake-H (iHD). The visible
+stale-frame symptom is demonstrated on the Qualcomm/Wayland setup; it did not
+reproduce on Intel/X11 in our test, and whether Windows/macOS show stale frames
+is not verified. H.264/VP9/AV1 use different decoders and are unaffected.
 
 ## Workaround
 
