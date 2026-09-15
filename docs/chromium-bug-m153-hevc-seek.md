@@ -28,12 +28,13 @@ spurious `kConfigChange` → `ApplyResolutionChange()` / decoder+pool recreation
 on every seek, which manifests as stale frames.
 
 Cross-platform: the spurious configuration change is **platform-independent** and
-was confirmed on Intel Comet Lake-H UHD (iHD, X11): `ApplyResolutionChange()`
-runs on every seek with the feature on (8/1 for the 4K clip, 14/2 for a 1080p
-clip) and only once with it off. On that Intel setup the *visible* stale-frame
-symptom did not reproduce (stale repeats ~6–10% both ways), so the severity of
-the visible symptom additionally depends on the display / frame-pool path (it is
-clearly reproducible on the Qualcomm iris-vaapi + Wayland/ANGLE setup).
+was confirmed on Intel Comet Lake-H UHD (iHD): `ApplyResolutionChange()` runs on
+every seek with the feature on (8/1 for the 4K clip, 14/2 for a 1080p clip) and
+only once with it off. On that Intel host the *visible* stale-frame symptom did
+not reproduce on either X11 or Wayland/GNOME (stale repeats ~7–9% both ways,
+unchanged by a larger post-seek settle window), so the visible symptom
+additionally depends on the display / frame-pool path — it is strongly
+reproducible on the Qualcomm iris-vaapi + Wayland/ANGLE setup (88% vs 0%).
 
 ## Regression range
 
@@ -181,8 +182,9 @@ So the spurious config-change defect is platform-independent and affects
 hardware HEVC on all these backends. It was confirmed on two VA-API setups:
 Qualcomm SM8150 (iris-vaapi) and Intel Comet Lake-H (iHD). The visible
 stale-frame symptom is demonstrated on the Qualcomm/Wayland setup; it did not
-reproduce on Intel/X11 in our test, and whether Windows/macOS show stale frames
-is not verified. H.264/VP9/AV1 use different decoders and are unaffected.
+reproduce on Intel (X11 and Wayland/GNOME) in our tests, and whether Windows/macOS
+show stale frames is not verified. H.264/VP9/AV1 use different decoders and are
+unaffected.
 
 ## Workaround
 

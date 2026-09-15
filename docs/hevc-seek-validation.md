@@ -114,17 +114,27 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 | 平台 | 会话 | 素材 | feature 开 stale | feature 关 stale | `ApplyResolutionChange` 开/关 |
 |---|---|---|---|---|---|
 | SM8150/Adreno640（nabu，iris-vaapi） | Wayland | 4K Jellyfin | 74–87% | **0%** | 6 / 1 |
-| SM8150/Adreno640（nabu） | Wayland | 1080p 闭GOP 转码 | 87.8% | **0%** | — |
+| SM8150/Adreno640（nabu） | Wayland | 1080p 闭GOP 转码 | **88.0%** (settle=15) | **0%** | — |
 | Intel CometLake-H UHD（iHD 26.3.2） | X11 | 4K Jellyfin | 6.1% | 5.0% | **8 / 1** |
 | Intel CometLake-H UHD | X11 | 1080p 闭GOP 转码 | 9.6% | 7.7% | **14 / 2** |
+| Intel CometLake-H UHD | Wayland(GNOME) | 4K Jellyfin | 6.8–8.2% | 6.7–9.1% | — |
+| Intel CometLake-H UHD | Wayland(GNOME) | 1080p 闭GOP 转码 | 12.2% | 8.0% | — |
 
 结论（重要）：
 - **缺陷平台无关**：两平台 feature 开时每次 seek 都触发 `ApplyResolutionChange`
   （Intel 上 8/1、14/2 也证实了）。
-- **可见旧帧症状是路径相关的**：只在 nabu（Qualcomm iris-vaapi 的 stable
-  surface 复用 + Wayland/ANGLE）明显；本台 Intel/X11/iHD 上不出现。
+- **可见旧帧症状目前只在 nabu 稳定复现**（Qualcomm iris-vaapi 的 stable surface
+  复用 + Wayland/ANGLE）。Intel 无论 X11 还是 Wayland(GNOME)，on/off 无分离
+  （底噪 ~7–9%）；把 `analyze.py` 的 settle 从 5 提到 15 也不改变结论（之前
+  Intel 单次 18.8% 是 settle 污染）。即：症状还需要 nabu 那条显示/帧池路径。
 
 （nabu 的 Chrome 152 为 0%，H.264 硬/软解均 0%。）
+
+### 关于 settle（底噪）
+
+`analyze.py` 现支持第二个参数指定 seek 后跳过的采样数：
+`analyze.py <log> [settle]`（默认 5）。Intel 上 seek 稳定更慢，底噪偏高；
+但提到 15 仍无 on/off 分离，所以 Intel 的底噪不是症状。
 
 ### Intel 实测注意
 

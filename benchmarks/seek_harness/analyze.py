@@ -13,6 +13,10 @@ import re
 import sys
 
 path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/opencode/seq.log"
+# Number of samples to drop right after each SEEK while playback settles onto
+# the new position.  Raise it on platforms where a seek takes longer (e.g.
+# slower VA-API setups) so pre-seek frames are not miscounted as stale.
+settle = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 
 segments = [[]]
 seeks = 0
@@ -34,7 +38,7 @@ seen_sn = set()
 stale_sn = total_sn = 0
 for si, seg in enumerate(segments):
     if si > 0 and seen:
-        for _, h, sn, _, _ in seg[5:]:   # skip settle samples
+        for _, h, sn, _, _ in seg[settle:]:   # skip settle samples
             total += 1
             if h in seen:
                 stale += 1
@@ -48,9 +52,9 @@ for si, seg in enumerate(segments):
             seen_sn.add(sn)
 
 dfs = [s[4] for seg in segments for s in seg]
-print("seeks=%d samples=%d stale_repeats=%d (%.1f%%) stale_serial=%d/%d (%.1f%%) "
+print("seeks=%d settle=%d samples=%d stale_repeats=%d (%.1f%%) stale_serial=%d/%d (%.1f%%) "
       "df: start=%s end=%s max=%s"
-      % (seeks, sum(len(s) for s in segments), stale,
+      % (seeks, settle, sum(len(s) for s in segments), stale,
          100.0 * stale / max(1, total),
          stale_sn, total_sn,
          100.0 * stale_sn / max(1, total_sn),
