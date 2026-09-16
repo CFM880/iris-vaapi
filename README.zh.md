@@ -132,6 +132,22 @@ google-chrome --enable-features=VaapiVideoDecoder
 VPU_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
 ```
 
+### 临时规避：Chrome 153 的 HEVC seek 回归
+
+Chrome **153** 的 HEVC 硬解存在 Chromium 回归（
+`ExtendedVideoBitstreamValidation`；`H265Decoder::Reset()` 误清 `active_sps_`，
+使每次 seek 被误判为配置变更）。seek 后合成器会反复显示 seek 前的旧帧，而解码
+器仍在正常出帧。该问题**仅影响 HEVC，且与本驱动无关**（Chrome 152、H.264/VP9
+均正常；关闭该 feature 后本机 stale repeats 为 0%）。上游修复前，用：
+
+```sh
+google-chrome --disable-features=ExtendedVideoBitstreamValidation
+```
+
+或继续使用 Chrome 152。详情、复现与跨平台结果见
+[`docs/chromium-bug-m153-hevc-seek.md`](docs/chromium-bug-m153-hevc-seek.md)、
+[`docs/hevc-seek-validation.md`](docs/hevc-seek-validation.md)。
+
 ## 测试
 
 使用 [Fluster](https://github.com/fluendo/fluster) 作为标准码流测试基准，统一比较
@@ -210,6 +226,10 @@ Turnip 路径令 RSS 约增加 64 MiB；限定 Freedreno ICD 后本机增量约�
 
 - 10-bit P010 解码需要配套的 `nabu-iris` 内核模块；HDR 元数据、色调映射和
   最终显示效果仍取决于 Chrome、合成器和显示器链路；
+- Chrome 153 的 HEVC 硬解 seek 会显示 seek 前的旧帧，源于 Chromium 的
+  `ExtendedVideoBitstreamValidation` 回归；用
+  `--disable-features=ExtendedVideoBitstreamValidation` 启动或改用 Chrome 152
+  （见 Chrome 一节）；
 - FFmpeg 的 `hevc_v4l2m2m` 与 `vp9_v4l2m2m` 前端目前不会为 10-bit 输入选择
   P010 CAPTURE，可能成功退出但输出 0 帧；VA-API 路径和仓库内显式 P010 的
   V4L2 测试程序不受此限制；

@@ -139,6 +139,24 @@ Chrome versions and distribution launch arguments may differ; driver-side tracin
 VPU_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
 ```
 
+### Temporary workaround: Chrome 153 HEVC seek regression
+
+Chrome **153** hardware HEVC decode has a Chromium regression
+(`ExtendedVideoBitstreamValidation`; `H265Decoder::Reset()` clears `active_sps_`,
+so every seek is misdetected as a configuration change). After seeking, the
+compositor repeatedly shows stale pre-seek frames while the decoder keeps
+running. It is HEVC-specific and independent of this driver (Chrome 152 and
+H.264/VP9 are clean; 0% with the feature disabled). Until it is fixed upstream,
+launch Chrome with:
+
+```sh
+google-chrome --disable-features=ExtendedVideoBitstreamValidation
+```
+
+or stay on Chrome 152. Details, reproduction and cross-platform results:
+[`docs/chromium-bug-m153-hevc-seek.md`](docs/chromium-bug-m153-hevc-seek.md),
+[`docs/hevc-seek-validation.md`](docs/hevc-seek-validation.md).
+
 ## Testing
 
 [Fluster](https://github.com/fluendo/fluster) is used as the standard bitstream test benchmark,
@@ -224,6 +242,9 @@ system, see [`中文`](docs/video-decode-setup.md) / [`English`](docs/video-deco
 
 - 10-bit P010 decode requires the companion `nabu-iris` kernel module; HDR metadata, tone mapping,
   and the final display result still depend on Chrome, the compositor, and the display chain;
+- Chrome 153 hardware HEVC seek shows stale pre-seek frames due to a Chromium
+  `ExtendedVideoBitstreamValidation` regression; run Chrome with
+  `--disable-features=ExtendedVideoBitstreamValidation` or use Chrome 152 (see the Chrome section);
 - FFmpeg's `hevc_v4l2m2m` and `vp9_v4l2m2m` frontends currently do not select a P010 CAPTURE for
   10-bit input, and may exit successfully while outputting 0 frames; the VA-API path and the
   repository's explicit-P010 V4L2 test programs are not affected by this limitation;
