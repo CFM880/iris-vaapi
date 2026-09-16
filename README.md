@@ -1,54 +1,58 @@
 # vpu-vaapi
 
-实验性、分层的 VA-API 解码驱动。它把 Chrome、FFmpeg 等 VA-API 客户端提交的
-参数和 slice 交给独立 codec adapter 重组成完整访问单元，再通过 platform 层
-交给硬件。
-当前 `qcom-iris` 平台面向 Qualcomm SM8150 Iris1 stateful V4L2 解码器；VA
-前端、codec adapter、调度/surface 和平台设备操作已解耦。后续既可以增加
-codec，也可以增加独立平台实现。
+**English** | [中文](README.zh.md)
 
-当前版本：`0.2.0`。
+An experimental, layered VA-API decode driver. It hands the parameters and slices submitted by
+VA-API clients such as Chrome and FFmpeg to independent codec adapters, which reassemble them into
+complete access units, then passes them to the hardware through a platform layer.
+The current `qcom-iris` platform targets the Qualcomm SM8150 Iris1 stateful V4L2 decoder; the VA
+frontend, codec adapters, scheduling/surface management, and platform device operations are
+decoupled. Both new codecs and independent platform implementations can be added later.
 
-> 项目仍处于实验阶段，目前只针对 Xiaomi Pad 5（`nabu`）及配套内核验证。
+Current version: `0.2.0`.
 
-## 功能状态
+> The project is still experimental and is currently verified only against the Xiaomi Pad 5
+> (`nabu`) and its companion kernel.
 
-| 格式 | VA-API profile | 输出 | 状态 |
+## Feature status
+
+| Format | VA-API profile | Output | Status |
 |---|---|---|---|
-| H.264 | Constrained Baseline / Main / High | NV12 | 已验证 |
-| HEVC | Main / Main10 | NV12 / P010 | 已验证（8/10-bit） |
-| VP9 | Profile 0 / Profile 2 | NV12 / P010 | 已验证（8/10-bit） |
+| H.264 | Constrained Baseline / Main / High | NV12 | Verified |
+| HEVC | Main / Main10 | NV12 / P010 | Verified (8/10-bit) |
+| VP9 | Profile 0 / Profile 2 | NV12 / P010 | Verified (8/10-bit) |
 
-HEVC Main10 与 VP9 Profile 2 已分别通过三轮 4K P010 完整码流测试，所有帧均
-成功输出且没有 corrupt frame，因此按 VA-API 解码能力计为已支持。H.264、HEVC
-与 VP9 支持 Chrome 所需的稳定 DMA-BUF surface、异步 fence、解码顺序输出和
-片尾帧释放。实验性的 V4L2 CAPTURE 直连可通过
-`VPU_DIRECT_CAPTURE=1` 启用，默认仍使用已充分验证的稳定 surface 拷贝路径。
+HEVC Main10 and VP9 Profile 2 have each passed three full 4K P010 bitstream test runs, with all
+frames output successfully and no corrupt frames, so they count as supported VA-API decode
+capabilities. H.264, HEVC, and VP9 support the stable DMA-BUF surfaces, asynchronous fences,
+decode-order output, and end-of-stream frame release that Chrome needs. The experimental V4L2
+CAPTURE direct path can be enabled with `VPU_DIRECT_CAPTURE=1`; the default remains the
+well-verified stable surface-copy path.
 
-## 依赖
+## Dependencies
 
-- Linux ARM64，带匹配的 `qcom-iris` 驱动；
-- VA-API 1.23 ABI（已使用 libva 2.22/2.23 验证）；
-- GCC、pkg-config、make；
-- 可选：`libvulkan-dev`（实验性的 Turnip DMA-BUF 异步复制）；
-- `/dev/video0`、DRM render node 和 `/dev/dma_heap/system`。
+- Linux ARM64 with a matching `qcom-iris` driver;
+- VA-API 1.23 ABI (verified with libva 2.22/2.23);
+- GCC, pkg-config, make;
+- Optional: `libvulkan-dev` (experimental Turnip DMA-BUF asynchronous copy);
+- `/dev/video0`, a DRM render node, and `/dev/dma_heap/system`.
 
-在 Debian/Ubuntu 系统上：
+On Debian/Ubuntu systems:
 
 ```sh
 sudo apt install build-essential pkg-config libva-dev libdrm-dev vainfo \
   libvulkan-dev
 ```
 
-内核侧源码和构建方法位于
-[`nabu-iris`](https://github.com/CFM880/nabu-iris)。H.264/HEVC/VP9 4K 播放应启用
-统一参数：
+The kernel-side source and build instructions are in
+[`nabu-iris`](https://github.com/CFM880/nabu-iris). For H.264/HEVC/VP9 4K playback, enable the
+unified parameter:
 
 ```text
 options qcom_iris cached_capture=1
 ```
 
-## 构建
+## Build
 
 ```sh
 git clone https://github.com/CFM880/iris-vaapi.git
@@ -57,27 +61,28 @@ make -j"$(nproc)"
 LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 ```
 
-默认自动选择平台，并扫描 `/dev/video*`，根据 Iris 驱动标识、M2M 能力及
-压缩输入/原始输出格式识别解码器，跳过摄像头和编码器，不依赖设备编号。
-没有可用解码设备时初始化失败。多 VPU 系统或调试时可以显式选择
-（`VPU_DEVICE` 优先于自动探测）：
+By default the platform is auto-selected, and `/dev/video*` is scanned to identify decoders by the
+Iris driver identifier, M2M capabilities, and compressed-input/raw-output formats, skipping cameras
+and encoders and not relying on device numbering. Initialization fails when no decode device is
+available. On multi-VPU systems or when debugging, you can select explicitly (`VPU_DEVICE` takes
+precedence over auto-detection):
 
 ```sh
 VPU_PLATFORM=qcom-iris VPU_DEVICE=/dev/video1 \
 LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" vainfo
 ```
 
-分层结构、platform 契约和新增平台步骤见
-[`docs/architecture.md`](docs/architecture.md)。
+See [`docs/architecture.md`](docs/architecture.md) for the layering, the platform contract, and the
+steps to add a platform.
 
-预期能看到 H.264、HEVC Main/Main10 和 VP9 Profile 0/Profile 2 的
-`VAEntrypointVLD`。
+You should see `VAEntrypointVLD` for H.264, HEVC Main/Main10, and VP9 Profile 0/Profile 2.
 
-驱动会按所选解码设备实际枚举的 CAPTURE 格式公布能力。若内核模块尚未更新、
-未提供 P010，Main10 和 Profile 2 会被隐藏，避免客户端逐帧尝试失败后再回退软件
-解码；此时应先更新并重载配套的 `nabu-iris` 模块。
+The driver advertises capabilities according to the CAPTURE formats the selected decode device
+actually enumerates. If the kernel module has not been updated and does not provide P010, Main10 and
+Profile 2 are hidden, avoiding per-frame client attempts that then fall back to software decode; in
+that case, update and reload the companion `nabu-iris` module first.
 
-无需安装即可让 FFmpeg 使用当前构建：
+To let FFmpeg use the current build without installing:
 
 ```sh
 LIBVA_DRIVER_NAME=vpu LIBVA_DRIVERS_PATH="$PWD/build" \
@@ -85,29 +90,33 @@ ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 \
   -i /path/to/video.mp4 -an -f null -
 ```
 
-H.264 对未导出的 VA surface 使用异步提交以保持硬件解码流水线；已经通过
-DRM PRIME 导出的 surface 继续在 `vaEndPicture` 做兼容性等待，避免旧 Adreno
-显示上一帧。诊断时可设置 `VPU_H264_SYNC_END=1`，恢复所有 H.264 surface 的
-逐帧同步行为。
+H.264 uses asynchronous submission for VA surfaces that are not exported, in order to keep the
+hardware decode pipeline running; surfaces already exported via DRM PRIME continue to do a
+compatibility wait in `vaEndPicture`, preventing older Adreno from displaying the previous frame.
+For diagnostics you can set `VPU_H264_SYNC_END=1` to restore per-frame synchronization for all
+H.264 surfaces.
 
-设置 `VPU_VULKAN_COPY=1` 可启用实验性的 Turnip DMA-BUF copy engine：V4L2
-CAPTURE buffer 通过 `VIDIOC_EXPBUF` 导出，Vulkan 异步复制到 Chrome 已导入的
-稳定 surface，GPU 完成后才 signal surface fence 并回收 CAPTURE buffer。Vulkan
-不可用或提交失败时会自动回退 CPU `memcpy`。当前仍默认使用 CPU 路径，先完成
-Chrome 长时间播放和多标签验证后再考虑默认启用。
-同一 VA display 的解码 context 共享一套 Vulkan instance/device，因此 seek、
-换流和多标签不会重复初始化 Turnip。SM8150 专用启动环境还可设置
-`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/freedreno_icd.json`，避免加载无关 ICD。
+Setting `VPU_VULKAN_COPY=1` enables the experimental Turnip DMA-BUF copy engine: the V4L2 CAPTURE
+buffer is exported via `VIDIOC_EXPBUF`, Vulkan asynchronously copies it to the stable surface
+already imported by Chrome, and only after the GPU completes is the surface fence signaled and the
+CAPTURE buffer reclaimed. If Vulkan is unavailable or submission fails, it automatically falls back
+to a CPU `memcpy`. The CPU path is still the default; enabling it by default will be considered
+after long Chrome playback and multi-tab verification.
+Decode contexts on the same VA display share one Vulkan instance/device, so seeking, stream
+switching, and multiple tabs do not reinitialize Turnip. The SM8150-specific startup environment can
+also set `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/freedreno_icd.json` to avoid loading unrelated
+ICDs.
 
-## 系统安装
+## System install
 
 ```sh
 make
 sudo ./install-system.sh
 ```
 
-脚本从当前仓库的 `build/` 安装驱动，并安装 DMA-heap udev 规则及
-`cached_capture` modprobe 配置。模块重新加载或重启后生效：
+The script installs the driver from the current repository's `build/` and installs the DMA-heap
+udev rules and the `cached_capture` modprobe configuration. They take effect after reloading the
+module or rebooting:
 
 ```sh
 cat /sys/module/qcom_iris/parameters/cached_capture
@@ -116,42 +125,45 @@ LIBVA_DRIVER_NAME=vpu vainfo
 
 ## Chrome
 
-确保浏览器 GPU 进程继承驱动选择：
+Make sure the browser's GPU process inherits the driver selection:
 
 ```sh
 export LIBVA_DRIVER_NAME=vpu
 google-chrome --enable-features=VaapiVideoDecoder
 ```
 
-在 `chrome://media-internals` 中检查 `kVideoDecoderName`，在 `chrome://gpu` 中
-检查 Video Acceleration。Chrome 版本和发行版启动参数可能不同；驱动侧跟踪可用：
+Check `kVideoDecoderName` in `chrome://media-internals` and Video Acceleration in `chrome://gpu`.
+Chrome versions and distribution launch arguments may differ; driver-side tracing is available with:
 
 ```sh
 VPU_VAAPI_DEBUG=1 google-chrome --enable-logging=stderr
 ```
 
-## 测试
+## Testing
 
-使用 [Fluster](https://github.com/fluendo/fluster) 作为标准码流测试基准，统一比较
-FFmpeg 软件、V4L2 M2M 与 VA-API 三条路径的输出 MD5 和端到端耗时。
-固定上游版本，自动下载测试资源，保存每次运行的日志和环境元数据：
+[Fluster](https://github.com/fluendo/fluster) is used as the standard bitstream test benchmark,
+uniformly comparing the output MD5 and end-to-end timing of the FFmpeg software, V4L2 M2M, and
+VA-API paths.
+The upstream version is pinned, test resources are downloaded automatically, and the logs and
+environment metadata of each run are saved:
 
 ```sh
-make check-fluster       # 五个向量、三条路径，串行冒烟测试
-make check-fluster-full  # 四套完整上游测试集
+make check-fluster       # five vectors, three paths, serial smoke test
+make check-fluster-full  # four complete upstream test suites
 ```
 
-使用方法与性能统计边界见 [Fluster 测试指南](docs/fluster.md)，
-三路径实测结果见 [Fluster 测试报告](benchmark-results/fluster-baseline.md)。
-目前仍存在超时和解码错误，之前的完整码流/吞吐验证不代表标准符合性测试通过。
+See the [Fluster testing guide](docs/fluster.md) for usage and the performance statistics scope, and
+the [Fluster test report](benchmark-results/fluster-baseline.md) for measured results on the three
+paths. Timeouts and decode errors still occur; earlier full-bitstream/throughput verification does
+not mean the conformance suite passes.
 
-纯参数重建测试不需要硬件：
+The pure parameter rebuild test needs no hardware:
 
 ```sh
 make check
 ```
 
-硬件测试需要用户提供码流，不包含任何本机绝对路径：
+Hardware tests require user-provided bitstreams and contain no local absolute paths:
 
 ```sh
 ./build/test_v4l2_dec stream.h264 3840 2160
@@ -164,13 +176,14 @@ make check
 ./build/test_surface_fence /dev/video0
 ```
 
-## 性能对比
+## Performance comparison
 
-以下为 Xiaomi Pad 5（SM8150）4K60 完整码流的最大吞吐测试。CPU 以单核满载
-为 100%，RSS 为进程峰值；同一规格内交替运行 V4L2 与 VA-API。H.264 使用当前
-异步提交实现，其余结果来自初始完整基准。
+The following is a maximum-throughput test on Xiaomi Pad 5 (SM8150) with 4K60 full bitstreams. CPU
+is expressed as 100% = a single core fully loaded, and RSS is the process peak; V4L2 and VA-API are
+run alternately within the same spec. H.264 uses the current asynchronous submission
+implementation, and the other results come from the initial full benchmark.
 
-| 编码规格 | 位深 | 路径 | 解码速度 | CPU | 峰值 RSS |
+| Spec | Bit depth | Path | Decode speed | CPU | Peak RSS |
 |---|---:|---|---:|---:|---:|
 | H.264 High | 8-bit | V4L2 | 167.55 fps | 30.24% | 415.84 MiB |
 | H.264 High | 8-bit | VA-API | 166.95 fps | 59.28% | 544.30 MiB |
@@ -183,41 +196,47 @@ make check
 | VP9 Profile 2 | 10-bit | V4L2 P010 | 116.33 fps | 20.51% | 739.11 MiB |
 | VP9 Profile 2 | 10-bit | VA-API | 113.82 fps | 42.09% | 798.59 MiB |
 
-当前五种规格的 VA-API 与 V4L2 吞吐差均不超过 2.2%。H.264 异步优化将
-VA-API 从 65.55 fps 提升到 166.95 fps；虽然最大吞吐时 CPU 占用率提高，但
-完整码流总 CPU 时间从 8.66 秒降至 6.38 秒。实验性的 Vulkan copy 路径已经把
-stable-surface CPU 整帧复制降为 0；H.264 4K 的 120 帧强制读回校验与 CPU
-路径逐帧一致，总 CPU 时间降低约 7%，墙钟时间增加约 2%。600 帧热态 null sink
-测试总 CPU 时间约从 2.69 秒降至 2.47 秒。默认 Vulkan loader 扫描全部 ICD 时
-Turnip 路径令 RSS 约增加 64 MiB；限定 Freedreno ICD 后本机增量约为 15 MiB。
-首次 Turnip 初始化仍有明显 CPU 成本，因此它目前主要用于验证“用 GPU 换 CPU”
-的方向，还不是默认配置。
+The VA-API vs V4L2 throughput difference for the current five specs is no more than 2.2%. The H.264
+asynchronous optimization improved VA-API from 65.55 fps to 166.95 fps; although CPU utilization is
+higher at maximum throughput, total CPU time for the full bitstream dropped from 8.66 seconds to
+6.38 seconds. The experimental Vulkan copy path has reduced the stable-surface full-frame CPU copy
+to zero; the forced readback verification of 120 frames of H.264 4K matches the CPU path per frame,
+with total CPU time reduced by about 7% and wall-clock time increased by about 2%. The 600-frame warm
+null sink test reduced total CPU time from about 2.69 seconds to 2.47 seconds. When the default
+Vulkan loader scans all ICDs, the Turnip path increases RSS by about 64 MiB; after limiting to the
+Freedreno ICD, the local increment is about 15 MiB. Turnip's first initialization still has a
+noticeable CPU cost, so it is currently mainly used to validate the "trade GPU for CPU" direction
+and is not yet the default configuration.
 
-原始数据和可复现脚本位于 [`benchmark-results/`](benchmark-results/) 与
-[`benchmarks/`](benchmarks/)；10-bit V4L2 测试程序会映射整个输入文件，因此
-表中的原始 RSS 包含输入文件大小，CSV 中另有扣除输入映射后的修正值。
+The raw data and reproducible scripts are in [`benchmark-results/`](benchmark-results/) and
+[`benchmarks/`](benchmarks/); the 10-bit V4L2 test program maps the entire input file, so the raw
+RSS in the table includes the input file size, and the CSV also has a corrected value after
+subtracting the input mapping.
 
-详细的实现过程、基准和历史排障记录保留在
-[`docs/development-notes.md`](docs/development-notes.md)。Chromium 交互点见
-[`docs/chromium-integration.md`](docs/chromium-integration.md)。
+The detailed implementation process, benchmarks, and historical troubleshooting records are kept in
+[`docs/development-notes.md`](docs/development-notes.md). For Chromium integration points, see
+[`docs/chromium-integration.md`](docs/chromium-integration.md).
 
-从全新系统打通内核、固件、VA-API、FFmpeg 和 Chrome 的完整步骤见
-[`中文`](docs/video-decode-setup.md) / [`English`](docs/video-decode-setup.en.md)。
+For the complete steps to bring up the kernel, firmware, VA-API, FFmpeg, and Chrome from a fresh
+system, see [`中文`](docs/video-decode-setup.md) / [`English`](docs/video-decode-setup.en.md).
 
-## 已知限制
+## Known limitations
 
-- 10-bit P010 解码需要配套的 `nabu-iris` 内核模块；HDR 元数据、色调映射和
-  最终显示效果仍取决于 Chrome、合成器和显示器链路；
-- FFmpeg 的 `hevc_v4l2m2m` 与 `vp9_v4l2m2m` 前端目前不会为 10-bit 输入选择
-  P010 CAPTURE，可能成功退出但输出 0 帧；VA-API 路径和仓库内显式 P010 的
-  V4L2 测试程序不受此限制；
-- 默认 stable-surface 路径会做一次 CAPTURE 到 DMA-BUF 的 CPU 拷贝；配套内核的
-  `cached_capture=1` 会加速 H.264/HEVC/VP9 的 MMAP CAPTURE 读取；可用
-  `VPU_VULKAN_COPY=1` 改为实验性的异步 GPU 复制，但会增加 Turnip 内存开销；
-- `VPU_DIRECT_CAPTURE` 仍是实验功能，不建议作为默认发布配置；
-- 非正常终止旧内核会话可能使固件超时，需要重载 `qcom_iris`；
-- 需要与本仓库功能匹配的 `nabu-iris` 内核模块，单独替换用户态驱动不够。
+- 10-bit P010 decode requires the companion `nabu-iris` kernel module; HDR metadata, tone mapping,
+  and the final display result still depend on Chrome, the compositor, and the display chain;
+- FFmpeg's `hevc_v4l2m2m` and `vp9_v4l2m2m` frontends currently do not select a P010 CAPTURE for
+  10-bit input, and may exit successfully while outputting 0 frames; the VA-API path and the
+  repository's explicit-P010 V4L2 test programs are not affected by this limitation;
+- the default stable-surface path does a single CPU copy from CAPTURE to DMA-BUF; the companion
+  kernel's `cached_capture=1` speeds up MMAP CAPTURE reads for H.264/HEVC/VP9; `VPU_VULKAN_COPY=1`
+  can switch to the experimental asynchronous GPU copy, but increases Turnip memory overhead;
+- `VPU_DIRECT_CAPTURE` is still experimental and is not recommended as the default release
+  configuration;
+- abnormally terminating an old kernel session may cause a firmware timeout, requiring a reload of
+  `qcom_iris`;
+- a `nabu-iris` kernel module matching this repository's features is required; replacing only the
+  userspace driver is not enough.
 
-## 许可证
+## License
 
-本项目以 GPL-2.0-or-later 发布，详见 [COPYING](COPYING)。
+This project is released under GPL-2.0-or-later; see [COPYING](COPYING) for details.
