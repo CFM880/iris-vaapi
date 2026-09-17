@@ -76,7 +76,7 @@ SEEK_VIDEO="$VID" SEEK_LOG=/tmp/seq.log SEEK_PORT=8756 \
 
 # Chrome 153，硬解（Intel 一般默认已开，必要时加 flag）
 LIBVA_DRIVER_NAME=iHD \
-google-chrome-stable \
+/opt/google/chrome/google-chrome \
   --user-data-dir=/tmp/chrome-seek --ozone-platform=wayland --start-fullscreen \
   --enable-features=VaapiVideoDecoder,VaapiVideoEncoder,PlatformHEVCDecoderSupport \
   --ignore-gpu-blocklist \
@@ -85,6 +85,15 @@ google-chrome-stable \
 # 播 ~36s 后关掉 Chrome，分析
 python3 benchmarks/seek_harness/analyze.py /tmp/seq.log
 ```
+
+> **务必用真实二进制。** 若本机存在会注入
+> `--disable-features=ExtendedVideoBitstreamValidation` 的 wrapper（典型是
+> `~/.local/bin/google-chrome-stable`，因 `~/.local/bin` 在 `PATH` 中先于
+> `/usr/bin` 而覆盖真实二进制），那么所有“默认”运行其实都被强制关掉了 feature，
+> 回归会看起来像修好了。复现与 A/B 请直接调用
+> `/opt/google/chrome/google-chrome`。实测 `153.0.8010.47` 在真实二进制下**仍
+> 复现**（stale 86.6%、每次 seek 触发一次 `ApplyResolutionChange`）；其相关源码
+> 与 `153.0.8010.36` 逐字节相同。
 
 先确认确实在用硬解：`chrome://media-internals` 里 decoder 为 `VaapiVideoDecoder`，
 `chrome://gpu` 里 “Video Decode: Hardware accelerated”。
@@ -164,6 +173,9 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 - Linux Chromium **没有 HEVC 软解**，`--disable-accelerated-video-decode` 会直接无法播放；
   不能靠软解做对照。
 - 素材要用 **HEVC**；H.264 本来就是 0%，不能用来判断。
+- **先确认启动器没有注入 flag**：`~/.local/bin/google-chrome-stable` 这类 wrapper
+  会追加 `--disable-features=ExtendedVideoBitstreamValidation`，使“默认”运行也关
+  掉了 feature；复现与 A/B 用真实二进制 `/opt/google/chrome/google-chrome`。
 - 统计只看 `stale_repeats`；seek 后的“正常回退一两帧”属 settle，`analyze.py` 已跳过每段前 5 个采样。
 - `/tmp` 可能被系统清理，重要日志/截图请存到仓库外的持久目录。
 
@@ -174,6 +186,8 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 - [ ] `vainfo` 有 `VAProfileHEVCMain` / `Main10`
 - [ ] `chrome://gpu` Video Decode = Hardware accelerated
 - [ ] `chrome://media-internals` decoder = `VaapiVideoDecoder`
+- [ ] 用真实二进制（`/opt/google/chrome/google-chrome`），而不是会注入
+      `--disable-features=ExtendedVideoBitstreamValidation` 的 wrapper
 - [ ] Chrome 153 默认：`stale_repeats` 高（预期 70–90%）
 - [ ] Chrome 153 + `--disable-features=ExtendedVideoBitstreamValidation`：降到 ~0%
 - [ ] （可选）Chrome 152：~0%

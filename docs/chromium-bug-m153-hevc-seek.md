@@ -8,6 +8,18 @@
 > See `hevc-seek-validation.md` for the reproduction procedure and the
 > cross-platform result table.
 
+> **Testing caveat — check your launcher first.** A local wrapper that injects
+> `--disable-features=ExtendedVideoBitstreamValidation` (for example
+> `~/.local/bin/google-chrome-stable`, which shadows the real binary because
+> `~/.local/bin` precedes `/usr/bin` in `PATH`) silently applies the workaround
+> to *every* launch, including "default" A/B runs. Reproduce and compare with
+> the real binary directly (`/opt/google/chrome/google-chrome`), otherwise the
+> feature is forced off and the regression looks fixed. Chrome
+> **`153.0.8010.47` still reproduces it** (86.6% stale repeats,
+> `ApplyResolutionChange()` once per seek) when launched this way; the related
+> Chromium sources are byte-identical between `153.0.8010.36` and
+> `153.0.8010.47`, so there is no upstream fix in that range.
+
 ## Summary
 
 With hardware HEVC decode on Linux (Wayland), Chrome **153.0.8010.36** presents
