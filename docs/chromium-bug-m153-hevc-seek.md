@@ -1,5 +1,7 @@
 # [M153 regression] HEVC hardware decode: seeking repeatedly displays stale pre-seek frames
 
+> Filed: https://issues.chromium.org/issues/563075803
+>
 > Ready-to-submit Chromium bug report. Primary measurement on Xiaomi Pad 5
 > (SM8150 / Adreno 640, iris-vaapi, Wayland). The spurious configuration change
 > was independently confirmed on a second VA-API platform, Intel Comet Lake-H
@@ -237,6 +239,7 @@ unaffected.
 
 ## Attachments / references
 
+- Issue: https://issues.chromium.org/issues/563075803
 - `h265-reset-active-sps.patch` (fix + regression tests)
 - `benchmarks/seek_harness/` (seq_server.py, seek_test.html, analyze.py)
 - Verify procedure and expected results: `docs/hevc-seek-validation.md`
