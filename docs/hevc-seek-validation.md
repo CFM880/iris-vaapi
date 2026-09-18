@@ -1,5 +1,7 @@
 # HEVC seek 旧帧问题：验证指南（Intel / 跨平台）
 
+[English](hevc-seek-validation.en.md) | 中文
+
 配套的 bug 报告见 [`chromium-bug-m153-hevc-seek.md`](chromium-bug-m153-hevc-seek.md)。
 本文用于在 **Intel 等其它 VA-API 平台**复现，以及 Chromium 修复后回测。
 
