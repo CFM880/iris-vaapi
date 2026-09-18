@@ -159,7 +159,7 @@ Feature introduction: `a67403c92953761dd1cdda758967210581763b7d`
 ("media: Add range extended validation for H.264 and H265 parsers"), whose
 comment says the feature is meant to be temporary ("Remove after M149").
 
-## Proposed fix
+## Fix (implemented and verified)
 
 Minimal, upstream:
 
@@ -169,19 +169,51 @@ Minimal, upstream:
 @@ -202,7 +202,6 @@ void H265Decoder::Reset() {
    parser_.Reset();
    accelerator_.Reset();
-
+ 
 -  active_sps_.reset();
    decoder_buffer_.reset();
    secure_handle_ = 0;
 ```
 
-`active_sps_` is only used to detect an actual SPS change. Keeping it across a
-seek makes an unchanged SPS a no-op; a genuinely different SPS is still caught
-by `*active_sps_ != *sps`. The first-ever parse still has `!active_sps_` true,
-so initial configuration is unaffected.
+`active_sps_` is the baseline used by the full-SPS comparison; it is not a
+per-picture buffer. Keeping it across `Reset()` (which the interface documents
+as "do not flush decoder state", so playback can resume from a different
+location) makes an unchanged SPS a no-op, while a genuinely different SPS is
+still caught by `*active_sps_ != *sps`. The first-ever parse still has
+`!active_sps_` true, so initial configuration is unaffected. This matches other
+decoders: FFmpeg's `hevc_decode_flush()` keeps the SPS/PPS across a flush, and
+`compare_sps()` reuses the existing SPS when the content is unchanged.
 
 Alternative (if the reset must stay): trigger `!active_sps_` only on the first
 parse of the decoder's lifetime, via a flag that is not cleared by `Reset()`.
+
+Patch: `h265-reset-active-sps.patch` (`media/gpu/h265_decoder.cc` -1 line,
+`media/gpu/h265_decoder_unittest.cc` +2 tests). The full-SPS comparison and the
+non-IRAP rejection are untouched.
+
+### Verification
+
+Local HEVC-enabled build of the same M153 source (`out/arm64/chrome`, real
+binary, VA-API, feature `ExtendedVideoBitstreamValidation` on by default):
+
+| Build | stale repeats | `stale_serial` | `ApplyResolutionChange()` |
+|---|---|---|---|
+| unpatched | 277/408 = 83.7% | 277/331 = 83.7% | 8 (one per seek) |
+| patched | 0/397 = 0.0% | 0/329 = 0.0% | 1 (startup only) |
+
+Unit tests (`media_unittests --gtest_filter='H265DecoderTest.*'`, arm64,
+18/18 pass):
+
+- `ConfigChangeOnNonIRAP` still returns `kDecodeError` for a 10-bit SPS/PPS +
+  P-frame, and for a modified-CTB SPS + P-frame injected after `Reset()`; the
+  hardening for 540024134 is not weakened.
+- New `ResetThenSameSpsDoesNotCauseConfigChange`: after `Reset()`, re-sending
+  the identical SPS/PPS does not produce `kConfigChange`.
+- New `ResetThenDifferentSpsOnIrapStillConfigChanges`: after `Reset()`, a
+  different SPS (10-bit) at an IRAP still produces `kConfigChange`.
+
+The two new tests fail on the unpatched tree (the first sees a spurious
+`kConfigChange`), so they pin the regression.
 
 ## Scope
 
@@ -205,5 +237,6 @@ unaffected.
 
 ## Attachments / references
 
+- `h265-reset-active-sps.patch` (fix + regression tests)
 - `benchmarks/seek_harness/` (seq_server.py, seek_test.html, analyze.py)
 - Verify procedure and expected results: `docs/hevc-seek-validation.md`

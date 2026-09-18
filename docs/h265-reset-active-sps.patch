@@ -1,0 +1,93 @@
+From 34556951820df5c04b357785f97fea8d83b5d3ad Mon Sep 17 00:00:00 2001
+From: Cheng Fangming <chengfangming1993@gmail.com>
+Date: Fri, 18 Sep 2026 14:40:26 +0800
+Subject: [PATCH] media: Don't clear the H.265 SPS baseline on decoder reset
+
+H265Decoder::Reset() cleared active_sps_, which is the baseline used to
+detect H.265 SPS configuration changes. Reset() is called on every seek
+and, per AcceleratedVideoDecoder::Reset(), must not flush decoder state so
+playback can resume later from a different location. Clearing the baseline
+made the first SPS re-sent after a seek look like a configuration change
+even when it was byte-identical, so the client flushed and reconfigured the
+decoder and its output frame pool on every seek. On display paths that keep
+already-imported output surfaces, that surfaces stale pre-seek frames.
+
+Keep the parameter-set baseline across Reset(); it is only replaced when a
+different SPS is actually accepted. The full-SPS comparison that rejects
+mid-sequence (non-IRAP) SPS changes is unchanged, so this does not weaken
+the validation added for the non-IRAP SPS change hardening. This matches
+other decoders: FFmpeg's hevc_decode_flush() keeps the SPS/PPS across a
+flush, and compare_sps() reuses the existing SPS when the content is
+unchanged, so an identical SPS is never treated as a change.
+
+Bug: 540024134
+Test: media_unittests --gtest_filter='H265DecoderTest.*'
+---
+ media/gpu/h265_decoder.cc          |  1 -
+ media/gpu/h265_decoder_unittest.cc | 38 ++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/media/gpu/h265_decoder.cc b/media/gpu/h265_decoder.cc
+index 9aab48952464c..9891dada2fc6d 100644
+--- a/media/gpu/h265_decoder.cc
++++ b/media/gpu/h265_decoder.cc
+@@ -202,7 +202,6 @@ void H265Decoder::Reset() {
+   parser_.Reset();
+   accelerator_->Reset();
+ 
+-  active_sps_.reset();
+   decoder_buffer_.reset();
+   secure_handle_ = 0;
+ 
+diff --git a/media/gpu/h265_decoder_unittest.cc b/media/gpu/h265_decoder_unittest.cc
+index 68c549ec17868..be15c1fdd3d06 100644
+--- a/media/gpu/h265_decoder_unittest.cc
++++ b/media/gpu/h265_decoder_unittest.cc
+@@ -561,6 +561,44 @@ TEST_F(H265DecoderTest, DecodeMultiFrameInput) {
+   EXPECT_TRUE(decoder_->Flush());
+ }
+ 
++// Regression: a flush/seek re-sends the same parameter sets at the
++// random-access point. Per HEVC, an identical SPS is not a configuration
++// change. Other decoders keep the parameter sets across flush (e.g. FFmpeg's
++// hevc_decode_flush() does not free the SPS/PPS, and compare_sps() reuses the
++// existing SPS when the content is unchanged), so ConfigChange follows content,
++// not the reset itself.
++TEST_F(H265DecoderTest, ResetThenSameSpsDoesNotCauseConfigChange) {
++  SetInputFrameFiles({kSpsPps, kFrame0});
++  EXPECT_EQ(AcceleratedVideoDecoder::kConfigChange, Decode());
++  EXPECT_EQ(gfx::Size(320, 184), decoder_->GetPicSize());
++  EXPECT_EQ(AcceleratedVideoDecoder::kRanOutOfStreamData, Decode());
++  ASSERT_TRUE(decoder_->Flush());
++  Mock::VerifyAndClearExpectations(&*accelerator_);
++  ResetExpectations();
++
++  // The client resets the decoder on seek and re-sends the same SPS/PPS.
++  decoder_->Reset();
++  SetInputFrameFiles({kSpsPps});
++  EXPECT_NE(AcceleratedVideoDecoder::kConfigChange, Decode());
++}
++
++// The same reset must still surface a genuinely different sequence config, so
++// this is a content comparison, not a blanket "ignore SPS after reset".
++TEST_F(H265DecoderTest, ResetThenDifferentSpsOnIrapStillConfigChanges) {
++  SetInputFrameFiles({kSpsPps, kFrame0});
++  EXPECT_EQ(AcceleratedVideoDecoder::kConfigChange, Decode());
++  EXPECT_EQ(gfx::Size(320, 184), decoder_->GetPicSize());
++  EXPECT_EQ(AcceleratedVideoDecoder::kRanOutOfStreamData, Decode());
++  ASSERT_TRUE(decoder_->Flush());
++  Mock::VerifyAndClearExpectations(&*accelerator_);
++  ResetExpectations();
++
++  // After reset, a different SPS (10-bit) at an IRAP is a real config change.
++  decoder_->Reset();
++  SetInputFrameFiles({k10BitFrame0});
++  EXPECT_EQ(AcceleratedVideoDecoder::kConfigChange, Decode());
++}
++
+ TEST_F(H265DecoderTest, ConfigChangeOnNonIRAP) {
+   // 1. Initialize with 8-bit stream.
+   SetInputFrameFiles({kSpsPps, kFrame0});
+-- 
+2.43.0
+
