@@ -55,7 +55,10 @@ static int v4l2_dec_supports_format(const char *dev,
 	struct v4l2_fmtdesc fmt;
 	int fd;
 
-	fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
+	if (!dev || !*dev)
+		return 0;
+
+	fd = open(dev, O_RDWR | O_NONBLOCK);
 	if (fd < 0)
 		return 0;
 
@@ -325,10 +328,15 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	memset(d, 0, sizeof(*d));
 	d->cap_memory = V4L2_MEMORY_MMAP;
 	d->fd = -1;
-	d->fd = open(dev ? dev : "/dev/video0", O_RDWR | O_NONBLOCK);
+
+	if (!dev || !*dev) {
+		fprintf(stderr, "v4l2-dec: no decoder device supplied\n");
+		return -ENODEV;
+	}
+
+	d->fd = open(dev, O_RDWR | O_NONBLOCK);
 	if (d->fd < 0) {
-		fprintf(stderr, "open %s: %s\n", dev ? dev : "/dev/video0",
-			strerror(errno));
+		fprintf(stderr, "open %s: %s\n", dev, strerror(errno));
 		return -errno;
 	}
 
@@ -343,7 +351,7 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		ret = -EINVAL;
 		goto error;
 	}
-	printf("v4l2-dec: device %s driver '%s' card '%s'\n", dev ? dev : "/dev/video0",
+	printf("v4l2-dec: device %s driver '%s' card '%s'\n", dev,
 	       (char *)cap.driver, (char *)cap.card);
 
 	memset(&sub, 0, sizeof(sub));
