@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* LD_PRELOAD ioctl logger for /dev/video0 — observe the exact V4L2 sequence
- * mpv uses so the vpu-vaapi engine can replicate it. */
+/* LD_PRELOAD ioctl logger for the Iris decoder (/dev/videoN) — observe the
+ * exact V4L2 sequence mpv uses so the vpu-vaapi engine can replicate it. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
@@ -13,16 +13,6 @@
 
 static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 static int logfd = -1;
-
-static int is_video_fd(int fd)
-{
-	struct stat st;
-
-	if (fstat(fd, &st) < 0)
-		return 0;
-	return S_ISCHR(st.st_mode) &&
-	       (strstr(st.st_rdev ? "/dev/video0" : "", "video") || 1);
-}
 
 static void plog(const char *fmt, ...)
 {

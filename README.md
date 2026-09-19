@@ -35,7 +35,8 @@ well-verified stable surface-copy path.
 - VA-API 1.23 ABI (verified with libva 2.22/2.23);
 - GCC, pkg-config, make;
 - Optional: `libvulkan-dev` (experimental Turnip DMA-BUF asynchronous copy);
-- `/dev/video0`, a DRM render node, and `/dev/dma_heap/system`.
+- a DRM render node, `/dev/dma_heap/system`, and an Iris decoder node
+  (`/dev/video*`, discovered automatically regardless of numbering).
 
 On Debian/Ubuntu systems:
 
@@ -191,7 +192,7 @@ Hardware tests require user-provided bitstreams and contain no local absolute pa
 ./build/test_va_vp9 stream.ivf
 ./build/test_hevc_au main10.h265 3840 2160 p010
 ./build/test_v4l2_vp9 profile2.ivf 3840 2160 p010
-./build/test_surface_fence /dev/video0
+./build/test_surface_fence
 ```
 
 ## Performance comparison

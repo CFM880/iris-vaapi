@@ -404,7 +404,7 @@ export VPU_VAAPI_DEBUG=1
 # Chrome 侧确认当前用的解码器：
 # chrome://media-internals → kVideoDecoderName；chrome://gpu → Video Acceleration
 # 安装/重载新内核模块后先验证 reservation fence 接口：
-./build/test_surface_fence /dev/video0
+./build/test_surface_fence
 ```
 
 注意：压力测试中途被杀（Ctrl-C/timeout）会 wedge 固件，先重载模块再继续调试。

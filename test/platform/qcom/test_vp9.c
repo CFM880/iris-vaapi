@@ -59,7 +59,7 @@ int main(int argc, char **argv)
 	if (!count) return 1;
 	printf("IVF frames found: %u\n", count);
 
-	ret = v4l2_dec_open(&dec, "/dev/video0", width, height,
+	ret = v4l2_dec_open(&dec, getenv("VPU_DEVICE"), width, height,
 			    V4L2_PIX_FMT_VP9, cap_pixfmt);
 	if (ret) { fprintf(stderr, "open %d\n", ret); return 1; }
 	ret = v4l2_dec_feed(&dec, frames[0].data, frames[0].len,

@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,64 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	} while (r == -1 && errno == EINTR);
 
 	return r;
+}
+
+/* Locate the Iris decoder node.  The camera pipeline can register
+ * /dev/video0..N before the codec, so the decoder has to be identified by its
+ * sysfs name and driver instead of a fixed minor.  Returns a malloc'd path
+ * (caller frees) or NULL when no decoder is present. */
+char *v4l2_dec_find_iris_device(void)
+{
+	glob_t devices = {0};
+	char *device = NULL;
+	size_t i;
+
+	if (glob("/dev/video[0-9]*", 0, NULL, &devices))
+		return NULL;
+
+	for (i = 0; i < devices.gl_pathc; i++) {
+		char sysfs_path[256], name[128];
+		struct v4l2_capability cap;
+		unsigned int caps;
+		FILE *sysfs;
+		int fd, ret;
+
+		snprintf(sysfs_path, sizeof(sysfs_path),
+			 "/sys/class/video4linux/%s/name",
+			 strrchr(devices.gl_pathv[i], '/') + 1);
+		sysfs = fopen(sysfs_path, "r");
+		if (!sysfs)
+			continue;
+		ret = fgets(name, sizeof(name), sysfs) != NULL;
+		fclose(sysfs);
+		if (!ret)
+			continue;
+		name[strcspn(name, "\n")] = '\0';
+		if (strcmp(name, "qcom-iris-decoder") &&
+		    strcmp(name, "Iris Decoder"))
+			continue;
+
+		fd = open(devices.gl_pathv[i], O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+		do {
+			ret = ioctl(fd, VIDIOC_QUERYCAP, &cap);
+		} while (ret < 0 && errno == EINTR);
+		close(fd);
+		if (ret < 0 || strcmp((char *)cap.driver, "iris_driver"))
+			continue;
+
+		caps = cap.capabilities & V4L2_CAP_DEVICE_CAPS ?
+			cap.device_caps : cap.capabilities;
+		if (!(caps & V4L2_CAP_VIDEO_M2M_MPLANE))
+			continue;
+
+		device = strdup(devices.gl_pathv[i]);
+		break;
+	}
+
+	globfree(&devices);
+	return device;
 }
 
 static int v4l2_dec_supports_format(const char *dev,
@@ -323,6 +382,7 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	struct v4l2_requestbuffers req;
 	struct v4l2_event_subscription sub;
 	unsigned int i;
+	char *discovered = NULL;
 	int ret;
 
 	memset(d, 0, sizeof(*d));
@@ -330,8 +390,12 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	d->fd = -1;
 
 	if (!dev || !*dev) {
-		fprintf(stderr, "v4l2-dec: no decoder device supplied\n");
-		return -ENODEV;
+		discovered = v4l2_dec_find_iris_device();
+		if (!discovered) {
+			fprintf(stderr, "v4l2-dec: no Iris decoder device found\n");
+			return -ENODEV;
+		}
+		dev = discovered;
 	}
 
 	d->fd = open(dev, O_RDWR | O_NONBLOCK);
@@ -451,9 +515,11 @@ int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 	if (ret)
 		goto error;
 
+	free(discovered);
 	return 0;
 
 error:
+	free(discovered);
 	v4l2_dec_close(d);
 	return ret;
 }

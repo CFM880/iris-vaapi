@@ -115,25 +115,8 @@ static int qcom_iris_open(void *session, const char *device,
 			     enum vpu_codec_id codec,
 			     enum vpu_pixel_format format)
 {
-	char *resolved = NULL;
-	int ret;
-
-	if (!device || !*device) {
-		resolved = qcom_iris_discover_device();
-		if (!resolved) {
-			fprintf(stderr,
-				"qcom-iris: no Iris decoder device found\n");
-			return -ENODEV;
-		}
-		device = resolved;
-	}
-
-	ret = v4l2_dec_open(session, device, width, height,
-			    v4l2_codec_format(codec), (unsigned int)format);
-
-	free(resolved);
-
-	return ret;
+	return v4l2_dec_open(session, device, width, height,
+			     v4l2_codec_format(codec), (unsigned int)format);
 }
 
 static int qcom_iris_dequeue_frame(void *session, struct vpu_decoded_frame *frame)

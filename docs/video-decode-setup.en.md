@@ -10,7 +10,7 @@ Chrome / FFmpeg
        ↓ VA-API
 vpu-vaapi (vpu_drv_video.so)
        ↓ stateful V4L2
-qcom-iris (/dev/video0)
+qcom-iris (/dev/video*, auto-discovered)
        ↓
 SM8150 Iris1 / Venus firmware
 ```
@@ -18,12 +18,17 @@ SM8150 Iris1 / Venus firmware
 A working installation satisfies all of the following conditions:
 
 - `uname -m` prints `aarch64`;
-- `/dev/video0` identifies itself as `Iris Decoder`;
+- a `qcom-iris-decoder` node exists (some `/dev/videoN`, numbering is not fixed);
 - `/dev/dri/renderD128` and `/dev/dma_heap/system` are accessible;
 - both `cached_capture` and `allow_fw_boot` are `Y`;
 - `vainfo` loads `vpu-vaapi 0.2.0` and lists H.264, HEVC Main/Main10, and VP9
   Profile 0/Profile 2;
 - FFmpeg or Chrome actually selects VA-API instead of a software decoder.
+
+> The Iris decoder is not necessarily `/dev/video0`: camera drivers may claim the
+> low minors first. Run `grep -l qcom-iris-decoder /sys/class/video4linux/*/name`
+> to find the actual node, or simply rely on vpu-vaapi's auto-discovery (set
+> `VPU_DEVICE` only to override it).
 
 > This is an experimental driver. The initial installation requires a custom kernel and
 > DTB. Prepare a known-good recovery boot entry before replacing them. Never force-load a

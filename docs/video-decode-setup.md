@@ -10,7 +10,7 @@ Chrome / FFmpeg
        ↓ VA-API
 vpu-vaapi (vpu_drv_video.so)
        ↓ stateful V4L2
-qcom-iris (/dev/video0)
+qcom-iris (/dev/video*，自动发现)
        ↓
 SM8150 Iris1 / Venus 固件
 ```
@@ -18,12 +18,16 @@ SM8150 Iris1 / Venus 固件
 最终应同时满足：
 
 - `uname -m` 输出 `aarch64`；
-- `/dev/video0` 是 `Iris Decoder`；
+- 存在 `qcom-iris-decoder` 节点（通常是某个 `/dev/videoN`，编号不固定）；
 - `/dev/dri/renderD128` 和 `/dev/dma_heap/system` 可访问；
 - `cached_capture` 与 `allow_fw_boot` 均为 `Y`；
 - `vainfo` 加载 `vpu-vaapi 0.2.0`，列出 H.264、HEVC Main/Main10 和 VP9
   Profile 0/Profile 2；
 - FFmpeg 或 Chrome 实际选择 VA-API，而不是软件解码器。
+
+> Iris 解码器不一定在 `/dev/video0`：相机等驱动可能先占用低位节点。可执行
+> `grep -l qcom-iris-decoder /sys/class/video4linux/*/name` 找到实际节点，
+> 或直接依赖 vpu-vaapi 的自动发现（`VPU_DEVICE` 仅在需要覆盖时设置）。
 
 > 这是实验性驱动。首次安装需要构建并启动自定义内核和 DTB，请先准备可用的
 > 恢复启动项。不要把为其他内核构建的 `.ko` 强行装入当前系统。
