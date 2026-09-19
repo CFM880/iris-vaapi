@@ -94,7 +94,7 @@ int main(int argc, char **argv)
 	if (ret || !n_aus) { fprintf(stderr, "no HEVC access units\n"); return 1; }
 	printf("access units found: %u\n", n_aus);
 
-	ret = v4l2_dec_open(&dec, "/dev/video0", width, height,
+	ret = v4l2_dec_open(&dec, getenv("VPU_DEVICE"), width, height,
 			    V4L2_PIX_FMT_HEVC, cap_pixfmt);
 	if (ret) { fprintf(stderr, "open %d\n", ret); return 1; }
 	ret = v4l2_dec_feed(&dec, aus[0].data, aus[0].len, 0);

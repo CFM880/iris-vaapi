@@ -33,7 +33,8 @@ HEVC Main10 与 VP9 Profile 2 已分别通过三轮 4K P010 完整码流测试�
 - VA-API 1.23 ABI（已使用 libva 2.22/2.23 验证）；
 - GCC、pkg-config、make；
 - 可选：`libvulkan-dev`（实验性的 Turnip DMA-BUF 异步复制）；
-- `/dev/video0`、DRM render node 和 `/dev/dma_heap/system`。
+- DRM render node、`/dev/dma_heap/system`，以及 Iris 解码器节点（`/dev/video*`，
+  驱动自动发现，不依赖设备编号）。
 
 在 Debian/Ubuntu 系统上：
 
@@ -179,7 +180,7 @@ make check
 ./build/test_va_vp9 stream.ivf
 ./build/test_hevc_au main10.h265 3840 2160 p010
 ./build/test_v4l2_vp9 profile2.ivf 3840 2160 p010
-./build/test_surface_fence /dev/video0
+./build/test_surface_fence
 ```
 
 ## 性能对比

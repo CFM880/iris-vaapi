@@ -62,10 +62,15 @@ int v4l2_dec_supports_capture_format(const char *dev,
 int v4l2_dec_supports_output_format(const char *dev,
 				     unsigned int pixelformat);
 
+/* Locate the Iris decoder node by sysfs name/driver.  Returns a malloc'd
+ * "/dev/videoN" path the caller must free, or NULL if no decoder is present.
+ * Needed because the camera pipeline may claim the low video minors. */
+char *v4l2_dec_find_iris_device(void);
+
 /* Open the decoder at @dev for a @width x @height stream using the given
  * bitstream pixel format (V4L2_PIX_FMT_H264/HEVC/VP9...) and uncompressed
- * CAPTURE format (V4L2_PIX_FMT_NV12/P010).  @dev must not be NULL; callers
- * that have no explicit path should discover the Iris device first. */
+ * CAPTURE format (V4L2_PIX_FMT_NV12/P010).  A NULL or empty @dev selects the
+ * Iris decoder automatically. */
 int v4l2_dec_open(struct v4l2_dec *d, const char *dev,
 		  unsigned int width, unsigned int height,
 		  unsigned int pixelformat, unsigned int cap_pixelformat);

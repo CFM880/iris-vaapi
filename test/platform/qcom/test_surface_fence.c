@@ -5,15 +5,18 @@
 #include <linux/dma-heap.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "platform/qcom/surface_fence.h"
+#include "platform/qcom/v4l2_decoder.h"
 
 int main(int argc, char **argv)
 {
-	const char *video_path = argc > 1 ? argv[1] : "/dev/video0";
+	const char *video_path = argc > 1 ? argv[1] : NULL;
+	char *discovered = NULL;
 	struct dma_heap_allocation_data alloc = {
 		.len = 4096,
 		.fd_flags = O_RDWR | O_CLOEXEC,
@@ -37,6 +40,14 @@ int main(int argc, char **argv)
 	if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
 		perror("DMA_HEAP_IOCTL_ALLOC");
 		goto close_heap;
+	}
+	if (!video_path) {
+		discovered = v4l2_dec_find_iris_device();
+		if (!discovered) {
+			fprintf(stderr, "no Iris decoder device found\n");
+			goto close_dmabuf;
+		}
+		video_path = discovered;
 	}
 	video_fd = open(video_path, O_RDWR | O_CLOEXEC);
 	if (video_fd < 0) {
@@ -92,5 +103,6 @@ close_dmabuf:
 	close(alloc.fd);
 close_heap:
 	close(heap_fd);
+	free(discovered);
 	return ret;
 }

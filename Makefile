@@ -206,9 +206,9 @@ $(TEST_VA_STRESS): test/test_va_stress.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -lva-drm
 
-$(TEST_SURFACE_FENCE): test/platform/qcom/test_surface_fence.c src/platform/qcom/surface_fence.h
+$(TEST_SURFACE_FENCE): test/platform/qcom/test_surface_fence.c $(QCOM_V4L2_OBJ) src/platform/qcom/surface_fence.h src/platform/qcom/v4l2_decoder.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $< $(QCOM_V4L2_OBJ)
 
 $(TEST_PLATFORM): test/platform/test_platform.c $(PLATFORM_OBJS) src/platform/platform.h
 	@mkdir -p $(BUILD)
