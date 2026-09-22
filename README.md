@@ -242,7 +242,9 @@ system, see [`中文`](docs/video-decode-setup.md) / [`English`](docs/video-deco
 ## Known limitations
 
 - 10-bit P010 decode requires the companion `nabu-iris` kernel module; HDR metadata, tone mapping,
-  and the final display result still depend on Chrome, the compositor, and the display chain;
+  and the final display result still depend on Chrome, the compositor, and the display chain. The
+  display chain exposes no HDR path yet — see
+  [`display-hdr-verification.md`](docs/display-hdr-verification.md) for the evidence;
 - Chrome 153 hardware HEVC seek shows stale pre-seek frames due to a Chromium
   `ExtendedVideoBitstreamValidation` regression; run Chrome with
   `--disable-features=ExtendedVideoBitstreamValidation` or use Chrome 152 (see the Chrome section);
