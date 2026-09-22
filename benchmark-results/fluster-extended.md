@@ -155,4 +155,6 @@ See [VP9 context continuation](vp9-context-continuation.md) for the implemented
 reference-owner handoff and rectangular surface copy. With `-noautoscale`,
 the original resized vector now produces 30 frames and matches the upstream
 MD5 on VA-API in three consecutive runs. Earlier results above are historical;
-direct V4L2 visible-size propagation remains unresolved.
+direct V4L2 visible-size propagation was resolved on 2026-09-22 (per-frame
+`G_SELECTION` crop plus client-side crop) — see
+[VP9 in-place resize over V4L2](vp9-v4l2-resize.md).
