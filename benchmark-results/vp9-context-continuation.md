@@ -46,9 +46,14 @@ and guards global recovery so only explicit HFI_EVENT_SYS_ERROR resets all
 sessions. Normal decoding recovered after the user reloaded that build.
 The unknown-session branch itself was not deliberately fault-injected.
 
-Direct V4L2 still exposes the original visible dimensions for the resized
-VP9 frames. Its metadata/notification fix remains outstanding. The separate
-HEVC MP4 edit-list/negative-timestamp issue is also still outstanding.
+Direct V4L2 exposes the visible dimensions for the resized VP9 frames as of
+2026-09-22: the driver publishes the per-frame `FILL_BUFFER_DONE` rectangle
+through `G_SELECTION` and a source-change notification, and the V4L2 m2m
+client crops to it. See [VP9 in-place resize over V4L2](vp9-v4l2-resize.md).
+The canonical 1280x720 → 640x360 vector is byte-identical to software; vectors
+whose resized height is not a multiple of 8 still expose the firmware's
+8-aligned height. The separate HEVC MP4 edit-list/negative-timestamp issue is
+still outstanding.
 No permanent kernel installation or system VA-API installation was performed.
 
 Raw logs: logs/extended-4k/vp9-context-final-{0,1,2}.log;
