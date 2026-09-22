@@ -226,7 +226,8 @@ Turnip 路径令 RSS 约增加 64 MiB；限定 Freedreno ICD 后本机增量约�
 ## 已知限制
 
 - 10-bit P010 解码需要配套的 `nabu-iris` 内核模块；HDR 元数据、色调映射和
-  最终显示效果仍取决于 Chrome、合成器和显示器链路；
+  最终显示效果仍取决于 Chrome、合成器和显示器链路；显示链路目前没有 HDR 通路，
+  证据见 [`display-hdr-verification.md`](docs/display-hdr-verification.md)；
 - Chrome 153 的 HEVC 硬解 seek 会显示 seek 前的旧帧，源于 Chromium 的
   `ExtendedVideoBitstreamValidation` 回归；用
   `--disable-features=ExtendedVideoBitstreamValidation` 启动或改用 Chrome 152
