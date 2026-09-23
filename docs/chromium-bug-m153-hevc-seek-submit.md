@@ -65,6 +65,11 @@ Evidence
 - Local HEVC-enabled build of the same M153 source, real binary, VA-API:
   unpatched -> 83.7% stale repeats and ApplyResolutionChange 8; patched
   (remove the reset) -> 0.0% and 1.
+- Windows D3D11 (Chrome 154.0.8037.58, RTX 3080, 4K HEVC): the same per-seek
+  configuration change reproduces (D3DVideoDecoder config change /
+  RecreateDecoderWrapper: 8 with the feature on, 1 with it off), so the defect
+  is not VA-API-specific. The visible stale-frame symptom did not reproduce on
+  Windows/D3D11 (0.0% on a clip whose seek targets are all distinct).
 
 Regression range
 | Build | Result |

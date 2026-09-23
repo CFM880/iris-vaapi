@@ -5,7 +5,8 @@
 > Ready-to-submit Chromium bug report. Primary measurement on Xiaomi Pad 5
 > (SM8150 / Adreno 640, iris-vaapi, Wayland). The spurious configuration change
 > was independently confirmed on a second VA-API platform, Intel Comet Lake-H
-> UHD (iHD, X11). The root cause is in shared Chromium H.265 code
+> UHD (iHD, X11), and on Windows D3D11 (Chrome 154, RTX 3080). The root cause is
+> in shared Chromium H.265 code
 > (`H265Decoder`), used by the VA-API, D3D11 and VideoToolbox accelerators.
 > See `hevc-seek-validation.md` for the reproduction procedure and the
 > cross-platform result table.
@@ -221,16 +222,19 @@ The two new tests fail on the unpatched tree (the first sees a spurious
 
 `H265Decoder` is shared by:
 - Linux/ChromeOS VA-API (`media/gpu/vaapi/vaapi_video_decoder.cc`),
-- Windows D3D11 (`media/gpu/windows/d3d11_video_decoder.cc:195`),
+- Windows D3D11 (`media/gpu/windows/d3d_video_decoder.cc`, `kConfigChange` →
+  `RecreateDecoderWrapper()`),
 - VideoToolbox accelerator implementations.
 
 So the spurious config-change defect is platform-independent and affects
-hardware HEVC on all these backends. It was confirmed on two VA-API setups:
-Qualcomm SM8150 (iris-vaapi) and Intel Comet Lake-H (iHD). The visible
-stale-frame symptom is demonstrated on the Qualcomm/Wayland setup; it did not
-reproduce on Intel (X11 and Wayland/GNOME) in our tests, and whether Windows/macOS
-show stale frames is not verified. H.264/VP9/AV1 use different decoders and are
-unaffected.
+hardware HEVC on all these backends. It was confirmed on three setups:
+Qualcomm SM8150 (iris-vaapi), Intel Comet Lake-H (iHD), and Windows D3D11
+(Chrome 154 / RTX 3080: `chrome://media-internals` shows `D3DVideoDecoder
+config change` + `RecreateDecoderWrapper` once per seek — 8 with the feature
+on, 1 with it off). The visible stale-frame symptom is demonstrated on the
+Qualcomm/Wayland setup; it did not reproduce on Intel (X11 and Wayland/GNOME)
+or on Windows D3D11. Whether macOS shows stale frames is not verified.
+H.264/VP9/AV1 use different decoders and are unaffected.
 
 ## Workaround
 

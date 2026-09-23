@@ -120,7 +120,7 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 
 ## 5. 结果记录表
 
-2026-09-15 实测：
+2026-09-15（Qualcomm/Intel）与 2026-09-23（Windows）实测：
 
 | 平台 | 会话 | 素材 | feature 开 stale | feature 关 stale | `ApplyResolutionChange` 开/关 |
 |---|---|---|---|---|---|
@@ -130,6 +130,8 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 | Intel CometLake-H UHD | X11 | 1080p 闭GOP 转码 | 9.6% | 7.7% | **14 / 2** |
 | Intel CometLake-H UHD | Wayland(GNOME) | 4K Jellyfin | 6.8–8.2% | 6.7–9.1% | — |
 | Intel CometLake-H UHD | Wayland(GNOME) | 1080p 闭GOP 转码 | 12.2% | 8.0% | — |
+| Windows（RTX 3080，`D3D11VideoDecoder`，Chrome 154.0.8037.58） | 桌面 | 4K Jellyfin | 2.7%（settle=5）、3.7%（settle=15） | 10.5%、9.7% | **8 / 1** |
+| Windows（RTX 3080，`D3D11VideoDecoder`） | 桌面 | 1080p 闭GOP 合成片，210s | **0.0%** | **0.0%** | — |
 
 结论（重要）：
 - **缺陷平台无关**：两平台 feature 开时每次 seek 都触发 `ApplyResolutionChange`
@@ -138,6 +140,12 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
   复用 + Wayland/ANGLE）。Intel 无论 X11 还是 Wayland(GNOME)，on/off 无分离
   （底噪 ~7–9%）；把 `analyze.py` 的 settle 从 5 提到 15 也不改变结论（之前
   Intel 单次 18.8% 是 settle 污染）。即：症状还需要 nabu 那条显示/帧池路径。
+- **Windows/D3D11（Chrome 154、RTX 3080）证实缺陷、但不复现症状。**
+  `chrome://media-internals` 里 `D3DVideoDecoder config change` +
+  `RecreateDecoderWrapper` 每次 seek 一次：feature 开 8 次、关 1 次（即 D3D11 版的
+  `ApplyResolutionChange`）。可见症状不复现——on/off 无分离，且 210s、7 个 seek
+  目标互不重叠的片子两边都是 0.0%；30s 片上的 2.7% vs 10.5% 是 seek 目标回绕噪声，
+  不是旧帧。
 
 （nabu 的 Chrome 152 为 0%，H.264 硬/软解均 0%。）
 
@@ -163,8 +171,9 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 ## 6. 其它平台
 
 - **Windows（D3D11）**：硬解 HEVC 走同一个 `H265Decoder`
-  （`media/gpu/windows/d3d11_video_decoder.cc`），理论同样受影响。用 Chrome 153
-  放 HEVC 拖动进度条，再对比 `--disable-features=ExtendedVideoBitstreamValidation`。
+  （`media/gpu/windows/d3d_video_decoder.cc` 的 `kConfigChange` →
+  `RecreateDecoderWrapper()`）。已在 Chrome 154 / RTX 3080 验证：伪配置变更每次
+  seek 触发一次（feature 开 8、关 1），但可见旧帧症状不复现（见第 5 节）。
 - **macOS（VideoToolbox）**：同样基于 `H265Decoder`，但未验证显示层是否也出现旧帧。
 - **V4L2 stateful / 其它**：不走这段逻辑，不在范围内。
 

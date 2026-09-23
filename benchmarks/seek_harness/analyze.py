@@ -9,10 +9,13 @@ displayed before the SEEK marker.  The serial is unique per decoded frame, so a
 repeated serial is an unambiguous stale-frame display.
 """
 
+import os
 import re
 import sys
+import tempfile
 
-path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/opencode/seq.log"
+path = (sys.argv[1] if len(sys.argv) > 1 else
+        os.path.join(tempfile.gettempdir(), "opencode", "seq.log"))
 # Number of samples to drop right after each SEEK while playback settles onto
 # the new position.  Raise it on platforms where a seek takes longer (e.g.
 # slower VA-API setups) so pre-seek frames are not miscounted as stale.

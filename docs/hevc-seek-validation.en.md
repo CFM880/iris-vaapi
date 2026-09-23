@@ -129,7 +129,7 @@ grep -c 'ApplyResolutionChange()' /tmp/chrome.log
 
 ## 5. Results table
 
-Measured on 2026-09-15:
+Measured on 2026-09-15 (Qualcomm/Intel) and 2026-09-23 (Windows):
 
 | Platform | Session | Clip | feature on stale | feature off stale | `ApplyResolutionChange` on/off |
 |---|---|---|---|---|---|
@@ -139,6 +139,8 @@ Measured on 2026-09-15:
 | Intel CometLake-H UHD | X11 | 1080p closed-GOP transcode | 9.6% | 7.7% | **14 / 2** |
 | Intel CometLake-H UHD | Wayland(GNOME) | 4K Jellyfin | 6.8–8.2% | 6.7–9.1% | — |
 | Intel CometLake-H UHD | Wayland(GNOME) | 1080p closed-GOP transcode | 12.2% | 8.0% | — |
+| Windows (RTX 3080, `D3D11VideoDecoder`, Chrome 154.0.8037.58) | desktop | 4K Jellyfin | 2.7% (settle=5), 3.7% (settle=15) | 10.5%, 9.7% | **8 / 1** |
+| Windows (RTX 3080, `D3D11VideoDecoder`) | desktop | 1080p closed-GOP synthetic, 210 s | **0.0%** | **0.0%** | — |
 
 Conclusions (important):
 - **The defect is platform-independent**: on both platforms with the feature on,
@@ -149,6 +151,13 @@ Conclusions (important):
   `analyze.py`'s settle from 5 to 15 does not change that (an earlier one-off
   Intel 18.8% was settle contamination). In other words, the symptom also needs
   the nabu display/frame-pool path.
+- **Windows/D3D11 (Chrome 154, RTX 3080) confirms the defect but not the
+  symptom.** `chrome://media-internals` shows `D3DVideoDecoder config change` +
+  `RecreateDecoderWrapper` once per seek: 8 with the feature on, 1 with it off
+  (the D3D11 equivalent of `ApplyResolutionChange`). The visible symptom does
+  not reproduce — there is no on/off separation, and a 210 s clip whose 7 seek
+  targets are all distinct gives 0.0% for both. The 2.7% vs 10.5% on the 30 s
+  clip is seek-target revisit noise, not stale frames.
 
 (nabu on Chrome 152 is 0%; H.264 hardware/software are both 0%.)
 
@@ -177,9 +186,10 @@ separation, so the Intel noise is not the symptom.
 ## 6. Other platforms
 
 - **Windows (D3D11)**: hardware HEVC uses the same `H265Decoder`
-  (`media/gpu/windows/d3d11_video_decoder.cc`), so it is theoretically affected.
-  Play HEVC on Chrome 153, seek, and compare with
-  `--disable-features=ExtendedVideoBitstreamValidation`.
+  (`media/gpu/windows/d3d_video_decoder.cc`, `kConfigChange` →
+  `RecreateDecoderWrapper()`). Verified on Chrome 154 / RTX 3080: the spurious
+  config change fires once per seek (8 with the feature on, 1 with it off), but
+  the visible stale-frame symptom does not reproduce (see section 5).
 - **macOS (VideoToolbox)**: also based on `H265Decoder`, but whether the display
   layer shows stale frames is not verified.
 - **V4L2 stateful / others**: do not go through this logic and are out of scope.

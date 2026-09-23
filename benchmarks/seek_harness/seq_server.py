@@ -13,10 +13,12 @@ import http.server
 import os
 import re
 import socketserver
+import tempfile
 
 PORT = int(os.environ.get("SEEK_PORT", "8756"))
 BASE = os.path.dirname(os.path.abspath(__file__))
-LOG = os.environ.get("SEEK_LOG", "/tmp/opencode/seq.log")
+LOG = os.environ.get("SEEK_LOG",
+                     os.path.join(tempfile.gettempdir(), "opencode", "seq.log"))
 HTML_PATH = os.path.join(BASE, "seek_test.html")
 VIDEO_PATH = os.environ.get("SEEK_VIDEO", "")
 CHUNK = 1 << 20
@@ -77,14 +79,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError):
                     return
                 remaining -= len(data)
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         data = self.rfile.read(n)
-        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        log_dir = os.path.dirname(LOG)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         with open(LOG, "ab") as fh:
             fh.write(data + b"\n")
         self.send_response(200)
