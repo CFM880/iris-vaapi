@@ -33,6 +33,10 @@ Tracked files:
   V4L2, VA-API CPU-copy, and VA-API Vulkan-copy raw samples.
 - `stable-copy-v4l2-vaapi.md`: steady-state averages, relative differences,
   methodology, and validation for the stable-surface copy comparison.
+- `hevc-seek-windows11.md`: Windows 11 / Chrome 154 D3D11 HEVC seek check — the
+  M153 per-seek configuration change reproduces (8 with the feature on, 1 off)
+  but the visible stale-frame symptom does not. See
+  `../docs/hevc-seek-validation.md`.
 - `v4l2-vaapi-summary.sql`: reproducible aggregation of the initial baseline.
 - `v4l2-vaapi-report.json`: canonical initial-baseline report input.
 - `v4l2-vaapi-report.html`: generated initial-baseline portable report.
