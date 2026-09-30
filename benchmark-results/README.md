@@ -31,6 +31,10 @@ Tracked files:
   VA-API Vulkan-copy raw samples after stable-surface copy support.
 - `p010-v4l2-vaapi-stable-copy.csv`: HEVC Main10 and VP9 Profile 2 direct
   V4L2, VA-API CPU-copy, and VA-API Vulkan-copy raw samples.
+- `pc-h264-4k.csv`: H.264 4K60 (Jellyfin AVC 60M) direct V4L2 and VA-API raw
+  runs.
+- `pc-p010.csv`: HEVC Main10 4K60 P010 raw runs, direct V4L2, VA-API CPU-copy,
+  and VA-API Vulkan-copy.
 - `stable-copy-v4l2-vaapi.md`: steady-state averages, relative differences,
   methodology, and validation for the stable-surface copy comparison.
 - `v4l2-vaapi-summary.sql`: reproducible aggregation of the initial baseline.
