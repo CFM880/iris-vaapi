@@ -215,7 +215,7 @@ static const struct VADriverVTable vpu_vtable_template = {
 };
 
 VPU_PUBLIC VAStatus
-__vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
+__vaDriverInit_1_0(VADriverContextP ctx, int major_version, int minor_version)
 {
 	struct VADriverVTable *vt;
 
@@ -281,9 +281,25 @@ __vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
 	return VA_STATUS_SUCCESS;
 }
 
-/* Compatibility aliases for older libva releases */
+/*
+ * Compatibility aliases.
+ *
+ * libva resolves the driver entry point by name: it builds
+ * "__vaDriverInit_<VA_MAJOR_VERSION>_<VA_MINOR_VERSION>" from its own
+ * headers and walks the minor version down to 1.0.  A driver compiled
+ * against newer headers (e.g. __vaDriverInit_1_23) therefore stays invisible
+ * to an older libva such as trixie's 2.22 ("has no function
+ * __vaDriverInit_1_0").  Export the stable 1.0 entry point, which every
+ * libva version walks to, plus the versioned/plain names some builds use.
+ */
+VPU_PUBLIC VAStatus
+__vaDriverInit_1_23(VADriverContextP ctx, int major_version, int minor_version)
+{
+	return __vaDriverInit_1_0(ctx, major_version, minor_version);
+}
+
 VPU_PUBLIC VAStatus
 vaDriverInit(VADriverContextP ctx, int major_version, int minor_version)
 {
-	return __vaDriverInit_1_23(ctx, major_version, minor_version);
+	return __vaDriverInit_1_0(ctx, major_version, minor_version);
 }
